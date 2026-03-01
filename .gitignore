@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+*.o
+*.d
+*.dSYS/
+
+# Cloned external repos
+extern/AdaptiveCpp/
+extern/amrex/
+extern/warpx/
+
+# Installed software
+opt/adaptivecpp/
+opt/metal-cpp/
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Compiled test binaries
+tests/sycl/device_query
+tests/sycl/vector_add
+tests/sycl/usm_test
+tests/sycl/reduction_test
