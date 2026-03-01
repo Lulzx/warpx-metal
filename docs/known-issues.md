@@ -6,27 +6,43 @@
 
 | Test | Status | Notes |
 |------|--------|-------|
-| `device_query.cpp` | Pending | Metal GPU should appear as SYCL GPU device |
-| `vector_add.cpp` | Pending | Buffer/accessor model, no USM dependency |
-| `usm_test.cpp` | Pending | **Critical** — AMReX requires `sycl::malloc_shared` |
-| `reduction_test.cpp` | Pending | `atomic_ref<float>` fetch_add for current deposition |
+| `device_query.cpp` | **PASS** | Apple M4 Pro detected: 16 CUs, 15974 MB, 1024 max work-group |
+| `vector_add.cpp` | **PASS** | 1M-element buffer/accessor parallel_for correct |
+| `usm_test.cpp` | **PASS** | `sycl::malloc_shared` works — AMReX compatibility confirmed |
+| `reduction_test.cpp` | **PASS** | `atomic_ref<float>` fetch_add correct; multi-cell deposition simulation correct |
 
 ### Build Environment
 
 - **macOS:** 26.4 (Tahoe)
 - **Xcode:** 26.3
-- **LLVM:** 18 (via Homebrew) — system LLVM 21 is incompatible with AdaptiveCpp
+- **LLVM:** 20.1.8 (via Homebrew) — Metal backend requires LLVM 20 APIs
+- **LLVM 18:** Also needed for `ld64.lld` (not shipped in LLVM 20 Homebrew bottle)
 - **AdaptiveCpp:** develop branch (Metal backend merged Feb 2026)
+- **metal-cpp:** macOS 15 / iOS 18 headers (from Apple developer site)
 
 ### Build Workarounds
 
-_None required yet — update after first build attempt._
+1. **LLVM 20 required (not 18):** AdaptiveCpp develop branch Metal backend uses LLVM 20 APIs (`MemSetPatternInst`, `Intrinsic::scmp/ucmp`, `CmpIntrinsic`). LLVM 18 will not compile it.
+
+2. **ld64.lld from LLVM 18:** The LLVM 20 Homebrew bottle does not include `ld64.lld`. Install `llvm@18` alongside `llvm@20` and pass `-DACPP_LLD_PATH=$(brew --prefix llvm@18)/bin/ld64.lld`.
+
+3. **ACPP_COMPILER_FEATURE_PROFILE=full:** Must be set explicitly. The default (`none`) disables the SSCP compiler, which prevents the `llvm-to-metal` translation library from being built.
+
+4. **CMAKE_OSX_SYSROOT:** Must be set to `$(xcrun --sdk macosx --show-sdk-path)`. Homebrew LLVM does not auto-detect the macOS SDK, causing SSCP libkernel bitcode compilation to fail with a broken `-isysroot` flag.
+
+5. **MSL 3.2 fallback patch:** metal-cpp headers from macOS 15 do not define `MTL::LanguageVersion4_0`. Patch `metal_code_object.cpp` to fall back to `LanguageVersion3_2`. See `patches/adaptivecpp/0001-metal-fallback-msl-3.2-for-older-metal-cpp-headers.patch`.
+
+6. **libomp:** Required by AdaptiveCpp runtime. Must pass explicit OpenMP flags to CMake since `libomp` is keg-only on Homebrew.
+
+### Linker Warnings (Non-blocking)
+
+- `ld: warning: building for macOS-16.0, but linking with dylib ... which was built for newer version 26.0` — LLVM 20 and libomp Homebrew bottles were built for macOS 26 but our deployment target is 16.0. No functional impact observed.
 
 ### Implications for Phase 2 (AMReX)
 
-- If `usm_test` **passes**: AMReX SYCL backend should work with minimal changes. `sycl::malloc_shared` backed by Metal shared storage mode provides the unified memory AMReX expects.
-- If `usm_test` **fails**: AMReX memory arenas need a buffer-based fallback path. This would be a significant refactoring effort — see spec.md §3.2.
-- If `reduction_test` **fails**: WarpX current deposition kernels need restructuring to avoid `atomic_ref<float>`. Possible workaround: threadgroup-local accumulation followed by non-atomic writeback.
+- **USM works:** `sycl::malloc_shared` is functional on Metal. AMReX SYCL backend should work with minimal changes.
+- **Atomics work:** `atomic_ref<float>` and `atomic_ref<int>` fetch_add are correct. WarpX current deposition kernels should work in FP32 mode.
+- **JIT compilation:** First kernel invocation triggers JIT compilation (LLVM IR → MSL). Subsequent runs use cached binaries. AdaptiveCpp warns about this — expect slower first timestep.
 
 ### Known Limitations (Hardware)
 

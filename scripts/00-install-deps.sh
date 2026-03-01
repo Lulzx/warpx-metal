@@ -14,7 +14,7 @@ source "${SCRIPT_DIR}/env.sh"
 echo ""
 echo "=== Step 1: Install Homebrew packages ==="
 
-PACKAGES=(llvm@18 boost ninja cmake)
+PACKAGES=(llvm@20 llvm@18 boost ninja cmake libomp)
 for pkg in "${PACKAGES[@]}"; do
     if brew list --formula "$pkg" &>/dev/null; then
         echo "  [OK] $pkg already installed"
@@ -25,34 +25,51 @@ for pkg in "${PACKAGES[@]}"; do
 done
 
 echo ""
-echo "=== Step 2: Verify LLVM 18 ==="
+echo "=== Step 2: Verify LLVM 20 ==="
 
 CLANG_VERSION=$("${LLVM_PREFIX}/bin/clang" --version | head -1)
 echo "  ${CLANG_VERSION}"
-if echo "${CLANG_VERSION}" | grep -q "18\."; then
-    echo "  [OK] LLVM 18 confirmed"
+if echo "${CLANG_VERSION}" | grep -q "20\."; then
+    echo "  [OK] LLVM 20 confirmed"
 else
-    echo "  [WARN] Expected LLVM 18, got: ${CLANG_VERSION}"
+    echo "  [WARN] Expected LLVM 20, got: ${CLANG_VERSION}"
+fi
+
+# LLVM 18 provides ld64.lld (not included in LLVM 20 Homebrew bottle)
+LLD_PATH="$(brew --prefix llvm@18)/bin/ld64.lld"
+if [ -x "${LLD_PATH}" ]; then
+    echo "  [OK] ld64.lld: ${LLD_PATH}"
+else
+    echo "  [WARN] ld64.lld not found in llvm@18"
 fi
 
 echo ""
 echo "=== Step 3: Verify Metal compiler toolchain ==="
 
+# Check for the Metal compiler binary (may need Metal Toolchain component)
 METAL_PATH="$(xcrun -f metal 2>/dev/null || true)"
 if [ -n "${METAL_PATH}" ]; then
-    echo "  [OK] Metal compiler: ${METAL_PATH}"
+    # Verify it actually works (Xcode 26+ may require downloading Metal Toolchain)
+    if "${METAL_PATH}" --version &>/dev/null; then
+        echo "  [OK] Metal compiler: ${METAL_PATH}"
+    else
+        echo "  [WARN] Metal compiler found at ${METAL_PATH} but not functional."
+        echo "         Run: xcodebuild -downloadComponent MetalToolchain"
+        echo "         (AdaptiveCpp uses LLVM JIT, so this may not be blocking.)"
+    fi
 else
-    echo "  [FAIL] Metal compiler not found. Install Xcode command-line tools:"
-    echo "         xcode-select --install"
-    exit 1
+    echo "  [WARN] Metal compiler not found via xcrun."
+    echo "         Install Xcode command-line tools: xcode-select --install"
+    echo "         Then download Metal Toolchain: xcodebuild -downloadComponent MetalToolchain"
 fi
 
 METALLIB_PATH="$(xcrun -f metallib 2>/dev/null || true)"
 if [ -n "${METALLIB_PATH}" ]; then
     echo "  [OK] metallib: ${METALLIB_PATH}"
 else
-    echo "  [FAIL] metallib not found"
-    exit 1
+    echo "  [WARN] metallib not found. This is expected if Metal Toolchain is not installed."
+    echo "         Run: xcodebuild -downloadComponent MetalToolchain"
+    echo "         (Not blocking — AdaptiveCpp uses its own LLVM IR → MSL JIT pipeline.)"
 fi
 
 echo ""

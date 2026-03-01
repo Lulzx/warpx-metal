@@ -7,8 +7,9 @@ set -euo pipefail
 # Project root (resolve relative to this script's location)
 export WARPX_METAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# LLVM 18 (AdaptiveCpp supports ≤20; we pin 18 for stability)
-export LLVM_PREFIX="$(brew --prefix llvm@18 2>/dev/null || echo /opt/homebrew/opt/llvm@18)"
+# LLVM 20 (AdaptiveCpp develop branch Metal backend requires LLVM 20 APIs)
+# LLVM 18 is also needed for ld64.lld (not shipped in LLVM 20 Homebrew bottle)
+export LLVM_PREFIX="$(brew --prefix llvm@20 2>/dev/null || echo /opt/homebrew/opt/llvm@20)"
 export LLVM_DIR="${LLVM_PREFIX}/lib/cmake/llvm"
 export CC="${LLVM_PREFIX}/bin/clang"
 export CXX="${LLVM_PREFIX}/bin/clang++"

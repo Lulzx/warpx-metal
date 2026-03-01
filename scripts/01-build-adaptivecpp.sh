@@ -53,12 +53,33 @@ BUILD_DIR="${ACPP_SOURCE_DIR}/build"
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
+# libomp is keg-only on Homebrew; help CMake find it
+OMP_PREFIX="$(brew --prefix libomp 2>/dev/null || echo /opt/homebrew/opt/libomp)"
+
+# macOS SDK sysroot (needed for SSCP libkernel bitcode compilation)
+MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+
+# ld64.lld: LLVM 20 Homebrew bottle doesn't include lld; use LLVM 18's copy
+LLD_PATH="$(brew --prefix llvm@18 2>/dev/null)/bin/ld64.lld"
+if [ ! -x "${LLD_PATH}" ]; then
+    echo "  [WARN] ld64.lld not found at ${LLD_PATH}. Install llvm@18: brew install llvm@18"
+fi
+
 cmake .. \
     -G Ninja \
     -DCMAKE_INSTALL_PREFIX="${ACPP_INSTALL_PREFIX}" \
     -DCMAKE_C_COMPILER="${CC}" \
     -DCMAKE_CXX_COMPILER="${CXX}" \
+    -DCMAKE_OSX_SYSROOT="${MACOS_SDK}" \
     -DLLVM_DIR="${LLVM_DIR}" \
+    -DACPP_COMPILER_FEATURE_PROFILE=full \
+    -DACPP_LLD_PATH="${LLD_PATH}" \
+    -DOpenMP_C_FLAGS="-Xclang -fopenmp -I${OMP_PREFIX}/include" \
+    -DOpenMP_CXX_FLAGS="-Xclang -fopenmp -I${OMP_PREFIX}/include" \
+    -DOpenMP_C_LIB_NAMES="omp" \
+    -DOpenMP_CXX_LIB_NAMES="omp" \
+    -DOpenMP_omp_LIBRARY="${OMP_PREFIX}/lib/libomp.dylib" \
+    -DMETAL_INCLUDE_DIR="${METAL_CPP_DIR}" \
     -DWITH_METAL_BACKEND=ON \
     -DWITH_CPU_BACKEND=ON \
     -DWITH_CUDA_BACKEND=OFF \
