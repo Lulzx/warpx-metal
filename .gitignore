@@ -9,8 +9,12 @@ extern/AdaptiveCpp/
 extern/amrex/
 extern/warpx/
 
+# Root-level amrex clone (legacy)
+/amrex/
+
 # Installed software
 opt/adaptivecpp/
+opt/amrex/
 opt/metal-cpp/
 
 # macOS
@@ -28,3 +32,4 @@ tests/sycl/device_query
 tests/sycl/vector_add
 tests/sycl/usm_test
 tests/sycl/reduction_test
+tests/amrex/heat_equation/build/

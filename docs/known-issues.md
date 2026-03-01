@@ -44,6 +44,64 @@
 - **Atomics work:** `atomic_ref<float>` and `atomic_ref<int>` fetch_add are correct. WarpX current deposition kernels should work in FP32 mode.
 - **JIT compilation:** First kernel invocation triggers JIT compilation (LLVM IR → MSL). Subsequent runs use cached binaries. AdaptiveCpp warns about this — expect slower first timestep.
 
+## Phase 2: AMReX on AdaptiveCpp Metal Backend
+
+### Build Configuration
+
+AMReX is built with the AdaptiveCpp `acpp` compiler as the SYCL provider, replacing Intel oneAPI's `icpx`/`dpcpp`. Key CMake flags:
+
+```
+-DCMAKE_CXX_COMPILER=acpp
+-DAMReX_GPU_BACKEND=SYCL
+-DAMReX_PRECISION=SINGLE
+-DAMReX_PARTICLES_PRECISION=SINGLE
+-DAMReX_SYCL_SUB_GROUP_SIZE=32
+-DAMReX_MPI=OFF -DAMReX_OMP=OFF -DAMReX_FORTRAN=OFF
+-DAMReX_SYCL_AOT=OFF -DAMReX_SYCL_SPLIT_KERNEL=OFF -DAMReX_SYCL_ONEDPL=OFF
+```
+
+### Test Results
+
+| Test | Status | Notes |
+|------|--------|-------|
+| HeatEquation (16^3, 10 steps) | **PASS** | All 10 timesteps complete on Metal GPU |
+
+### Patches Applied
+
+**1. AMReXSYCL.cmake** (file replacement)
+Replaces `Tools/CMake/AMReXSYCL.cmake` to support AdaptiveCpp alongside Intel oneAPI. The original unconditionally adds Intel-specific flags (`-fsycl`, `-qmkl`, `-fsycl-device-lib`, `-mlong-double-64`) that break under `acpp`. The patched version:
+- Detects AdaptiveCpp by checking if the CXX compiler basename is `acpp` or `syclcc`
+- **AdaptiveCpp path:** Minimal SYCL interface target with `cxx_std_17`, `-Wno-tautological-constant-compare`, and `-DAMREX_NO_INT128`
+- **Intel path:** Preserves all original Intel-specific flags unchanged
+
+**2. AMReX_RandomEngine.H / AMReX_Random.cpp** (file replacements)
+Guards `oneapi::mkl::rng` includes and usage with `!defined(SYCL_IMPLEMENTATION_ACPP)`. Provides stub RNG types for AdaptiveCpp (GPU RNG not yet supported; falls through to CPU RNG).
+
+**3. AMReX_INT.H** (surgical patch)
+Disables `__int128` / `AMREX_INT128_SUPPORTED` when `AMREX_NO_INT128` is defined. The Metal emitter cannot translate `i128` (maps to `uint4` in MSL with unsupported casts). All i128 codepaths (`umulhi`, `FastDivmodU64`) have safe fallbacks.
+
+**4. AMReX_Math.H** (no longer needed — handled by `AMREX_NO_INT128`)
+Previously patched `sycl::mul_hi` → UInt128_t fallback, but disabling INT128 entirely removes the function.
+
+**5. AMReX_GpuAsyncArray.H / AMReX_GpuElixir.cpp** (surgical patches)
+Replaces `host_task` (SYCL 2020 optional, not in AdaptiveCpp) with synchronous `q.wait()` + direct cleanup.
+
+**6. AMReX_GpuLaunchFunctsG.H / AMReX_GpuLaunchMacrosG.nolint.H / AMReX_TagParallelFor.H / AMReX_FBI.H** (surgical patches)
+Removes `[[sycl::reqd_sub_group_size(...)]]` and `[[sycl::reqd_work_group_size(...)]]` attributes. These caused: (a) compile warnings "unknown attribute", (b) runtime `uint4` type cast errors in the Metal emitter. Apple GPUs have fixed 32-thread sub-groups, so these are redundant.
+
+### AdaptiveCpp Metal Emitter Bug Fix
+
+**0003-metal-emit-struct-defs-for-array-elements.patch** — Fixes a bug in `Emitter.cpp` where struct types used as array elements inside other structs were not having their definitions emitted in MSL. The `addDeps` lambda only checked direct `StructType` members but didn't recurse into `ArrayType`. This caused "undeclared identifier" errors for types like `FastDivmodU64` used in `BoxIndexerND::fdm[2]`.
+
+### Metal GPU Constraints
+
+1. **No `double`:** Metal GPUs have zero double-precision support. All builds use `SINGLE` precision. Device code must avoid double literals (`2.` → `Real(2.0)` or `2.0f`).
+2. **No `__int128`:** The Metal emitter maps `i128` to `uint4` in MSL but only supports limited cast patterns. Disabled via `AMREX_NO_INT128`.
+3. **No `host_task`:** SYCL 2020 `host_task` is not supported by AdaptiveCpp. Replaced with synchronous `q.wait()`.
+4. **JIT compilation:** First kernel run triggers LLVM IR → MSL JIT compilation (AdaptiveCpp warns about this). Cached after first run.
+
+---
+
 ### Known Limitations (Hardware)
 
 1. **No FP64:** Apple GPUs have zero double-precision support. All builds must use `SINGLE` precision.

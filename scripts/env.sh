@@ -20,6 +20,12 @@ export METAL_CPP_DIR="${WARPX_METAL_ROOT}/opt/metal-cpp"
 # AdaptiveCpp install prefix
 export ACPP_INSTALL_PREFIX="${WARPX_METAL_ROOT}/opt/adaptivecpp"
 
+# AMReX install prefix
+export AMREX_INSTALL_PREFIX="${WARPX_METAL_ROOT}/opt/amrex"
+
+# AMReX source
+export AMREX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/amrex"
+
 # AdaptiveCpp source
 export ACPP_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/AdaptiveCpp"
 
