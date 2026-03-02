@@ -7,6 +7,23 @@ AdaptiveCpp compiles SYCL kernels to LLVM IR at build time and JIT-translates
 them to Metal Shading Language at runtime. Tested on an M4 Pro (applegpu_g16s,
 16 compute units).
 
+## Status
+
+WarpX — a full electromagnetic particle-in-cell (PIC) plasma physics code — is
+running SYCL kernels on Apple Silicon Metal GPU via AdaptiveCpp. The entire
+stack works end to end:
+
+    WarpX → AMReX → AdaptiveCpp SSCP → Metal → Apple M4 Pro GPU
+
+Key achievements that required non-trivial engineering:
+
+- Built AdaptiveCpp's Metal emitter with 4 patches (array deps, AS5 identity
+  cast, PHI cycle, thread-param IPA)
+- Fixed AMReX's atomic operations for SSCP mode (atomics were silently falling
+  to no-ops)
+- Worked around Metal's zero FP64 support, no __int128, no host_task, no
+  sub-group size hints
+
 ## Build
 
 Requires macOS 14+, Xcode 16, Homebrew, Apple Silicon.
