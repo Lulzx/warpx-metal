@@ -1,0 +1,28 @@
+# WarpX 2D field-only test — pure EM field solve, no particles
+# Validates core AMReX + WarpX field infrastructure on Metal GPU
+max_step = 10
+
+amr.n_cell = 32 32
+amr.max_grid_size = 32
+amr.max_level = 0
+
+geometry.dims = 2
+geometry.prob_lo = -20.e-6 -20.e-6
+geometry.prob_hi =  20.e-6  20.e-6
+
+boundary.field_lo = periodic periodic
+boundary.field_hi = periodic periodic
+
+warpx.verbose = 1
+warpx.cfl = 1.0
+warpx.use_filter = 0
+
+algo.field_gathering = energy-conserving
+algo.current_deposition = direct
+
+# No particles at all — omit species_names entirely
+# No algo.particle_shape needed without particles
+
+diagnostics.diags_names = diag1
+diag1.intervals = 99999
+diag1.diag_type = Full

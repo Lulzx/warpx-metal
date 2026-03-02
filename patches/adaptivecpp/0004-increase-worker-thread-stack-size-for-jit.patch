@@ -1,0 +1,69 @@
+diff --git a/include/hipSYCL/runtime/generic/async_worker.hpp b/include/hipSYCL/runtime/generic/async_worker.hpp
+index 22cd8e4a..2df10e7f 100644
+--- a/include/hipSYCL/runtime/generic/async_worker.hpp
++++ b/include/hipSYCL/runtime/generic/async_worker.hpp
+@@ -17,6 +17,7 @@
+ #include <mutex>
+ #include <functional>
+ #include <queue>
++#include <pthread.h>
+ 
+ 
+ namespace hipsycl {
+@@ -55,8 +56,10 @@ private:
+   /// tasks. If no tasks are available, waits until a new task is
+   /// supplied.
+   void work();
++  friend void* worker_thread_entry(void*);
+ 
+-  std::thread _worker_thread;
++  pthread_t _worker_thread;
++  bool _thread_created = false;
+ 
+   std::atomic<bool> _continue;
+ 
+diff --git a/src/runtime/generic/async_worker.cpp b/src/runtime/generic/async_worker.cpp
+index 65947caa..0aabff93 100644
+--- a/src/runtime/generic/async_worker.cpp
++++ b/src/runtime/generic/async_worker.cpp
+@@ -17,10 +17,25 @@
+ namespace hipsycl {
+ namespace rt {
+ 
++void* worker_thread_entry(void* arg) {
++  static_cast<worker_thread*>(arg)->work();
++  return nullptr;
++}
++
+ worker_thread::worker_thread()
+-    : _continue{true}
++    : _continue{true}, _thread_created{false}
+ {
+-  _worker_thread = std::thread{[this](){ work(); } };
++  // Use pthread directly to set a larger stack size (8MB).
++  // Default pthread stack on macOS is ~512KB, which overflows during
++  // LLVM JIT compilation of complex kernels (e.g. WarpX on Metal).
++  pthread_attr_t attr;
++  pthread_attr_init(&attr);
++  pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
++  int rc = pthread_create(&_worker_thread, &attr, worker_thread_entry, this);
++  pthread_attr_destroy(&attr);
++  if (rc == 0) {
++    _thread_created = true;
++  }
+ }
+ 
+ 
+@@ -54,8 +69,10 @@ void worker_thread::halt()
+     _continue = false;
+     _condition_wait.notify_all();
+   }
+-  if(_worker_thread.joinable())
+-    _worker_thread.join();
++  if(_thread_created) {
++    pthread_join(_worker_thread, nullptr);
++    _thread_created = false;
++  }
+ }
+ 
+ void worker_thread::work()

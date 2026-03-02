@@ -1,0 +1,41 @@
+diff --git a/src/compiler/llvm-to-backend/metal/Emitter.cpp b/src/compiler/llvm-to-backend/metal/Emitter.cpp
+index 614e6bc8..127e9592 100644
+--- a/src/compiler/llvm-to-backend/metal/Emitter.cpp
++++ b/src/compiler/llvm-to-backend/metal/Emitter.cpp
+@@ -277,12 +277,21 @@ void MetalEmitter::emitTypes() {
+ 
+   std::unordered_map<const StructType*, std::unordered_set<const StructType*>> deps;
+ 
+-  auto addDeps = [&](const StructType *ST) {
+-    for (unsigned i = 0; i < ST->getNumElements(); ++i) {
+-      Type *elemTy = ST->getElementType(i);
++  // Recursively unwrap ArrayType to find nested StructType dependencies.
++  // Without this, struct types used as array elements (e.g. FastDivmodU64[2])
++  // are not collected and their definitions are missing in emitted MSL.
++  std::function<void(Type*, const StructType*)> collectStructDeps =
++    [&](Type* elemTy, const StructType* parent) {
+       if (auto *elemST = dyn_cast<StructType>(elemTy)) {
+-        deps[ST].insert(elemST);
++        deps[parent].insert(elemST);
++      } else if (auto *AT = dyn_cast<ArrayType>(elemTy)) {
++        collectStructDeps(AT->getElementType(), parent);
+       }
++    };
++
++  auto addDeps = [&](const StructType *ST) {
++    for (unsigned i = 0; i < ST->getNumElements(); ++i) {
++      collectStructDeps(ST->getElementType(i), ST);
+     }
+   };
+ 
+@@ -1414,6 +1423,10 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
+     return it->second;
+   }
+ 
++  // Insert sentinel to break infinite recursion through PHI/select cycles
++  // (e.g. PHI -> GEP -> PHI -> ...). Will be overwritten with actual AS.
++  inferredPtrAS[V] = 0;
++
+   // If the value is an addrspacecast, get the original address space
+   if (auto* Alloca = dyn_cast<AllocaInst>(V)) {
+     return (inferredPtrAS[V] = 5 /* private */);

@@ -26,6 +26,9 @@ export AMREX_INSTALL_PREFIX="${WARPX_METAL_ROOT}/opt/amrex"
 # AMReX source
 export AMREX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/amrex"
 
+# WarpX source
+export WARPX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/warpx"
+
 # AdaptiveCpp source
 export ACPP_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/AdaptiveCpp"
 
