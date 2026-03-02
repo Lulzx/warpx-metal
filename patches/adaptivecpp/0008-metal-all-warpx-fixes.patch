@@ -22,11 +22,98 @@ index 22cd8e4a..2df10e7f 100644
  
    std::atomic<bool> _continue;
  
+diff --git a/src/compiler/llvm-to-backend/GlobalInliningAttributorPass.cpp b/src/compiler/llvm-to-backend/GlobalInliningAttributorPass.cpp
+index 22f6b57f..d3d78963 100644
+--- a/src/compiler/llvm-to-backend/GlobalInliningAttributorPass.cpp
++++ b/src/compiler/llvm-to-backend/GlobalInliningAttributorPass.cpp
+@@ -11,6 +11,8 @@
+ #include "hipSYCL/compiler/llvm-to-backend/GlobalInliningAttributorPass.hpp"
+ 
+ #include <llvm/IR/Module.h>
++#include <cstdlib>
++#include <string>
+ 
+ namespace hipsycl {
+ namespace compiler {
+@@ -27,14 +29,30 @@ llvm::PreservedAnalyses GlobalInliningAttributorPass::run(llvm::Module &M,
+     if(auto* F = M.getFunction(KN))
+       Kernels.insert(F);
+ 
++  // Threshold for force-inlining: functions larger than this many instructions
++  // get InternalLinkage but NOT AlwaysInline, so the O3 cost-based inliner
++  // decides for them. This prevents catastrophic size explosion when large
++  // helper functions (e.g. RNG implementations) are force-inlined into kernels,
++  // which can produce 80K+ instruction kernels that take 30+ minutes to structurize.
++  // Set via ACPP_INLINE_THRESHOLD env var, default 200.
++  unsigned InlineThreshold = 200;
++  if (const char* env = std::getenv("ACPP_INLINE_THRESHOLD"))
++    InlineThreshold = static_cast<unsigned>(std::stoul(env));
++
+   for(auto &F : M) {
+     // Ignore kernels and intrinsics
+     if (!F.isIntrinsic() && !Kernels.contains(&F)) {
+       // Ignore undefined functions
+       if(!F.empty()) {
+         F.setLinkage(llvm::GlobalValue::InternalLinkage);
+-        if(!F.hasFnAttribute(llvm::Attribute::AlwaysInline))
+-          F.addFnAttr(llvm::Attribute::AlwaysInline);
++        // Count instructions to decide whether to force-inline
++        unsigned NumInsts = 0;
++        for (auto& BB : F) NumInsts += BB.size();
++        if (NumInsts <= InlineThreshold) {
++          if(!F.hasFnAttribute(llvm::Attribute::AlwaysInline))
++            F.addFnAttr(llvm::Attribute::AlwaysInline);
++        }
++        // Large functions: leave to O3's cost-based inliner
+       }
+     }
+   }
 diff --git a/src/compiler/llvm-to-backend/metal/Emitter.cpp b/src/compiler/llvm-to-backend/metal/Emitter.cpp
-index 614e6bc8..9dce7f4f 100644
+index 614e6bc8..fede9ff8 100644
 --- a/src/compiler/llvm-to-backend/metal/Emitter.cpp
 +++ b/src/compiler/llvm-to-backend/metal/Emitter.cpp
-@@ -277,12 +277,21 @@ void MetalEmitter::emitTypes() {
+@@ -142,6 +142,7 @@ bool MetalEmitter::emit(std::string& out) {
+   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+ 
+   analyzeCallInsts();
++  analyzeThreadASParams();
+ 
+   os << R"__(
+ #include <metal_stdlib>
+@@ -228,10 +229,31 @@ uint3 __acpp_sscp_metal_local_size [[threads_per_threadgroup]];
+   auto sortedFunctions = topologicalSort(callGraph);
+ 
+   for (Function* F : sortedFunctions) {
++    auto funcName = F->getName().str();
++    unsigned numBBs = F->size();
++    unsigned numInsts = 0;
++    for (auto& BB : *F) numInsts += BB.size();
++
++    // Safety net for non-kernel functions that are still too large after the
++    // reduced-inlining optimization. Kernels are NEVER skipped — they must
++    // exist for the runtime to find them. Non-kernel stubs are safe because
++    // their callers also stub the call via emitCallInstruction.
++    bool isKernelFunc = kernelNames.count(funcName) > 0;
++    if (!isKernelFunc && numInsts > 50000) {
++      llvm::errs() << "[MetalEmitter] SKIPPING large helper " << funcName
++                   << " (" << numBBs << " BBs, " << numInsts << " insts)\n";
++      os << "// SKIPPED (too large): " << funcName << " (" << numBBs << " BBs, " << numInsts << " insts)\n\n";
++      continue;
++    }
++    if (numInsts > 10000) {
++      llvm::errs() << "[MetalEmitter] WARNING: large function " << funcName
++                   << " (" << numBBs << " BBs, " << numInsts << " insts) - may be slow\n";
++    }
++
+     HLExtractionPass hlPass;
+     hlPass.run(*F, FAM);
+     if (!hlPass.tree) {
+-      errorMsg = "Failed to extract HL tree for " + F->getName().str();
++      errorMsg = "Failed to extract HL tree for " + funcName;
+       return false;
+     }
+ 
+@@ -277,12 +299,21 @@ void MetalEmitter::emitTypes() {
  
    std::unordered_map<const StructType*, std::unordered_set<const StructType*>> deps;
  
@@ -52,7 +139,20 @@ index 614e6bc8..9dce7f4f 100644
      }
    };
  
-@@ -648,7 +657,22 @@ bool MetalEmitter::emitBasicBlock(const BasicBlock* BB, int level) {
+@@ -462,7 +493,11 @@ bool MetalEmitter::emitSignature(Function& F) {
+         }
+ 
+       } else {
+-        os << typeName << " " << valueName(&A);
++        // For non-kernel functions, use physical AS inference for pointer parameters.
++        // This ensures parameters that always receive thread-private (AS5) pointers
++        // are declared as 'thread void*' rather than 'device void*'.
++        auto inferredTypeName = A.getType()->isPointerTy() ? mapType(&A) : typeName;
++        os << inferredTypeName << " " << valueName(&A);
+       }
+     }
+   }
+@@ -648,7 +683,22 @@ bool MetalEmitter::emitBasicBlock(const BasicBlock* BB, int level) {
      if (it != phiIncomingFromBlock.end()) {
        const Value *V = it->second;
        if (!isa<UndefValue>(V) && !isa<PoisonValue>(V)) {
@@ -76,7 +176,7 @@ index 614e6bc8..9dce7f4f 100644
        } else {
          os << indent(level) << valueName(PHI) << "_in = /* undef */ 0;\n";
        }
-@@ -747,9 +771,16 @@ bool MetalEmitter::emitInstruction(const Instruction& I, int level) {
+@@ -747,9 +797,30 @@ bool MetalEmitter::emitInstruction(const Instruction& I, int level) {
      auto destType = mapType(CI->getDestTy());
      std::string src = emitExpr(CI->getOperand(0));
      auto srcType = mapType(CI->getSrcTy());
@@ -84,18 +184,32 @@ index 614e6bc8..9dce7f4f 100644
 +    // Special-case: addrspacecast — reinterpret via ulong on unified memory
      if (auto* ASC = dyn_cast<AddrSpaceCastInst>(CI)) {
 -      os << indent(level) << name << " = " << src << "; " << "// " << instToString(I) << "\n";
-+      unsigned srcAS = ASC->getSrcTy()->getPointerAddressSpace();
-+      unsigned destAS = ASC->getDestTy()->getPointerAddressSpace();
++      unsigned srcAS = ASC->getSrcAddressSpace();
++      unsigned destAS = ASC->getDestAddressSpace();
 +      if (srcAS != destAS) {
 +        auto destType = mapType(&I);
-+        os << indent(level) << name << " = (" << destType << ")((ulong)" << src << "); " << "// " << instToString(I) << "\n";
++        if (srcAS == 3 && destAS == 0) {
++          // threadgroup → generic: preserve threadgroup address space (AS3).
++          // Do NOT convert through ulong — that loses the address space qualifier,
++          // breaking barrier synchronization for shared-memory reductions.
++          os << indent(level) << name << " = " << src << "; " << "// threadgroup→generic AS3→AS0 (preserved) " << instToString(I) << "\n";
++        } else if (srcAS == 5 && destAS == 0) {
++          // thread (private) → generic: preserve thread address space (AS5).
++          // On Apple Silicon Metal GPU, reading thread-private memory via a device
++          // pointer returns zeros — the thread address space is NOT accessible via
++          // the device address space. Emit an identity cast so all subsequent GEPs
++          // and loads/stores through this pointer keep the 'thread' qualifier.
++          os << indent(level) << name << " = " << src << "; " << "// thread→generic AS5→AS0 (preserved) " << instToString(I) << "\n";
++        } else {
++          os << indent(level) << name << " = (" << destType << ")((ulong)" << src << "); " << "// " << instToString(I) << "\n";
++        }
 +      } else {
 +        os << indent(level) << name << " = " << src << "; " << "// " << instToString(I) << "\n";
 +      }
      } else if (auto* BC = dyn_cast<BitCastInst>(CI)) {
        os << indent(level) << name << " = " << "as_type<" << destType << ">(" << src << "); " << "// " << instToString(I) << "\n";
      } else if (auto* SI = dyn_cast<SExtInst>(CI)) {
-@@ -972,6 +1003,13 @@ void MetalEmitter::emitICmpInstruction(const ICmpInst* IC, const std::string& na
+@@ -972,6 +1043,13 @@ void MetalEmitter::emitICmpInstruction(const ICmpInst* IC, const std::string& na
    std::string lhs = emitExpr(IC->getOperand(0));
    std::string rhs = emitExpr(IC->getOperand(1));
  
@@ -109,7 +223,7 @@ index 614e6bc8..9dce7f4f 100644
    auto resultType = mapType(IC->getType());
  
    switch (IC->getPredicate()) {
-@@ -1088,7 +1126,15 @@ void MetalEmitter::emitGEPInstruction(const GetElementPtrInst* GEP, const std::s
+@@ -1088,7 +1166,15 @@ void MetalEmitter::emitGEPInstruction(const GetElementPtrInst* GEP, const std::s
    auto idxIt = GEP->idx_begin();
    if (idxIt != GEP->idx_end()) {
      Value *firstIdx = *idxIt;
@@ -126,7 +240,7 @@ index 614e6bc8..9dce7f4f 100644
  
      if (auto *CI = dyn_cast<ConstantInt>(firstIdx)) {
        accessExpr = castBase + "[" + std::to_string(CI->getSExtValue()) + "]";
-@@ -1138,8 +1184,11 @@ void MetalEmitter::emitGEPInstruction(const GetElementPtrInst* GEP, const std::s
+@@ -1138,8 +1224,11 @@ void MetalEmitter::emitGEPInstruction(const GetElementPtrInst* GEP, const std::s
  bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& name, int level) {
    Function *callee = CI->getCalledFunction();
    if (!callee) {
@@ -140,7 +254,7 @@ index 614e6bc8..9dce7f4f 100644
    }
  
    std::string calleeName = callee->getName().str();
-@@ -1148,6 +1197,27 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
+@@ -1148,6 +1237,39 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
      return emitMetalInlineCall(CI, name, level);
    }
  
@@ -160,7 +274,19 @@ index 614e6bc8..9dce7f4f 100644
 +  if (calleeName.find("amrex6Random") != std::string::npos ||
 +      calleeName.find("amrex12Random") != std::string::npos) {
 +    if (!name.empty()) {
-+      os << indent(level) << name << " = as_type<float>(0x3f000000u); // RNG stub: 0.5f\n";
++      Type* retTy = CI->getType();
++      if (auto* ST = dyn_cast<StructType>(retTy)) {
++        // Return type is a struct (e.g. { float, float, float } momentum)
++        auto typeName = mapType(retTy);
++        std::string fields;
++        for (unsigned i = 0; i < ST->getNumElements(); ++i) {
++          if (i > 0) fields += ", ";
++          fields += "0.5f";
++        }
++        os << indent(level) << name << " = " << typeName << "{" << fields << "}; // RNG stub\n";
++      } else {
++        os << indent(level) << name << " = as_type<float>(0x3f000000u); // RNG stub: 0.5f\n";
++      }
 +    }
 +    return true;
 +  }
@@ -168,7 +294,7 @@ index 614e6bc8..9dce7f4f 100644
    int argsSize = CI->arg_size();
    if (callee->isDeclaration()) {
      auto returnType = callee->getReturnType();
-@@ -1195,7 +1265,13 @@ std::string MetalEmitter::emitExpr(const Value* V) {
+@@ -1195,7 +1317,13 @@ std::string MetalEmitter::emitExpr(const Value* V) {
    }
  
    if (auto *CF = dyn_cast<ConstantFP>(V)) {
@@ -183,7 +309,7 @@ index 614e6bc8..9dce7f4f 100644
      uint32_t val; memcpy(&val, &floatVal, sizeof(float));
      std::ostringstream hex;
      hex << "as_type<float>(" << "0x" << std::hex << val << "u)";
-@@ -1216,6 +1292,29 @@ std::string MetalEmitter::emitExpr(const Value* V) {
+@@ -1216,6 +1344,29 @@ std::string MetalEmitter::emitExpr(const Value* V) {
      return "/* undef */ 0";
    }
  
@@ -213,7 +339,7 @@ index 614e6bc8..9dce7f4f 100644
    return valueName(V);
  }
  
-@@ -1334,8 +1433,10 @@ std::string MetalEmitter::mapType(const Type* T) {
+@@ -1334,8 +1485,10 @@ std::string MetalEmitter::mapType(const Type* T) {
    } else if (T->isFloatTy()) {
      return typeCache[T] = "float";
    } else if (T->isDoubleTy()) {
@@ -226,20 +352,41 @@ index 614e6bc8..9dce7f4f 100644
    } else if (T->isHalfTy()) {
      return typeCache[T] = "half";
    } else {
-@@ -1409,17 +1510,27 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
+@@ -1409,43 +1562,108 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
    if (AS != 0) {
      return AS;
    }
 +  static constexpr unsigned SENTINEL = UINT_MAX;
    auto it = inferredPtrAS.find(V);
    if (it != inferredPtrAS.end()) {
-+    // If we hit a cached SENTINEL, a cycle was detected — default to device AS
-+    if (it->second == SENTINEL) return 1;
++    // If we hit a cached SENTINEL, we're in a back-edge cycle (e.g. loop counter PHI
++    // feeding back through a GEP).  Return 0 (unknown) rather than 1 (device) so
++    // that PHI/Select handlers skip this value instead of concluding "device".
++    // The PHI will resolve to the explicitly-typed non-cyclic incoming (e.g. an
++    // AS5→AS0 addrspacecast from a thread-private alloca), and all subsequent
++    // GEPs/loads will be re-evaluated against that resolved value.
++    if (it->second == SENTINEL) return 0;
      return it->second;
    }
  
 +  // Insert sentinel to break infinite recursion through PHI/select cycles.
 +  inferredPtrAS[V] = SENTINEL;
++
++  // Function arguments: check if this parameter was identified as thread-AS.
++  if (auto* Arg = dyn_cast<Argument>(V)) {
++    const Function* F = Arg->getParent();
++    auto it = threadASParams.find(F);
++    if (it != threadASParams.end() && it->second.count(Arg->getArgNo())) {
++      return (inferredPtrAS[V] = 5);
++    }
++    return (inferredPtrAS[V] = 1);
++  }
++
++  // Undef/poison values carry no meaningful address space; treat as unknown
++  // so that PHI/Select nodes containing them don't default to device.
++  if (isa<UndefValue>(V) || isa<PoisonValue>(V)) {
++    return 0; // SENTINEL stays in map, which also returns 0 — correct either way
++  }
 +
    // If the value is an addrspacecast, get the original address space
    if (auto* Alloca = dyn_cast<AllocaInst>(V)) {
@@ -247,15 +394,35 @@ index 614e6bc8..9dce7f4f 100644
    }
    if (auto* ASC = dyn_cast<AddrSpaceCastInst>(V)) {
 -    return (inferredPtrAS[V] = getPhysicalPointerAddressSpace(ASC->getOperand(0)));
++    unsigned srcAS = ASC->getSrcTy()->getPointerAddressSpace();
 +    unsigned destAS = ASC->getDestTy()->getPointerAddressSpace();
 +    if (destAS != 0)
 +      return (inferredPtrAS[V] = destAS);
-+    // Cast to generic (AS 0) → use device (1) as MSL generic stand-in
++    // Cast to generic (AS 0):
++    // Preserve threadgroup (AS3) → generic so that loads/stores through this
++    // pointer use threadgroup address space and barriers synchronize correctly.
++    // (Fixes AMReX blockReduceSum which uses h.local threadgroup memory via void*.)
++    if (srcAS == 3)
++      return (inferredPtrAS[V] = 3);
++    // Preserve thread/private (AS5) → generic so that loads/stores through this
++    // pointer use thread address space. On Apple Silicon Metal GPU, reading
++    // thread-private memory via a device pointer returns zeros.
++    if (srcAS == 5)
++      return (inferredPtrAS[V] = 5);
++    // Otherwise use device (1) as MSL generic stand-in
 +    return (inferredPtrAS[V] = 1);
    }
    if (auto* GEP = dyn_cast<GetElementPtrInst>(V)) {
-     return (inferredPtrAS[V] = getPhysicalPointerAddressSpace(GEP->getPointerOperand()));
-@@ -1429,23 +1540,34 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
+-    return (inferredPtrAS[V] = getPhysicalPointerAddressSpace(GEP->getPointerOperand()));
++    unsigned r = getPhysicalPointerAddressSpace(GEP->getPointerOperand());
++    if (r != 0) return (inferredPtrAS[V] = r);
++    // Result unknown (cycle-derived) — erase SENTINEL so future re-evaluation
++    // can resolve once the base PHI has been assigned a concrete address space.
++    inferredPtrAS.erase(V);
++    return 0;
+   }
+   if (auto* PHI = dyn_cast<PHINode>(V)) {
+     unsigned deducedAS = 0;
      for (unsigned i = 0; i < PHI->getNumIncomingValues(); ++i) {
        Value* incomingV = PHI->getIncomingValue(i);
        unsigned incomingAS = getPhysicalPointerAddressSpace(incomingV);
@@ -284,6 +451,12 @@ index 614e6bc8..9dce7f4f 100644
 +    // Treat sentinel as unknown
 +    if (trueAS == SENTINEL) trueAS = 0;
 +    if (falseAS == SENTINEL) falseAS = 0;
++    if (trueAS == 0 && falseAS == 0) {
++      // Both inputs are cycle-derived / unknown — erase SENTINEL so future
++      // re-evaluation can resolve once operands have concrete address spaces.
++      inferredPtrAS.erase(V);
++      return 0;
++    }
 +    if (trueAS != 0 && (trueAS == falseAS || falseAS == 0)) {
 +      return (inferredPtrAS[V] = trueAS);
 +    }
@@ -294,7 +467,7 @@ index 614e6bc8..9dce7f4f 100644
        return (inferredPtrAS[V] = trueAS);
      }
    }
-@@ -1465,12 +1587,12 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
+@@ -1465,12 +1683,12 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
        if (stRoot != root) continue;
  
        unsigned storedAS = getPhysicalPointerAddressSpace(SI->getValueOperand());
@@ -310,18 +483,105 @@ index 614e6bc8..9dce7f4f 100644
        }
      }
  
-@@ -1479,7 +1601,9 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
+@@ -1479,7 +1697,18 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
      }
    }
  
 -  return 0;
++  // BitCast: propagate the source operand's physical address space.
++  // e.g. T* shared = (T*)h.local  where h.local is void* derived from AS3 via addrspacecast
++  if (auto* BC = dyn_cast<BitCastInst>(V)) {
++    unsigned r = getPhysicalPointerAddressSpace(BC->getOperand(0));
++    if (r != 0) return (inferredPtrAS[V] = r);
++    inferredPtrAS.erase(V);
++    return 0;
++  }
++
 +  // Unknown pointer origin — default to device address space (1).
 +  // In GPU kernels, most pointers point to device memory.
 +  return (inferredPtrAS[V] = 1);
  }
  
  void MetalEmitter::analyzeCallInsts() {
-@@ -1568,7 +1692,7 @@ void MetalEmitter::collectVariablesInfo(const Function& F) {
+@@ -1536,6 +1765,77 @@ void MetalEmitter::analyzeCallInsts() {
+   }
+ }
+ 
++// Helper: returns true if V is rooted in an AS5 (thread-private) alloca,
++// or is a function argument already identified as thread-AS. Walks the
++// value chain without using the inferredPtrAS cache to avoid ordering issues.
++static bool isFromAS5Alloca(
++    const Value* V,
++    const std::unordered_map<const Function*, std::unordered_set<unsigned>>& threadASParams)
++{
++  // Prevent infinite loops (e.g. through PHI cycles); use visited set.
++  std::unordered_set<const Value*> visited;
++  const Value* Cur = V;
++  while (Cur && !visited.count(Cur)) {
++    visited.insert(Cur);
++    if (dyn_cast<AllocaInst>(Cur))
++      return true;  // AS5 alloca is the canonical thread-private root
++    if (auto* ASC = dyn_cast<AddrSpaceCastInst>(Cur)) {
++      if (ASC->getSrcAddressSpace() == 5)
++        return true;  // explicit AS5 source
++      Cur = ASC->getPointerOperand();
++    } else if (auto* GEP = dyn_cast<GetElementPtrInst>(Cur)) {
++      Cur = GEP->getPointerOperand();
++    } else if (auto* BC = dyn_cast<BitCastInst>(Cur)) {
++      Cur = BC->getOperand(0);
++    } else if (auto* Arg = dyn_cast<Argument>(Cur)) {
++      const Function* F = Arg->getParent();
++      auto it = threadASParams.find(F);
++      return it != threadASParams.end() && it->second.count(Arg->getArgNo());
++    } else {
++      break;
++    }
++  }
++  return false;
++}
++
++// Pre-analysis pass: identify function parameters that always receive AS5 (thread-private)
++// pointer arguments at their call sites. This is needed because the AS5→AS0 addrspacecast
++// pattern (used for WarpX AddPlasma lambda captures) passes a thread pointer to a function
++// that nominally takes a 'device void*' in LLVM IR. We must change those function signatures
++// to use 'thread void*' so Metal does not reject the cross-address-space call.
++//
++// Iterates to a fixed point to handle transitive propagation (e.g. A→B→C all thread-AS).
++void MetalEmitter::analyzeThreadASParams() {
++  bool changed = true;
++  while (changed) {
++    changed = false;
++    for (Function& F : M) {
++      if (F.isDeclaration()) continue;
++      for (BasicBlock& BB : F) {
++        for (Instruction& I : BB) {
++          auto* CI = dyn_cast<CallInst>(&I);
++          if (!CI) continue;
++          Function* callee = CI->getCalledFunction();
++          if (!callee || callee->isDeclaration()) continue;
++          // Do not mark kernel entry-point parameters (they receive device buffers).
++          if (kernelNames.count(callee->getName().str())) continue;
++          for (unsigned i = 0; i < CI->arg_size(); ++i) {
++            if (i >= callee->arg_size()) break; // vararg safety
++            Value* arg = CI->getArgOperand(i);
++            if (!arg->getType()->isPointerTy()) continue;
++            if (isFromAS5Alloca(arg, threadASParams)) {
++              if (!threadASParams[callee].count(i)) {
++                threadASParams[callee].insert(i);
++                changed = true;
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++}
++
+ void MetalEmitter::collectVariablesInfo(const Function& F) {
+   allocaIndex.clear();
+   phiSources.clear();
+@@ -1568,7 +1868,7 @@ void MetalEmitter::collectVariablesInfo(const Function& F) {
  
        if (!I.getType()->isVoidTy()) {
          if (auto* ASC = dyn_cast<AddrSpaceCastInst>(&I)) {
@@ -330,6 +590,28 @@ index 614e6bc8..9dce7f4f 100644
          } else if (auto* GEP = dyn_cast<GetElementPtrInst>(&I)) {
            valuesToDeclare[&I] = mapType(GEP->getPointerOperand());
          } else {
+diff --git a/src/compiler/llvm-to-backend/metal/Emitter.hpp b/src/compiler/llvm-to-backend/metal/Emitter.hpp
+index d865c783..db7513ba 100644
+--- a/src/compiler/llvm-to-backend/metal/Emitter.hpp
++++ b/src/compiler/llvm-to-backend/metal/Emitter.hpp
+@@ -76,6 +76,7 @@ private:
+   std::string mapType(const llvm::Value* V);
+   std::string getAddressSpaceKeyword(unsigned AS);
+   void analyzeCallInsts();
++  void analyzeThreadASParams();
+   void collectVariablesInfo(const llvm::Function& F);
+   unsigned getPhysicalPointerAddressSpace(const llvm::Value* V);
+   const llvm::Value* stripToRootObject(const llvm::Value* V);
+@@ -105,6 +106,9 @@ private:
+   std::unordered_map<const llvm::Value*, unsigned> inferredPtrAS;
+ 
+   std::unordered_set<const llvm::Function*> needsDynamicLocalMemory;
++  // Maps callee Function -> set of parameter indices that always receive AS5 (thread) pointers.
++  // Used to emit those parameters as 'thread void*' in function signatures.
++  std::unordered_map<const llvm::Function*, std::unordered_set<unsigned>> threadASParams;
+   int inputStructCounter = 0;
+   std::string inputStructName;
+ 
 diff --git a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
 index 8d2a54eb..45b45dd3 100644
 --- a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
@@ -709,7 +991,7 @@ index 65947caa..b5030c01 100644
  
  void worker_thread::work()
 diff --git a/src/runtime/metal/metal_code_object.cpp b/src/runtime/metal/metal_code_object.cpp
-index b9f76f1c..1345942a 100644
+index b9f76f1c..7d4e75fd 100644
 --- a/src/runtime/metal/metal_code_object.cpp
 +++ b/src/runtime/metal/metal_code_object.cpp
 @@ -15,6 +15,7 @@
@@ -734,15 +1016,42 @@ index b9f76f1c..1345942a 100644
    options->setOptimizationLevel(MTL::LibraryOptimizationLevel::LibraryOptimizationLevelSize);
  
    NS::String* sourceString = NS::String::string(source.c_str(),
-@@ -41,6 +48,11 @@ result build_metal_library_from_source(MTL::Library*& library,
+@@ -40,6 +47,14 @@ result build_metal_library_from_source(MTL::Library*& library,
+ 
    library = device->newLibrary(sourceString, options.get(), &error);
  
++  // Dump MSL if env var is set (useful for debugging Metal compilation issues)
++  if (const char* dump = std::getenv("ACPP_DUMP_MSL")) {
++    static int dumpCount = 0;
++    std::string dumpPath = std::string(dump) + "." + std::to_string(dumpCount++);
++    std::ofstream ofs(dumpPath);
++    if (ofs) ofs << source;
++  }
++
    if (error) {
-+    // Dump MSL source for debugging
-+    if (const char* dump = std::getenv("ACPP_DUMP_MSL")) {
-+      std::ofstream ofs(dump);
-+      if (ofs) ofs << source;
-+    }
      std::string error_msg = "metal_code_object: Shader compilation failed";
      if (error->localizedDescription()) {
-       error_msg += ": ";
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index 1241efee..4489e74f 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -164,11 +164,14 @@ result launch_kernel_from_library(
+ 
+   encoder->setComputePipelineState(pipeline_state.get());
+   auto user_local_mem_size = local_mem_size;
+-  auto threads_in_group = num_groups[0] * num_groups[1] * num_groups[2];
+-  // TODO: check if workgroup reduction is used in kernel_info to adjust local mem size
+-  auto additional_local_mem_per_thread = (threads_in_group + 32 - 1) / 32; // for per-workgroup reductions
+-
+-  local_mem_size = user_local_mem_size + additional_local_mem_per_thread;
++  // Compute threads per workgroup (local size), NOT number of workgroups (blocks).
++  // Each warp (32 threads) stores one reduction value of up to sizeof(double)=8 bytes.
++  // Use sizeof(double) as upper bound to handle float, int, and double reductions.
++  auto threads_per_group = group_size[0] * group_size[1] * group_size[2];
++  auto num_warps = (threads_per_group + 32 - 1) / 32;
++  auto additional_local_mem = static_cast<unsigned>(num_warps * sizeof(double)); // for per-workgroup reductions
++
++  local_mem_size = user_local_mem_size + additional_local_mem;
+   if (local_mem_size != 0) {
+     encoder->setThreadgroupMemoryLength(align_up(local_mem_size, 16), 0);
+   }

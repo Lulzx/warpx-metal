@@ -1,0 +1,223 @@
+diff --git a/Src/Base/AMReX_GpuAtomic.H b/Src/Base/AMReX_GpuAtomic.H
+index 64b6bec67..9dd85b36d 100644
+--- a/Src/Base/AMReX_GpuAtomic.H
++++ b/Src/Base/AMReX_GpuAtomic.H
+@@ -31,7 +31,7 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     R atomic_op (R* const address, R const val, F const f) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -55,7 +55,7 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     bool atomic_op_if (R* const address, R const val, Op&& op, Cond&& cond) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -137,7 +137,7 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     T Add_device (T* const sum, T const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         sycl::atomic_ref<T,mo,ms,AS> a{*sum};
+@@ -200,7 +200,9 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T Add (T* sum, T value) noexcept
+     {
+-#ifdef AMREX_USE_SYCL
++#if defined(AMREX_USE_SYCL) && defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
++        return Add_device<T,AS>(sum, value);
++#elif defined(AMREX_USE_SYCL)
+         AMREX_IF_ON_DEVICE((return Add_device<T,AS>(sum, value);))
+ #else
+         AMREX_IF_ON_DEVICE((return Add_device(sum, value);))
+@@ -256,6 +258,9 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     bool If (T* const add, T const value, Op&& op, Cond&& cond) noexcept
+     {
++#if defined(AMREX_USE_SYCL) && defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
++        return If_device(add, value, std::forward<Op>(op), std::forward<Cond>(cond));
++#else
+         AMREX_IF_ON_DEVICE((
+             return If_device(add, value, std::forward<Op>(op), std::forward<Cond>(cond));
+         ))
+@@ -269,6 +274,7 @@ namespace detail {
+                 return false;
+             }
+         ))
++#endif
+     }
+ 
+ ////////////////////////////////////////////////////////////////////////
+@@ -283,7 +289,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     void AddNoRet (T* sum, T value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         Add_device<T,AS>(sum, value);
+ #else
+         AMREX_IF_ON_DEVICE((Add_device(sum, value);))
+@@ -313,7 +319,7 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     T Min_device (T* const m, T const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -356,6 +362,9 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T Min (T* const m, T const value) noexcept
+     {
++#if defined(AMREX_USE_SYCL) && defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
++        return Min_device(m, value);
++#else
+         AMREX_IF_ON_DEVICE((
+             return Min_device(m, value);
+         ))
+@@ -364,6 +373,7 @@ namespace detail {
+             *m = (*m) < value ? (*m) : value;
+             return old;
+         ))
++#endif
+     }
+ 
+ ////////////////////////////////////////////////////////////////////////
+@@ -376,7 +386,7 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     T Max_device (T* const m, T const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -419,6 +429,9 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T Max (T* const m, T const value) noexcept
+     {
++#if defined(AMREX_USE_SYCL) && defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
++        return Max_device(m, value);
++#else
+         AMREX_IF_ON_DEVICE((
+             return Max_device(m, value);
+         ))
+@@ -427,6 +440,7 @@ namespace detail {
+             *m = (*m) > value ? (*m) : value;
+             return old;
+         ))
++#endif
+     }
+ 
+ ////////////////////////////////////////////////////////////////////////
+@@ -436,7 +450,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     int LogicalOr (int* const m, int const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -461,7 +475,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     int LogicalAnd (int* const m, int const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -487,7 +501,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T Exch (T* address, T val) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -513,7 +527,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T CAS (T* const address, T compare, T const val) noexcept
+     {           // cannot be T const compare because of compare_exchange_strong
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -558,6 +572,9 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T Multiply (T* const prod, T const value) noexcept
+     {
++#if defined(AMREX_USE_SYCL) && defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
++        return Multiply_device(prod, value);
++#else
+         AMREX_IF_ON_DEVICE((
+             return Multiply_device(prod, value);
+         ))
+@@ -566,6 +583,7 @@ namespace detail {
+             *prod *= value;
+             return old;
+         ))
++#endif
+     }
+ 
+ ////////////////////////////////////////////////////////////////////////
+@@ -594,6 +612,9 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T Divide (T* const quot, T const value) noexcept
+     {
++#if defined(AMREX_USE_SYCL) && defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
++        return Divide_device(quot, value);
++#else
+         AMREX_IF_ON_DEVICE((
+             return Divide_device(quot, value);
+         ))
+@@ -602,6 +623,7 @@ namespace detail {
+             *quot /= value;
+             return old;
+         ))
++#endif
+     }
+ }
+ 
+@@ -621,8 +643,12 @@ namespace HostDevice::Atomic {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     void Add (T* const sum, T const value) noexcept
+     {
++#if defined(AMREX_USE_SYCL) && defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)
++        Gpu::Atomic::AddNoRet(sum,value);
++#else
+         AMREX_IF_ON_DEVICE((Gpu::Atomic::AddNoRet(sum,value);))
+         AMREX_IF_ON_HOST((Add_Host(sum,value);))
++#endif
+     }
+ 
+ }
+diff --git a/Src/Base/AMReX_GpuQualifiers.H b/Src/Base/AMReX_GpuQualifiers.H
+index 3e10bec54..5accf44bd 100644
+--- a/Src/Base/AMReX_GpuQualifiers.H
++++ b/Src/Base/AMReX_GpuQualifiers.H
+@@ -45,8 +45,8 @@
+ #define AMREX_IMPL_VAN_AMREX_IMPL_ISH
+ 
+ #if !defined(AMREX_IF_ON_DEVICE) && !defined(AMREX_IF_ON_HOST)
+-#if (defined(AMREX_USE_CUDA) && defined(__CUDA_ARCH__)) ||         \
+-    (defined(AMREX_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)) || \
++#if (defined(AMREX_USE_CUDA) && defined(__CUDA_ARCH__)) ||                  \
++    (defined(AMREX_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)) ||           \
+     (defined(AMREX_USE_SYCL) && defined(__SYCL_DEVICE_ONLY__))
+ #define AMREX_IF_ON_DEVICE(CODE) \
+   { AMREX_IMPL_STRIP_PARENS(CODE) }

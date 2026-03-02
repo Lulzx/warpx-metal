@@ -33,3 +33,23 @@ tests/sycl/vector_add
 tests/sycl/usm_test
 tests/sycl/reduction_test
 tests/amrex/heat_equation/build/
+
+# WarpX test output files (runtime artifacts)
+tests/warpx/diags/
+tests/warpx/Backtrace.*
+tests/warpx/warpx_used_inputs
+tests/warpx/plt*/
+
+# WarpX runtime artifacts at repo root (when run from root)
+/Backtrace.*
+/diags/
+/warpx_used_inputs
+
+# Compiled SYCL test binaries (no extension)
+tests/sycl/test_as5_escape
+tests/sycl/test_as5_noopt
+
+# Compiled Metal test artifacts
+tests/metal_direct/run_test
+tests/metal_direct/*.air
+tests/metal_direct/*.metallib
