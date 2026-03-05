@@ -95,9 +95,9 @@ old = '''                    q.submit([&] (sycl::handler& h) {
                     });
                 } catch (sycl::exception const& ex) {
                     amrex::Abort(std::string(\\\"host_task: \\\")+ex.what()+\\\"!!!!!\\\");'''
-new = '''                    q.wait();
-                    The_Arena()->free(pd);
-                    The_Pinned_Arena()->free(ph);
+new = '''                    (void)q;
+                    Gpu::Device::freeAsync(The_Arena(), pd);
+                    Gpu::Device::freeAsync(The_Pinned_Arena(), ph);
                 } catch (sycl::exception const& ex) {
                     amrex::Abort(std::string(\\\"async cleanup: \\\")+ex.what()+\\\"!!!!!\\\");'''
 s = s.replace(old, new)
@@ -118,11 +118,9 @@ old = '''        auto& q = *(Gpu::gpuStream().queue);
             });
         } catch (sycl::exception const& ex) {
             amrex::Abort(std::string(\\\"host_task: \\\")+ex.what()+\\\"!!!!!\\\");'''
-new = '''        auto& q = *(Gpu::gpuStream().queue);
-        try {
-            q.wait();
+new = '''        try {
             for (auto const& pa : lpa) {
-                pa.second->free(pa.first);
+                Gpu::Device::freeAsync(pa.second, pa.first);
             }
         } catch (sycl::exception const& ex) {
             amrex::Abort(std::string(\\\"async cleanup: \\\")+ex.what()+\\\"!!!!!\\\");'''

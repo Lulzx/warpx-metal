@@ -28,6 +28,8 @@ export AMREX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/amrex"
 
 # WarpX source
 export WARPX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/warpx"
+export WARPX_GPU_BUILD_DIR="${WARPX_SOURCE_DIR}/build-acpp"
+export WARPX_CPU_BUILD_DIR="${WARPX_SOURCE_DIR}/build-cpu"
 
 # AdaptiveCpp source
 export ACPP_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/AdaptiveCpp"
