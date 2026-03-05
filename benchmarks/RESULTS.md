@@ -59,11 +59,21 @@ At 512², GPU (20.8ms) is now within 28% of 12-thread CPU (16.2ms). The gap is m
 
 At 128³ (2M cells), GPU wins at 1.60x. Particle push and field solve are compute/bandwidth dominated here; GPU has 2.6× the DRAM bandwidth of 12 CPU cores on M4 Pro's unified memory bus.
 
-### Path to larger GPU advantage
+### GPU scaling with particle count (512², warm JIT)
 
-1. **Larger particle count**: GPU advantage scales with ppc. 4ppc at 128³ would put GPU at ~3-4×.
-2. **SYCL command graphs** (if AdaptiveCpp implements): encode multiple steps into one command buffer, eliminate inter-step commit cost.
-3. **Native Metal kernels**: hand-written MSL for GatherAndPush/Deposition would allow kernel fusion and eliminate SYCL dispatch wrapper overhead.
+Crossover from CPU-faster to GPU-faster occurs between 4ppc and 16ppc at 512².
+Field solve + FillBoundary overhead is ~10ms/step (fixed); GPU wins once particle
+compute exceeds that floor.
+
+| ppc | Total particles | GPU s/step | CPU (12T) s/step | Speedup |
+|-----|----------------|-----------|-----------------|---------|
+| 2² = 4 | 2M | 0.0476 | 0.0247 | 0.52x |
+| 4² = 16 | 8M | 0.0503 | 0.0800 | **1.59x** |
+| 6² = 36 | 18M | 0.0702 | 0.1746 | **2.49x** |
+| 8² = 64 | 33M | 0.1214 | 0.3145 | **2.59x** |
+
+GPU scales near-linearly with particles. CPU OpenMP saturates at 12 threads.
+At 33M particles/step, GPU is 2.59× faster than 12-thread CPU at 512².
 
 ## Notes
 
