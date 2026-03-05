@@ -55,7 +55,9 @@ Infrastructure (FillBoundary + Redistribute + Sort): **7.0ms/step** (was 138ms, 
 
 At 128² and 64³, total work per step is small enough that even 7ms GPU overhead > entire CPU step. The GPU has a fixed ~5ms floor from unavoidable Metal framework costs (command buffer allocation, GPU scheduling latency). CPU has no such floor.
 
-At 512², GPU (20.8ms) is now within 28% of 12-thread CPU (16.2ms). The gap is memory bandwidth competition — Apple M4 Pro has unified memory, and both CPU and GPU share the same 120 GB/s bandwidth.
+At 512² 4ppc, GPU physics time (profiled kernels) = 13.3ms/step — already faster than CPU. The 7.5ms overhead comes from AMReX calling `q.wait()` ~5×/step (EvolveB, EvolveE, GatherAndPush, Deposition, Redistribute). Each `q.wait()` → Metal `commit()` + `waitUntilCompleted()` = ~1.5ms IOKit. Total: 7.5ms overhead → GPU 20.8ms vs CPU 16.2ms = 0.78x.
+
+**Lazy-wait was attempted** (defer GPU commit until D2H memcpy) but breaks AMReX: particle sort writes counts to pinned memory read by CPU after `q.wait()` without going through a tracked D2H path. Stale count → wrong buffer sizes → 10× performance regression. The 5 Metal commits/step are required for correctness.
 
 At 128³ (2M cells), GPU wins at 1.60x. Particle push and field solve are compute/bandwidth dominated here; GPU has 2.6× the DRAM bandwidth of 12 CPU cores on M4 Pro's unified memory bus.
 
