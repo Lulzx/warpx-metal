@@ -157,6 +157,41 @@ For GPU vs CPU benchmarking:
     ./scripts/08-benchmark.sh          # Run full benchmark matrix
     ./scripts/09-profile-metal.sh      # Metal System Trace via xctrace
 
+### patches/adaptivecpp/0010-metal-dtoh-fast-path.patch
+
+Adds a D2H fast path for CPU-accessible (shared/host) USM allocations. Instead
+of the old Metal blit + staging buffer approach (two Metal command buffer commits
+per D2H), flush pending GPU work once and `memcpy` directly from the shared
+buffer to the host pointer.
+
+Key correctness constraints:
+- Device (`sycl::malloc_device`) allocations use `ResourceStorageModePrivate` and
+  `gpuAddress()` as their CPU pointer — NOT accessible from CPU. Fast path is
+  restricted to `shared`/`host` USM types where `buffer->contents()` is valid.
+- Source buffer is `retain()`ed before queuing the lambda to prevent premature
+  Metal buffer deallocation if the caller frees the allocation before the worker
+  thread runs.
+- `_worker.wait()` makes the D2H synchronous — required because the destination
+  may be a stack variable (`&np`) that goes out of scope if the caller is not
+  blocked.
+
+### patches/amrex/0003-amrex-redistribute-no-mpi-sync.patch
+
+Removes two redundant `streamSynchronize()` calls from the no-MPI redistribution
+path in `AMReX_ParticleContainerI.H::RedistributeGPU`:
+
+- Sync before staging D2H (sync #1): no-op for MPI=OFF (no pinned staging
+  buffer needed).
+- Sync after `buildMPIFinish` (sync #2): no-op for MPI=OFF (no MPI
+  communication).
+
+The final sync after `unpackBuffer` (sync #3) is kept — required to prevent
+use-after-free when the next `Redistribute` call frees tile Metal buffers via
+`tile.resize()` before `unpackBuffer` GPU kernels complete.
+
+Also adds a `streamSynchronize()` before the `tile.resize()` loop to ensure
+`packBuffer` GPU kernels complete before tile memory is freed (Metal command
+buffer use-after-free fix).
 
 ## License
 

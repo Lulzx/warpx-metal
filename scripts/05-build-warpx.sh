@@ -54,6 +54,21 @@ git clean -fd
 
 AMREX_PATCH_DIR="${PATCHES_DIR}/amrex"
 
+# Apply .patch files via git apply (same as 03-build-amrex.sh)
+AMREX_PATCH_COUNT=$(find "${AMREX_PATCH_DIR}" -name '*.patch' 2>/dev/null | wc -l | tr -d ' ')
+if [ "${AMREX_PATCH_COUNT}" -gt 0 ]; then
+    for patch in "${AMREX_PATCH_DIR}"/*.patch; do
+        PATCH_NAME="$(basename "${patch}")"
+        if git apply --check "${patch}" 2>/dev/null; then
+            echo "  [..] Applying ${PATCH_NAME}..."
+            git apply "${patch}"
+            echo "  [OK] Applied ${PATCH_NAME}"
+        else
+            echo "  [SKIP] ${PATCH_NAME} (already applied or conflicts)"
+        fi
+    done
+fi
+
 # Copy replacement files
 replace_file() {
     local src="${AMREX_PATCH_DIR}/$1"

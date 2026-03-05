@@ -1,0 +1,50 @@
+diff --git a/Src/Particle/AMReX_ParticleContainerI.H b/Src/Particle/AMReX_ParticleContainerI.H
+index e6f3a62b0..fcd07a094 100644
+--- a/Src/Particle/AMReX_ParticleContainerI.H
++++ b/Src/Particle/AMReX_ParticleContainerI.H
+@@ -1551,6 +1551,14 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+ 
+     packBuffer(*this, op, plan, snd_buffer);
+ 
++    // Ensure packBuffer GPU kernels have completed before freeing tile Metal
++    // buffers below.  On Metal/SSCP the D2H inside packBuffer is async
++    // (queued in the worker thread); tile.resize() runs immediately on the
++    // CPU and would free the MTLBuffer while packBuffer kernels are still
++    // pending, causing a GPU use-after-free when flush_pending_commands()
++    // later commits the command buffer.
++    Gpu::Device::streamSynchronize();
++
+     // clear particles from container
+     for (int lev = lev_min; lev <= lev_max; ++lev)
+     {
+@@ -1592,6 +1600,8 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+     }
+     else
+     {
++#ifdef AMREX_USE_MPI
++        // MPI path: need explicit syncs around D2H staging and communication.
+         Gpu::Device::streamSynchronize();
+         Gpu::PinnedVector<char> pinned_snd_buffer;
+         Gpu::PinnedVector<char> pinned_rcv_buffer;
+@@ -1615,9 +1625,20 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+         communicateParticlesFinish(plan);
+         Gpu::htod_memcpy_async(rcv_buffer.dataPtr(), pinned_rcv_buffer.dataPtr(), pinned_rcv_buffer.size());
+         unpackRemotes(*this, plan, rcv_buffer, RedistributeUnpackPolicy());
++        Gpu::Device::streamSynchronize();
++#else
++        // No-MPI path: all redistribution is intra-process.  The two syncs that
++        // surrounded D2H staging and MPI communication are removed (no-ops for
++        // MPI=OFF).  The final sync is kept: without it, unpackBuffer GPU kernels
++        // remain pending when the next Redistribute call frees the tile buffers via
++        // tile.resize(), which causes a use-after-free in the Metal command buffer.
++        this->ReserveForRedistribute(plan);
++        rcv_buffer.resize(0);
++        unpackBuffer(*this, plan, snd_buffer, RedistributeUnpackPolicy());
++        Gpu::Device::streamSynchronize();
++#endif
+     }
+ 
+-    Gpu::Device::streamSynchronize();
+     AMREX_ASSERT(numParticlesOutOfRange(*this, lev_min, lev_max, nGrow) == 0);
+ #else
+     amrex::ignore_unused(lev_min,lev_max,nGrow,local,remove_negative);
