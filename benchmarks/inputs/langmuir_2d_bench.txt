@@ -1,0 +1,87 @@
+# langmuir_2d_bench.txt — Parameterized 2D Langmuir benchmark input
+#
+# Override these from the command line:
+#   NX=128  (grid cells per dimension, e.g. 128 or 512)
+#   PPC=2   (particles per cell per dimension, total = PPC*PPC per species)
+#   NSTEP=40
+#
+# Example:
+#   warpx.2d... langmuir_2d_bench.txt NX=128 PPC=2 NSTEP=40 diag1.intervals=99999
+
+# --- Grid size (override NX on command line) ---
+my_constants.NX = 128
+my_constants.PPC = 2
+my_constants.NSTEP = 40
+
+# Physics constants
+my_constants.epsilon = 0.01
+my_constants.n0 = 2.e24
+my_constants.wp = sqrt(2.*n0*q_e**2/(epsilon0*m_e))
+my_constants.kp = wp/clight
+my_constants.k = 2.*pi/20.e-6
+
+# Time steps
+max_step = NSTEP
+
+# Grid
+amr.n_cell = NX NX
+amr.max_grid_size = NX
+amr.max_level = 0
+
+# Geometry
+geometry.dims = 2
+geometry.prob_lo = -20.e-6  -20.e-6
+geometry.prob_hi =  20.e-6   20.e-6
+
+# Boundary
+boundary.field_lo = periodic periodic
+boundary.field_hi = periodic periodic
+
+warpx.serialize_initial_conditions = 1
+warpx.verbose = 1
+
+# Algorithms
+algo.current_deposition = direct
+algo.field_gathering = energy-conserving
+warpx.use_filter = 0
+algo.particle_shape = 1
+warpx.cfl = 1.0
+
+# Particles
+particles.species_names = electrons positrons
+
+electrons.charge = -q_e
+electrons.mass = m_e
+electrons.injection_style = "NUniformPerCell"
+electrons.num_particles_per_cell_each_dim = PPC PPC
+electrons.xmin = -20.e-6
+electrons.xmax =  20.e-6
+electrons.zmin = -20.e-6
+electrons.zmax =  20.e-6
+electrons.profile = constant
+electrons.density = n0
+electrons.momentum_distribution_type = parse_momentum_function
+electrons.momentum_function_ux(x,y,z) = "epsilon * k/kp * sin(k*x)"
+electrons.momentum_function_uy(x,y,z) = "0."
+electrons.momentum_function_uz(x,y,z) = "epsilon * k/kp * cos(k*x)"
+
+positrons.charge = q_e
+positrons.mass = m_e
+positrons.injection_style = "NUniformPerCell"
+positrons.num_particles_per_cell_each_dim = PPC PPC
+positrons.xmin = -20.e-6
+positrons.xmax =  20.e-6
+positrons.zmin = -20.e-6
+positrons.zmax =  20.e-6
+positrons.profile = constant
+positrons.density = n0
+positrons.momentum_distribution_type = parse_momentum_function
+positrons.momentum_function_ux(x,y,z) = "-epsilon * k/kp * sin(k*x)"
+positrons.momentum_function_uy(x,y,z) = "0."
+positrons.momentum_function_uz(x,y,z) = "-epsilon * k/kp * cos(k*x)"
+
+# Diagnostics (disabled by default — override on command line to enable)
+warpx.synchronize_velocity_for_diagnostics = 1
+diagnostics.diags_names = diag1
+diag1.intervals = 99999
+diag1.diag_type = Full

@@ -1,0 +1,379 @@
+diff --git a/include/hipSYCL/runtime/metal/metal_queue.hpp b/include/hipSYCL/runtime/metal/metal_queue.hpp
+index f054c752..ef7ab19f 100644
+--- a/include/hipSYCL/runtime/metal/metal_queue.hpp
++++ b/include/hipSYCL/runtime/metal/metal_queue.hpp
+@@ -26,6 +26,8 @@
+ namespace MTL {
+ 
+ class Device;
++class CommandQueue;
++class CommandBuffer;
+ 
+ } // namespace MTL
+ 
+@@ -89,6 +91,17 @@ private:
+   MTL::Device* _device = nullptr;
+   metal_allocator* _allocator = nullptr;
+   device_id _device_id;
++  // Persistent command queue — created once, reused for all kernel/blit submissions.
++  // Eliminates the ~1ms Metal overhead of creating a new MTLCommandQueue per kernel.
++  MTL::CommandQueue* _mtl_command_queue = nullptr;
++  // Currently open command buffer.  Multiple kernels and blits are encoded into this
++  // buffer and committed together only when wait() or insert_event() is called.
++  // This eliminates per-kernel commit+waitUntilCompleted overhead (~3ms each on Apple
++  // Silicon IOKit) which was responsible for 71% of WarpX step time.
++  MTL::CommandBuffer* _pending_cmd_buf = nullptr;
++  int _pending_cmd_count = 0;
++  static constexpr int kMaxPendingOps = 256;  // auto-flush threshold
++  result flush_pending_commands();
+ 
+   metal_sscp_code_object_invoker _sscp_code_object_invoker;
+ 
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index 1241efee..b503575d 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -105,7 +105,9 @@ result launch_kernel_from_library(
+   std::size_t* arg_sizes,
+   std::size_t num_args,
+   const rt::hcf_kernel_info* kernel_info,
+-  const std::optional<std::vector<int>>& retained_indices)
++  const std::optional<std::vector<int>>& retained_indices,
++  MTL::CommandQueue* cmd_queue,
++  MTL::CommandBuffer*& cmd_buf)
+ {
+   if (!library) {
+     return make_error(__acpp_here(),
+@@ -144,19 +146,18 @@ result launch_kernel_from_library(
+   }
+   bool arg_buffer_used = static_cast<int>(num_args) > metal_max_args_for_flat_mode;
+ 
+-  NS::SharedPtr<MTL::CommandQueue> command_queue = NS::TransferPtr(device->newCommandQueue());
+-  if (!command_queue) {
+-    return make_error(__acpp_here(),
+-                      error_info{"metal: Failed to create command queue"});
+-  }
+-
+-  auto* command_buffer = command_queue->commandBuffer();
+-  if (!command_buffer) {
+-    return make_error(__acpp_here(),
+-                      error_info{"metal: Failed to create command buffer"});
++  // Get or create the persistent command buffer (no new command queue per kernel).
++  // The caller owns cmd_buf and will commit+wait when ready (on queue::wait()).
++  if (!cmd_buf) {
++    cmd_buf = cmd_queue->commandBuffer();
++    if (!cmd_buf) {
++      return make_error(__acpp_here(),
++                        error_info{"metal: Failed to create command buffer"});
++    }
++    cmd_buf->retain();  // take ownership; released by flush_pending_commands()
+   }
+ 
+-  auto* encoder = command_buffer->computeCommandEncoder();
++  auto* encoder = cmd_buf->computeCommandEncoder();
+   if (!encoder) {
+     return make_error(__acpp_here(),
+                       error_info{"metal: Failed to create compute encoder"});
+@@ -164,11 +165,14 @@ result launch_kernel_from_library(
+ 
+   encoder->setComputePipelineState(pipeline_state.get());
+   auto user_local_mem_size = local_mem_size;
+-  auto threads_in_group = num_groups[0] * num_groups[1] * num_groups[2];
+-  // TODO: check if workgroup reduction is used in kernel_info to adjust local mem size
+-  auto additional_local_mem_per_thread = (threads_in_group + 32 - 1) / 32; // for per-workgroup reductions
+-
+-  local_mem_size = user_local_mem_size + additional_local_mem_per_thread;
++  // Compute threads per workgroup (local size), NOT number of workgroups (blocks).
++  // Each warp (32 threads) stores one reduction value of up to sizeof(double)=8 bytes.
++  // Use sizeof(double) as upper bound to handle float, int, and double reductions.
++  auto threads_per_group = group_size[0] * group_size[1] * group_size[2];
++  auto num_warps = (threads_per_group + 32 - 1) / 32;
++  auto additional_local_mem = static_cast<unsigned>(num_warps * sizeof(double)); // for per-workgroup reductions
++
++  local_mem_size = user_local_mem_size + additional_local_mem;
+   if (local_mem_size != 0) {
+     encoder->setThreadgroupMemoryLength(align_up(local_mem_size, 16), 0);
+   }
+@@ -204,25 +208,15 @@ result launch_kernel_from_library(
+ 
+   encoder->endEncoding();
+ 
+-  command_buffer->commit();
+-  command_buffer->waitUntilCompleted();
+-
+-  if (command_buffer->error()) {
+-    NS::Error* err = command_buffer->error();
+-    std::string msg = "metal: Command buffer failed: ";
+-    if (err->localizedDescription()) {
+-      msg += err->localizedDescription()->utf8String();
+-    }
+-    return make_error(__acpp_here(), error_info{msg});
+-  }
+-
++  // Do NOT commit here — the queue batches multiple operations per command buffer.
++  // The caller (submit_sscp_kernel_from_code_object) flushes on queue::wait().
+   HIPSYCL_DEBUG_INFO << "metal: Kernel '" << kernel_name
+-                     << "' executed successfully" << std::endl;
++                     << "' encoded into command buffer (deferred commit)" << std::endl;
+ 
+   return make_success();
+ }
+ 
+-result memset_device(
++result encode_memset_into_buffer(
+   MTL::CommandBuffer* command_buffer,
+   metal_allocator* allocator,
+   void* ptr,
+@@ -243,19 +237,7 @@ result memset_device(
+ 
+   blit_encoder->fillBuffer(buffer, NS::Range::Make(offset, num_bytes), pattern);
+   blit_encoder->endEncoding();
+-
+-  command_buffer->commit();
+-  command_buffer->waitUntilCompleted();
+-
+-  if (command_buffer->error()) {
+-    NS::Error* err = command_buffer->error();
+-    std::string msg = "metal_queue: Memset failed: ";
+-    if (err->localizedDescription()) {
+-      msg += err->localizedDescription()->utf8String();
+-    }
+-    return make_error(__acpp_here(), error_info{msg});
+-  }
+-
++  // Caller owns commit/wait
+   return make_success();
+ }
+ 
+@@ -265,7 +247,32 @@ metal_inorder_queue::metal_inorder_queue(MTL::Device* device, metal_allocator* a
+   : _device{device}, _allocator{allocator}, _device_id{id}
+   , _sscp_code_object_invoker(this)
+   , _kernel_cache{kernel_cache::get()}
+-{ }
++{
++  // Create one persistent MTLCommandQueue for the lifetime of this SYCL queue.
++  // Previously a new queue was created per kernel dispatch (~1ms each).
++  _mtl_command_queue = device->newCommandQueue();
++}
++
++result metal_inorder_queue::flush_pending_commands() {
++  if (!_pending_cmd_buf) return make_success();
++
++  _pending_cmd_buf->commit();
++  _pending_cmd_buf->waitUntilCompleted();
++
++  result res = make_success();
++  if (_pending_cmd_buf->error()) {
++    NS::Error* err = _pending_cmd_buf->error();
++    std::string msg = "metal: Command buffer failed: ";
++    if (err->localizedDescription())
++      msg += err->localizedDescription()->utf8String();
++    res = make_error(__acpp_here(), error_info{msg});
++  }
++
++  _pending_cmd_buf->release();
++  _pending_cmd_buf = nullptr;
++  _pending_cmd_count = 0;
++  return res;
++}
+ 
+ std::shared_ptr<dag_node_event> metal_inorder_queue::insert_event() {
+   HIPSYCL_DEBUG_INFO << "metal_queue: Inserting event into queue..." << std::endl;
+@@ -273,8 +280,10 @@ std::shared_ptr<dag_node_event> metal_inorder_queue::insert_event() {
+   auto evt = std::make_shared<metal_node_event>();
+   auto signal_channel = evt->get_signal_channel();
+ 
+-  // Schedule a task that will signal the event when all previous work completes
+-  _worker([signal_channel]() {
++  // Flush pending GPU work before signaling so the event represents true completion.
++  _worker([this, signal_channel]() {
++    result r = flush_pending_commands();
++    if (!r.is_success()) register_error(r);
+     signal_channel->signal();
+   });
+ 
+@@ -342,19 +351,40 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+   _worker([=]() {
+     NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+ 
+-    NS::SharedPtr<MTL::CommandQueue> command_queue = NS::TransferPtr(_device->newCommandQueue());
+-    if (!command_queue) {
+-      register_error(make_error(__acpp_here(),
+-        error_info{"metal_queue: Failed to create command queue for memcpy"}));
+-      return;
++    // For CPU-involved transfers we must flush pending GPU work first so prior
++    // GPU writes are visible before CPU reads.  For GPU->GPU we batch into the
++    // persistent command buffer (same as kernels) to avoid per-blit commit cost.
++    bool needs_cpu_staging = (!src_is_device || !dst_is_device);
++    if (needs_cpu_staging) {
++      result flush_r = flush_pending_commands();
++      if (!flush_r.is_success()) { register_error(flush_r); return; }
+     }
+ 
+-    MTL::CommandBuffer* command_buffer = command_queue->commandBuffer();
+-    if (!command_buffer) {
+-      register_error(make_error(__acpp_here(),
+-        error_info{"metal_queue: Failed to create command buffer for memcpy"}));
+-      return;
++    // Get or create the command buffer (reuse persistent buf for GPU->GPU)
++    MTL::CommandBuffer* command_buffer = nullptr;
++    bool owns_command_buffer = false;
++    if (needs_cpu_staging) {
++      command_buffer = _mtl_command_queue->commandBuffer();
++      if (!command_buffer) {
++        register_error(make_error(__acpp_here(),
++          error_info{"metal_queue: Failed to create command buffer for memcpy"}));
++        return;
++      }
++      owns_command_buffer = true;
++    } else {
++      // GPU->GPU: encode into persistent buffer
++      if (!_pending_cmd_buf) {
++        _pending_cmd_buf = _mtl_command_queue->commandBuffer();
++        if (!_pending_cmd_buf) {
++          register_error(make_error(__acpp_here(),
++            error_info{"metal_queue: Failed to create command buffer for memcpy"}));
++          return;
++        }
++        _pending_cmd_buf->retain();
++      }
++      command_buffer = _pending_cmd_buf;
+     }
++
+     MTL::BlitCommandEncoder* blit_encoder = command_buffer->blitCommandEncoder();
+     if (!blit_encoder) {
+       register_error(make_error(__acpp_here(),
+@@ -449,17 +479,26 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+     }
+ 
+     blit_encoder->endEncoding();
+-    command_buffer->commit();
+-    command_buffer->waitUntilCompleted();
+-
+-    if (command_buffer->error()) {
+-      NS::Error* err = command_buffer->error();
+-      std::string msg = "metal_queue: Memcpy failed: ";
+-      if (err->localizedDescription()) {
+-        msg += err->localizedDescription()->utf8String();
++
++    if (owns_command_buffer) {
++      // CPU-involved transfer: commit and wait synchronously
++      command_buffer->commit();
++      command_buffer->waitUntilCompleted();
++      if (command_buffer->error()) {
++        NS::Error* err = command_buffer->error();
++        std::string msg = "metal_queue: Memcpy failed: ";
++        if (err->localizedDescription())
++          msg += err->localizedDescription()->utf8String();
++        register_error(make_error(__acpp_here(), error_info{msg}));
++        return;
++      }
++    } else {
++      // GPU->GPU: blit encoded into persistent buffer, will commit on wait()
++      ++_pending_cmd_count;
++      if (_pending_cmd_count >= kMaxPendingOps) {
++        result r = flush_pending_commands();
++        if (!r.is_success()) { register_error(r); return; }
+       }
+-      register_error(make_error(__acpp_here(), error_info{msg}));
+-      return;
+     }
+ 
+     if (!dst_is_device) {
+@@ -517,24 +556,27 @@ result metal_inorder_queue::submit_memset(memset_operation& op, const dag_node_p
+ 
+   _worker([=]() {
+     NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+-    NS::SharedPtr<MTL::CommandQueue> command_queue = NS::TransferPtr(_device->newCommandQueue());
+-    if (!command_queue) {
+-      register_error(make_error(__acpp_here(),
+-        error_info{"metal_queue: Failed to create command queue for memset"}));
+-      return;
+-    }
+ 
+-    MTL::CommandBuffer* command_buffer = command_queue->commandBuffer();
+-    if (!command_buffer) {
+-      register_error(make_error(__acpp_here(),
+-        error_info{"metal_queue: Failed to create command buffer for memset"}));
+-      return;
++    // Encode memset into persistent command buffer (no per-memset commit)
++    if (!_pending_cmd_buf) {
++      _pending_cmd_buf = _mtl_command_queue->commandBuffer();
++      if (!_pending_cmd_buf) {
++        register_error(make_error(__acpp_here(),
++          error_info{"metal_queue: Failed to create command buffer for memset"}));
++        return;
++      }
++      _pending_cmd_buf->retain();
+     }
+ 
+-    result res = memset_device(command_buffer, _allocator, ptr, pattern, num_bytes);
+-
++    result res = encode_memset_into_buffer(_pending_cmd_buf, _allocator, ptr, pattern, num_bytes);
+     if (!res.is_success()) {
+       register_error(res);
++      return;
++    }
++
++    if (++_pending_cmd_count >= kMaxPendingOps) {
++      result r = flush_pending_commands();
++      if (!r.is_success()) register_error(r);
+     }
+   });
+ 
+@@ -574,6 +616,12 @@ result metal_inorder_queue::submit_external_wait_for(const dag_node_ptr& node) {
+ 
+ result metal_inorder_queue::wait() {
+   HIPSYCL_DEBUG_INFO << "metal_queue: Waiting for queue completion..." << std::endl;
++  // Enqueue a flush so the pending command buffer is committed before we return.
++  // This is the ONE place per SYCL queue::wait() call that pays the Metal commit cost.
++  _worker([this]() {
++    result r = flush_pending_commands();
++    if (!r.is_success()) register_error(r);
++  });
+   _worker.wait();
+   return make_success();
+ }
+@@ -738,14 +786,24 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+       error_info{"metal_queue: Metal library is null"});
+   }
+ 
+-  return launch_kernel_from_library(
++  result launch_result = launch_kernel_from_library(
+     library, _device, _allocator, kernel_name,
+     num_groups, group_size, local_mem_size,
+     _arg_mapper.get_mapped_args(),
+     const_cast<std::size_t*>(_arg_mapper.get_mapped_arg_sizes()),
+     _arg_mapper.get_mapped_num_args(),
+     kernel_info,
+-    retained_indices);
++    retained_indices,
++    _mtl_command_queue,
++    _pending_cmd_buf);
++
++  if (!launch_result.is_success()) return launch_result;
++
++  // Auto-flush when the pending buffer accumulates too many operations.
++  if (++_pending_cmd_count >= kMaxPendingOps) {
++    return flush_pending_commands();
++  }
++  return make_success();
+ 
+ #else
+   return make_error(__acpp_here(),
+@@ -755,7 +813,15 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+ }
+ 
+ metal_inorder_queue::~metal_inorder_queue() {
++  // Drain all pending work and flush any buffered GPU commands before teardown.
++  _worker([this]() {
++    flush_pending_commands();  // ignore errors at shutdown
++  });
+   _worker.halt();
++  if (_mtl_command_queue) {
++    _mtl_command_queue->release();
++    _mtl_command_queue = nullptr;
++  }
+ }
+ 
+ worker_thread& metal_inorder_queue::get_worker() {
