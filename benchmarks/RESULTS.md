@@ -1,87 +1,82 @@
 # WarpX-on-Metal Benchmark Results
 
 **Hardware:** Apple M4 Pro (12 CPU cores, 16 GPU CUs, 24 GB unified memory)
-**Date:** 2026-03-05
+**Date:** 2026-03-07 20:54:41
 
 ## GPU vs CPU Comparison
 
-CPU baseline: 12 OpenMP threads (Apple Clang, libomp).
-GPU: Metal via AdaptiveCpp SSCP + command buffer batching fix. All results are median of 3 timed runs after 2 GPU warm-up runs (JIT cache priming).
+CPU baseline uses 12 OpenMP threads (Apple Clang, libomp).
+GPU uses Metal via AdaptiveCpp SSCP. GPU times include first-run JIT warm-up cost;
+timed runs use cached JIT. All results are median of 3 runs.
 
-| Test | Grid | ppc | Steps | CPU (12T) s/step | GPU (Metal) s/step | Speedup |
-|------|------|-----|-------|------------------|--------------------|---------|
-| langmuir_2d_small | 128x128 | 4 | 40 | 0.0025 | 0.0184 | 0.14x |
-| langmuir_2d_large | 512x512 | 4 | 40 | 0.0162 | 0.0208 | 0.78x |
-| langmuir_3d_small | 64^3 | 1 | 20 | 0.0088 | 0.0236 | 0.37x |
-| langmuir_3d_large | 128^3 | 1 | 20 | 0.0617 | 0.0385 | **1.60x** |
+| Test | Grid | Particles/cell | Steps | CPU (12T) s/step | GPU (Metal) s/step | Speedup |
+|------|------|---------------|-------|-------------------|---------------------|---------|
+| langmuir_2d_small | 128x128 | 2^2=2*2 | 40 | 0.0027 | 0.0172 | 0.16x |
+| langmuir_2d_large | 512x512 | 2^2=2*2 | 40 | 0.0173 | 0.0208 | 0.83x |
+| langmuir_3d_small | 64^3 | 1^3 | 20 | 0.0081 | 0.0181 | 0.45x |
+| langmuir_3d_large | 128^3 | 1^3 | 20 | 0.0560 | 0.0402 | 1.39x |
 
-**GPU wins at 128³ (1.60x faster than 12-thread CPU).**
+## Kernel Breakdown (GPU)
 
-## Command Buffer Batching Fix — Improvement
-
-Phase 4 applied two fixes; cumulative effect at 512²:
-
-| Fix | GPU s/step | vs prev |
-|-----|-----------|---------|
-| Baseline (Phase 3) | 0.2087 | — |
-| freeAsync (GpuElixir/AsyncArray) | 0.1531 | 27% faster |
-| Command buffer batching | 0.0208 | 86% faster |
-| **Total improvement** | **0.0208** | **7.4× over baseline** |
-
-Root cause: AdaptiveCpp's `launch_kernel_from_library()` was calling `device->newCommandQueue()` + `command_buffer->waitUntilCompleted()` for every SYCL kernel dispatch (~100+/step). Each dispatch: 1–4 ms Metal/IOKit syscall overhead. Fix: persistent `MTLCommandQueue` + deferred `MTLCommandBuffer`; all kernels encoded into one buffer per step, single `commit()` + `waitUntilCompleted()` on `queue::wait()`.
-
-## Kernel Breakdown (GPU, 512x512, warm JIT)
+Source: `gpu_run_2`
 
 ```
-TinyProfiler total time: 1.282s (40 steps = 32ms/step overhead incl. I/O)
-
-FillBoundary_nowait()                320    0.1321s   10%  (3.3ms/step)
-WarpX::EvolveB()                      40    0.0902s    7%  (2.3ms/step)
-GatherAndPush (particle push)         40    0.0788s    6%  (2.0ms/step)
-CurrentDeposition                     40    0.0724s    6%  (1.8ms/step)
-WarpX::EvolveE()                      20    0.0530s    4%  (1.3ms/step)
-ParticleCopyPlan::build               42    0.0493s    4%  (1.2ms/step)
-Redistribute_partition                42    0.0472s    4%  (1.2ms/step)
-SortParticlesByBin                    10    0.0325s    3%  (0.8ms/step)
-DenseBins::buildGPU                   12    0.0247s    2%  (0.6ms/step)
+  Level 0   1 grids  2097152 cells  100 % of domain
+TinyProfiler total time across processes [min...avg...max]: 1.336 ... 1.336 ... 1.336
+main()                                                          1     0.2822     0.2822     0.2822  21.13%
+VisMF::Write(FabArray)                                          2     0.1535     0.1535     0.1535  11.50%
+ParticleContainer::WriteParticles()                             4     0.1385     0.1385     0.1385  10.37%
+FillBoundary_nowait()                                         320     0.1148     0.1148     0.1148   8.59%
+FabArray::setVal()                                             87    0.08687    0.08687    0.08687   6.50%
+PhysicalParticleContainer::Evolve::GatherAndPush               40    0.07239    0.07239    0.07239   5.42%
+WarpX::EvolveB()                                               40    0.06765    0.06765    0.06765   5.07%
+WarpXParticleContainer::DepositCurrent::CurrentDeposition      40    0.05685    0.05685    0.05685   4.26%
+PhysicalParticleContainer::AddPlasma()                          2    0.05628    0.05628    0.05628   4.21%
+ParticleCopyPlan::build                                        42    0.05158    0.05158    0.05158   3.86%
+Redistribute_partition                                         42    0.04328    0.04328    0.04328   3.24%
+WarpX::EvolveE()                                               20    0.03723    0.03723    0.03723   2.79%
+ParticleContainer::SortParticlesByBin()                        10    0.03365    0.03365    0.03365   2.52%
+DenseBins<T>::buildGPU                                         12    0.02394    0.02394    0.02394   1.79%
+WriteBinaryParticleData()                                       4    0.02015    0.02015    0.02015   1.51%
+sample::Coarsen()                                              22    0.01823    0.01823    0.01823   1.36%
+PhysicalParticleContainer::PushP()                              4    0.01609    0.01609    0.01609   1.21%
+ParticleContainer::addParticles                                 4    0.01477    0.01477    0.01477   1.11%
+ParticleContainer::RedistributeGPU()                           42    0.01041    0.01041    0.01041   0.78%
+FlushFormatPlotfile::WriteToFile()                              2   0.009714   0.009714   0.009714   0.73%
+amrex::packBuffer                                              42   0.007275   0.007275   0.007275   0.54%
+amrex::Add()                                                    4    0.00331    0.00331    0.00331   0.25%
+Diagnostics::FilterComputePackFlush()                          22    0.00303    0.00303    0.00303   0.23%
+amrex::ParticleToMesh                                           4   0.002409   0.002409   0.002409   0.18%
+WarpX::InitData()                                               1   0.001111   0.001111   0.001111   0.08%
+PhysicalParticleContainer::Evolve()                            40  0.0006021  0.0006021  0.0006021   0.05%
+WarpX::OneStep_nosub()                                         20  0.0003957  0.0003957  0.0003957   0.03%
+WriteMultiLevelPlotfile()                                       2  0.0003737  0.0003737  0.0003737   0.03%
+WarpX::Evolve::step                                            20  0.0003636  0.0003636  0.0003636   0.03%
+ablastr::utils::communication::FillBoundary                   258  0.0003229  0.0003229  0.0003229   0.02%
+WarpX::SyncCurrent()                                           20  0.0001106  0.0001106  0.0001106   0.01%
+FabArray::FillBoundaryAndSync()                               120  7.941e-05  7.941e-05  7.941e-05   0.01%
+FillBoundaryAndSync_nowait()                                  120  6.259e-05  6.259e-05  6.259e-05   0.00%
+FabArray::FillBoundary()                                      138  5.659e-05  5.659e-05  5.659e-05   0.00%
+FabArray<FAB>::SumBoundary()                                   62  4.342e-05  4.342e-05  4.342e-05   0.00%
+ablastr::utils::communication::SumBoundary                     62  3.963e-05  3.963e-05  3.963e-05   0.00%
+WarpX::Evolve()                                                 1  3.663e-05  3.663e-05  3.663e-05   0.00%
+FabArray<FAB>::SumBoundary_nowait()                            62  3.212e-05  3.212e-05  3.212e-05   0.00%
 ```
 
-Physics compute (GatherAndPush + FieldSolve + Deposition): **7.1ms/step** (was 31ms, now 4.4× faster — Metal commit overhead eliminated)
-Infrastructure (FillBoundary + Redistribute + Sort): **7.0ms/step** (was 138ms, now 19.7× faster)
+## Sort Interval Sensitivity
 
-## Performance Analysis
+Run `./scripts/08-benchmark.sh` with sort_intervals overrides to populate:
 
-### Why GPU still trails CPU at small scales
-
-At 128² and 64³, total work per step is small enough that even 7ms GPU overhead > entire CPU step. The GPU has a fixed ~5ms floor from unavoidable Metal framework costs (command buffer allocation, GPU scheduling latency). CPU has no such floor.
-
-At 512² 4ppc, GPU physics time (profiled kernels) = 13.3ms/step — already faster than CPU. The 7.5ms overhead comes from AMReX calling `q.wait()` ~5×/step (EvolveB, EvolveE, GatherAndPush, Deposition, Redistribute). Each `q.wait()` → Metal `commit()` + `waitUntilCompleted()` = ~1.5ms IOKit. Total: 7.5ms overhead → GPU 20.8ms vs CPU 16.2ms = 0.78x.
-
-**Lazy-wait was attempted** (defer GPU commit until D2H memcpy) but breaks AMReX: particle sort writes counts to pinned memory read by CPU after `q.wait()` without going through a tracked D2H path. Stale count → wrong buffer sizes → 10× performance regression. The 5 Metal commits/step are required for correctness.
-
-At 128³ (2M cells), GPU wins at 1.60x. Particle push and field solve are compute/bandwidth dominated here; GPU has 2.6× the DRAM bandwidth of 12 CPU cores on M4 Pro's unified memory bus.
-
-### GPU scaling with particle count (512², warm JIT)
-
-Crossover from CPU-faster to GPU-faster occurs between 4ppc and 16ppc at 512².
-Field solve + FillBoundary overhead is ~10ms/step (fixed); GPU wins once particle
-compute exceeds that floor.
-
-| ppc | Total particles | GPU s/step | CPU (12T) s/step | Speedup |
-|-----|----------------|-----------|-----------------|---------|
-| 2² = 4 | 2M | 0.0476 | 0.0247 | 0.52x |
-| 4² = 16 | 8M | 0.0503 | 0.0800 | **1.59x** |
-| 6² = 36 | 18M | 0.0702 | 0.1746 | **2.49x** |
-| 8² = 64 | 33M | 0.1214 | 0.3145 | **2.59x** |
-
-GPU scales near-linearly with particles. CPU OpenMP saturates at 12 threads.
-At 33M particles/step, GPU is 2.59× faster than 12-thread CPU at 512².
+| sort_intervals | Test | GPU s/step |
+|---------------|------|-----------|
+| 4 (default) | langmuir_2d_small | (run to populate) |
+| -1 (disabled) | langmuir_2d_small | (run to populate) |
+| 20 | langmuir_2d_small | (run to populate) |
 
 ## Notes
 
-- JIT compilation (LLVM IR → MSL) adds ~4-5s to first run per executable. Cache at `~/.acpp/apps/global/jit-cache/`.
-- Single precision (FP32) throughout — Metal has no FP64.
+- GPU first-run includes JIT compilation (LLVM IR -> MSL). Subsequent runs use cache at `~/.acpp/apps/global/jit-cache/`.
+- Single precision (FP32) throughout — Metal has no FP64 support.
 - PSATD spectral solver unavailable (no Metal FFT). FDTD only.
-- CPU: Apple Clang, libomp, `-O3 -DNDEBUG`, `OMP_NUM_THREADS=12`.
-- GPU: AdaptiveCpp SSCP + LLVM 20 → MSL → applegpu_g16s (16 CUs).
-- Patch `0009-metal-batch-command-buffer.patch` implements the batching fix in `metal_queue.cpp`.
+- CPU build: Apple Clang, libomp, `-O3 -DNDEBUG`.
+- GPU build: AdaptiveCpp SSCP + LLVM 20 -> MSL -> Apple GPU.
