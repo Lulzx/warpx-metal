@@ -163,6 +163,32 @@ for fname in [
         print(f'  [SKIP] {n} (no matching attributes)')
 "
 
+
+echo ""
+echo "=== Apply AMReX post-replacement patches ==="
+
+AMREX_POST_PATCH_DIR="${PATCHES_DIR}/amrex-post"
+if [ -d "${AMREX_POST_PATCH_DIR}" ]; then
+    POST_PATCH_COUNT=$(find "${AMREX_POST_PATCH_DIR}" -name '*.patch' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${POST_PATCH_COUNT}" -gt 0 ]; then
+        cd "${AMREX_SOURCE_DIR}"
+        for patch in "${AMREX_POST_PATCH_DIR}"/*.patch; do
+            PATCH_NAME="$(basename "${patch}")"
+            if git apply --check "${patch}" 2>/dev/null; then
+                echo "  [..] Applying ${PATCH_NAME}..."
+                git apply "${patch}"
+                echo "  [OK] Applied ${PATCH_NAME}"
+            else
+                echo "  [SKIP] ${PATCH_NAME} (already applied or conflicts)"
+            fi
+        done
+    else
+        echo "  [OK] No AMReX post-replacement patches to apply"
+    fi
+else
+    echo "  [OK] No AMReX post-replacement patch directory"
+fi
+
 echo ""
 echo "=== Step 3: Apply WarpX patches ==="
 

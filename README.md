@@ -11,13 +11,15 @@ workflow needed to get that stack working on macOS.
 
 ## Status
 
-- End-to-end WarpX runs on Apple GPU through Metal.
-- SYCL smoke tests pass on the AdaptiveCpp Metal backend.
-- AMReX validation passes on Metal with the included patches.
-- WarpX Langmuir tests pass in 2D and 3D on the Metal path.
-- Benchmarks on an Apple M4 Pro show GPU wins at larger 3D problem sizes.
+- End-to-end WarpX 2D particle-in-cell runs execute on Apple GPUs through Metal.
+- The backend path is `WarpX -> AMReX (SYCL) -> AdaptiveCpp SSCP -> Metal`.
+- Validation covers Apple M3 Ultra, Apple M4 Max, and Apple M5 Max systems.
+- Deterministic GPU-to-CPU crosstest maximum relative error is `1.68e-6` over 100 steps.
+- Statistical RNG-deck equivalence is at moment differences around `1e-18`.
+- Conservation checks pass: charge `2.67e-8` vs CPU, field energy `1.81e-6`, particle energy `3.25e-7`, exact particle count, and exact x/y momentum over 100 steps.
+- GPU charge/current deposition uses atomic adds, so run-to-run bitwise output is not expected to be deterministic. Physical observables are conserved and match CPU within the validated tolerances.
 
-The work has been tested on an Apple M4 Pro with 16 GPU compute units.
+See [VALIDATION.md](VALIDATION.md) for the validation summary and interpretation.
 
 ## Requirements
 
@@ -93,7 +95,7 @@ These confirm device discovery, basic kernels, shared USM, and atomics.
 [`scripts/03-build-amrex.sh`](scripts/03-build-amrex.sh):
 
 - clones `AMReX` into `extern/amrex`
-- applies the AMReX patch set and file replacements from `patches/amrex/`
+- applies the AMReX patch set, file replacements from `patches/amrex/`, and post-replacement patches from `patches/amrex-post/`
 - configures a SYCL build with single precision and MPI/Fortran disabled
 - installs into `opt/amrex`
 
@@ -194,11 +196,18 @@ Key patches:
 The AMReX directory also includes patched replacement files for SYCL CMake and
 RNG-related sources.
 
+- `patches/adaptivecpp/0011-metal-pointer-translation-runtime-fixes.patch`
+  Adds the validated Metal pointer-translation/runtime fixes used by WarpX.
+- `patches/amrex-post/0004-metal-pic-rng-reduction-fixes.patch`
+  Applies the AMReX PIC, RNG, atomic, and reduction fixes after the base AMReX
+  replacement files and compatibility edits are in place.
+
+
 ## Repository Layout
 
 ```text
 scripts/       Build, validation, benchmark, and profiling entry points
-patches/       AdaptiveCpp and AMReX patches plus AMReX replacement files
+patches/       AdaptiveCpp and AMReX patches, including AMReX post-replacement fixes
 tests/         SYCL, AMReX, and local WarpX validation inputs
 benchmarks/    Benchmark inputs, raw results, and summary report
 docs/          Notes, issues, and implementation background

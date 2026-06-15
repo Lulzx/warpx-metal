@@ -1,0 +1,1932 @@
+diff --git a/new/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp
+new file mode 100644
+index 0000000..74e8dd9
+--- /dev/null
++++ b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp
+@@ -0,0 +1,34 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#ifndef HIPSYCL_SSCP_POINTER_TRANSLATION_ANNOTATION_PASS_HPP
++#define HIPSYCL_SSCP_POINTER_TRANSLATION_ANNOTATION_PASS_HPP
++
++#include <llvm/IR/PassManager.h>
++
++namespace hipsycl {
++namespace compiler {
++
++static constexpr const char *MetalPtrLoadNeedsTranslationMD = "acpp.metal.ptr.load.needs_translation";
++static constexpr const char *MetalPtrStoreNeedsTranslationMD = "acpp.metal.ptr.store.needs_translation";
++
++class PointerTranslationAnnotationPass
++  : public llvm::PassInfoMixin<PointerTranslationAnnotationPass> {
++public:
++  explicit PointerTranslationAnnotationPass(unsigned GlobalAS);
++
++  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM);
++
++private:
++  unsigned GlobalAS;
++};
++
++} // namespace compiler
++} // namespace hipsycl
++
++#endif // HIPSYCL_SSCP_POINTER_TRANSLATION_ANNOTATION_PASS_HPP
+diff --git a/new/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp
+new file mode 100644
+index 0000000..d0f07e8
+--- /dev/null
++++ b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp
+@@ -0,0 +1,31 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#ifndef HIPSYCL_SSCP_POINTER_TRANSLATION_PASS_HPP
++#define HIPSYCL_SSCP_POINTER_TRANSLATION_PASS_HPP
++
++#include <llvm/IR/PassManager.h>
++
++namespace hipsycl {
++namespace compiler {
++
++class PointerTranslationPass
++  : public llvm::PassInfoMixin<PointerTranslationPass> {
++public:
++  explicit PointerTranslationPass(unsigned GlobalAS);
++
++  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM);
++
++private:
++  unsigned GlobalAS;
++};
++
++} // namespace compiler
++} // namespace hipsycl
++
++#endif // HIPSYCL_SSCP_POINTER_TRANSLATION_PASS_HPP
+diff --git a/include/hipSYCL/runtime/metal/metal_allocator.hpp b/include/hipSYCL/runtime/metal/metal_allocator.hpp
+index 21c76b9..70dfeff 100644
+--- a/include/hipSYCL/runtime/metal/metal_allocator.hpp
++++ b/include/hipSYCL/runtime/metal/metal_allocator.hpp
+@@ -14,8 +14,10 @@
+ #include "../allocator.hpp"
+ #include "../hints.hpp"
+ 
++#include <cstdint>
+ #include <map>
+ #include <memory>
++#include <vector>
+ 
+ namespace MTL {
+ 
+@@ -29,10 +31,8 @@ namespace rt {
+ 
+ struct metal_mmap_region;
+ 
+-// Metal USM allocator. Reserves a large VA range via mmap and wraps sub-regions
+-// with newBuffer(ptr,...) so that all shared/host buffers satisfy:
+-//   buffer->gpuAddress() - (uintptr_t)buffer->contents() == _delta (constant).
+-// _delta is used for pointer translation between CPU and GPU address spaces.
++// Metal USM allocator. Shared/host USM is backed by MTL::Buffer over
++// mmap-owned CPU memory; pointer args are resolved by get_usm_block().
+ class metal_allocator : public backend_allocator
+ {
+ public:
+@@ -69,14 +69,22 @@ public:
+ 
+   // Returns the Metal buffer and offset for a given USM pointer
+   std::tuple<MTL::Buffer*, size_t, usm_alloc_type> get_usm_block(const void* ptr) const;
++
++  struct pointer_translation_entry {
++    std::uint64_t host_base;
++    std::uint64_t gpu_base;
++    std::uint64_t length;
++  };
++
++  // Returns per-buffer host/GPU address ranges for pointer values copied
++  // through global memory.
++  std::vector<pointer_translation_entry> get_pointer_translation_entries() const;
+ private:
+   MTL::Buffer* alloc_buffer(size_t size_bytes);
+-  void calibrate();
+ 
+   MTL::Device* _device = nullptr;
+   device_id _device_id;
+   const size_t _page_size;
+-  size_t _delta;
+ 
+   struct usm_block {
+     MTL::Buffer* buffer;
+diff --git a/src/compiler/llvm-to-backend/CMakeLists.txt b/src/compiler/llvm-to-backend/CMakeLists.txt
+index 5c8d9cd..33e3ba4 100644
+--- a/src/compiler/llvm-to-backend/CMakeLists.txt
++++ b/src/compiler/llvm-to-backend/CMakeLists.txt
+@@ -307,6 +307,8 @@ if(WITH_SSCP_COMPILER)
+       LIBRARY
+         metal/LLVMToMetal.cpp
+         metal/HLExtractionPass.cpp
++        metal/PointerTranslationAnnotationPass.cpp
++        metal/PointerTranslationPass.cpp
+         metal/HLTree.cpp
+         metal/Emitter.cpp
+       TOOL metal/LLVMToMetalTool.cpp)
+diff --git a/src/compiler/llvm-to-backend/metal/Emitter.cpp b/src/compiler/llvm-to-backend/metal/Emitter.cpp
+index ce6949d..0453d0d 100644
+--- a/src/compiler/llvm-to-backend/metal/Emitter.cpp
++++ b/src/compiler/llvm-to-backend/metal/Emitter.cpp
+@@ -13,6 +13,7 @@
+ #include <llvm/Analysis/PostDominators.h>
+ 
+ #include <llvm/IR/CFG.h>
++#include <llvm/ADT/SmallPtrSet.h>
+ #include <llvm/IR/Constants.h>
+ #include <llvm/IR/DataLayout.h>
+ #include <llvm/IR/DerivedTypes.h>
+@@ -48,6 +49,8 @@
+ #include "HLTree.hpp"
+ #include "HLExtractionPass.hpp"
+ 
++#include <functional>
++
+ using namespace llvm;
+ 
+ namespace hipsycl {
+@@ -62,10 +65,7 @@ std::string indent(int level) {
+ }
+ 
+ std::string instToString(const llvm::Instruction& I) {
+-  std::string str;
+-  llvm::raw_string_ostream rso(str);
+-  I.print(rso);
+-  return rso.str();
++  return std::string(I.getOpcodeName());
+ }
+ 
+ std::optional<uint64_t> getConstU64(llvm::Value* V) {
+@@ -224,18 +224,111 @@ uint3 __acpp_sscp_metal_local_size [[threads_per_threadgroup]];
+ threadgroup void * constant __acpp_sscp_metal_dynamic_local_memory [[threadgroup(0)]];
+ constant uint& constant __acpp_sscp_metal_dynamic_local_memory_size [[buffer(0)]];
+ 
++struct __acpp_sscp_metal_pointer_translation_entry {
++  ulong host_base;
++  ulong gpu_base;
++  ulong length;
++};
++
++struct __acpp_sscp_metal_pointer_translation_table {
++  uint count;
++  uint capacity;
++  ulong reserved1;
++  __acpp_sscp_metal_pointer_translation_entry entries[4096];
++};
++
++constant __acpp_sscp_metal_pointer_translation_table& constant __acpp_sscp_metal_pointer_translation [[buffer(1)]];
++
++struct __acpp_sscp_metal_pointer_translation_miss {
++  atomic_uint code;
++  uint direction;
++  uint table_count;
++  uint table_capacity;
++  ulong raw_addr;
++};
++
++inline void __acpp_metal_pointer_translation_fail(
++    device __acpp_sscp_metal_pointer_translation_miss& miss_flag,
++    uint code,
++    ulong raw_addr) {
++  uint old = atomic_fetch_or_explicit(&miss_flag.code,
++                                      code, memory_order_relaxed);
++  if (old == 0) {
++    miss_flag.direction = code;
++    miss_flag.table_count = __acpp_sscp_metal_pointer_translation.count;
++    miss_flag.table_capacity = __acpp_sscp_metal_pointer_translation.capacity;
++    miss_flag.raw_addr = raw_addr;
++  }
++}
++
++inline long __acpp_metal_translate_host_addr_to_gpu(
++    long raw_addr,
++    device __acpp_sscp_metal_pointer_translation_miss& miss_flag) {
++  if (raw_addr == 0) {
++    return raw_addr;
++  }
++  ulong addr = (ulong)raw_addr;
++  if (__acpp_sscp_metal_pointer_translation.count > __acpp_sscp_metal_pointer_translation.capacity) {
++    __acpp_metal_pointer_translation_fail(miss_flag, 4u, addr);
++    return 0;
++  }
++  for (uint i = 0; i < __acpp_sscp_metal_pointer_translation.count; ++i) {
++    __acpp_sscp_metal_pointer_translation_entry entry = __acpp_sscp_metal_pointer_translation.entries[i];
++    if (addr >= entry.host_base && addr < entry.host_base + entry.length) {
++      return (long)(entry.gpu_base + (addr - entry.host_base));
++    }
++  }
++  __acpp_metal_pointer_translation_fail(miss_flag, 1u, addr);
++  return 0;
++}
++
++inline long __acpp_metal_translate_gpu_addr_to_host(
++    long raw_addr,
++    device __acpp_sscp_metal_pointer_translation_miss& miss_flag) {
++  if (raw_addr == 0) {
++    return raw_addr;
++  }
++  ulong addr = (ulong)raw_addr;
++  if (__acpp_sscp_metal_pointer_translation.count > __acpp_sscp_metal_pointer_translation.capacity) {
++    __acpp_metal_pointer_translation_fail(miss_flag, 4u, addr);
++    return 0;
++  }
++  for (uint i = 0; i < __acpp_sscp_metal_pointer_translation.count; ++i) {
++    __acpp_sscp_metal_pointer_translation_entry entry = __acpp_sscp_metal_pointer_translation.entries[i];
++    if (addr >= entry.gpu_base && addr < entry.gpu_base + entry.length) {
++      return (long)(entry.host_base + (addr - entry.gpu_base));
++    }
++  }
++  __acpp_metal_pointer_translation_fail(miss_flag, 2u, addr);
++  return 0;
++}
++
+ inline uint __acpp_sscp_get_num_subgroups() {
+   return (__acpp_sscp_metal_local_size.x + __simd_size - 1u) / __simd_size;
+ }
+ 
+-inline ulong __acpp_sscp_atomic_load_i64(uint, uint, uint, device void* ptr) {
+-  return *((device ulong*)ptr);
++inline long __acpp_sscp_atomic_load_i64(uint, uint, uint, device void* ptr) {
++  return *__pointer_cast<long>(ptr);
+ }
+ 
+-inline ulong __acpp_sscp_atomic_load_i64(uint, uint, uint, threadgroup void* ptr) {
+-  return *((threadgroup ulong*)ptr);
++inline long __acpp_sscp_atomic_load_i64(uint, uint, uint, threadgroup void* ptr) {
++  return *__pointer_cast<long>(ptr);
+ }
+ 
++inline ulong __acpp_sscp_atomic_load_u64(uint, uint, uint, device void* ptr) {
++  return *__pointer_cast<ulong>(ptr);
++}
++
++inline ulong __acpp_sscp_atomic_load_u64(uint, uint, uint, threadgroup void* ptr) {
++  return *__pointer_cast<ulong>(ptr);
++}
++
++template <typename A, typename B>
++inline void _ZN5amrex10Error_hostEPKcS1_(A, B) {}
++
++template <typename A, typename B, typename C>
++inline void _ZN5amrex11Assert_hostEPKcS1_iS1_m(A, B, uint, C, ulong) {}
++
+ )__";
+ 
+   emitTypes();
+@@ -526,8 +619,14 @@ bool MetalEmitter::emitSignature(Function& F) {
+   os << returnType << " " << F.getName().str() << " (";
+ 
+   bool first = true;
+-  int bufIdx = 1; // index=0 is reserved for dynamic local memory size if needed, so start from 1
++  int bufIdx = 2; // buffer(0): local memory size, buffer(1): pointer translation table
++  if (isKernel) {
++    first = false;
++    os << "device __acpp_sscp_metal_pointer_translation_miss& "
++       << "__acpp_sscp_metal_pointer_translation_miss_flag [[buffer(30)]]";
++  }
+   if (useArgStruct) {
++    if (!first) os << ", ";
+     first = false;
+     os << "device " << inputStructName << "& __args [[buffer(" << bufIdx++ << ")]]";
+   } else {
+@@ -947,9 +1046,15 @@ bool MetalEmitter::emitCastInstruction(const CastInst* CI, const std::string& na
+     return false;
+   };
+ 
+-  // Special-case: addrspacecast to generic loses the information; in MSL we treat it as no-op.
+-  if (dyn_cast<AddrSpaceCastInst>(CI)) {
+-    os << indent(level) << name << " = " << src << "; // " << instToString(*CI) << "\n";
++  // Special-case addrspacecast: preserve AS3/AS5 when casting to generic.
++  if (auto* ASC = dyn_cast<AddrSpaceCastInst>(CI)) {
++    unsigned srcAS = ASC->getSrcAddressSpace();
++    unsigned destAS = ASC->getDestAddressSpace();
++    if (srcAS == destAS || (destAS == 0 && (srcAS == 3 || srcAS == 5))) {
++      os << indent(level) << name << " = " << src << "; // " << instToString(*CI) << "\n";
++    } else {
++      os << indent(level) << name << " = (" << destType << ")((ulong)" << src << "); // " << instToString(*CI) << "\n";
++    }
+   } else if (dyn_cast<BitCastInst>(CI)) {
+     os << indent(level) << name << " = as_type<" << destType << ">(" << src << "); // " << instToString(*CI) << "\n";
+   } else if (dyn_cast<SExtInst>(CI)) {
+@@ -1182,6 +1287,13 @@ void MetalEmitter::emitGEPInstruction(const GetElementPtrInst* GEP, const std::s
+   std::string base = emitExpr(GEP->getPointerOperand());
+   Type* srcElemType = GEP->getSourceElementType();
+   std::string typeName = mapType(srcElemType);
++  // Pointer-typed elements (e.g., ptr[]) cannot be expressed in MSL as "device void**".
++  if (srcElemType->isPointerTy()) {
++    auto pointerAS = srcElemType->getPointerAddressSpace();
++    auto elemAddrSpace = getAddressSpaceKeyword(pointerAS);
++    auto structName = "__struct_ptr_to_" + elemAddrSpace;
++    typeName = structName;
++  }
+ 
+   unsigned physAS = getPhysicalPointerAddressSpace(GEP->getPointerOperand());
+   std::string addrSpace = getAddressSpaceKeyword(physAS);
+@@ -1253,6 +1365,14 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
+ 
+   std::string calleeName = callee->getName().str();
+ 
++  if (calleeName == "__acpp_metal_translate_host_addr_to_gpu" ||
++      calleeName == "__acpp_metal_translate_gpu_addr_to_host") {
++    std::string callExpr = calleeName + "(" + emitExpr(CI->getArgOperand(0)) +
++      ", __acpp_sscp_metal_pointer_translation_miss_flag)";
++    os << indent(level) << name << " = " << callExpr << ";\n";
++    return true;
++  }
++
+   if (calleeName.find("__acpp_sscp_metal") == 0) {
+     return emitMetalInlineCall(CI, name, level);
+   }
+@@ -1320,8 +1440,18 @@ std::string MetalEmitter::emitExpr(const Value* V) {
+ 
+   // Strip pointer casts (addrspacecast, bitcast)
+   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+-    if (CE->getOpcode() == Instruction::AddrSpaceCast ||
+-        CE->getOpcode() == Instruction::BitCast) {
++    if (CE->getOpcode() == Instruction::AddrSpaceCast) {
++      Type* srcTy = CE->getOperand(0)->getType();
++      Type* destTy = CE->getType();
++      unsigned srcAS = srcTy->isPointerTy() ? srcTy->getPointerAddressSpace() : 0;
++      unsigned destAS = destTy->isPointerTy() ? destTy->getPointerAddressSpace() : 0;
++      std::string src = emitExpr(CE->getOperand(0));
++      if (srcAS == destAS || (destAS == 0 && (srcAS == 3 || srcAS == 5))) {
++        return src;
++      }
++      return "(" + mapType(destTy) + ")((ulong)" + src + ")";
++    }
++    if (CE->getOpcode() == Instruction::BitCast) {
+       return emitExpr(CE->getOperand(0));
+     }
+   }
+@@ -1335,19 +1465,39 @@ std::string MetalEmitter::emitExpr(const Value* V) {
+ }
+ 
+ std::string MetalEmitter::valueName(const Value* V) {
+-  std::string s;
+-  raw_string_ostream rso(s);
+-  V->printAsOperand(rso, false);
+-  std::string name = rso.str();
+-  if (name[0] == '%') {
+-    name = name.substr(1);
++  auto cached = valueNameCache.find(V);
++  if (cached != valueNameCache.end()) {
++    return cached->second;
++  }
++
++  std::string name;
++  if (V->hasName()) {
++    name = V->getName().str();
++  } else if (auto* A = dyn_cast<Argument>(V)) {
++    name = "arg" + std::to_string(A->getArgNo());
++  } else if (isa<Instruction>(V)) {
++    name = "__v" + std::to_string(nextValueNameId++);
++  } else {
++    std::string s;
++    raw_string_ostream rso(s);
++    V->printAsOperand(rso, false);
++    name = rso.str();
++    if (!name.empty() && name[0] == '%') {
++      name = name.substr(1);
++    }
+   }
+   for (char& c : name) {
+     if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) {
+       c = '_';
+     }
+   }
+-  return "t" + name;
++  if (name.empty()) {
++    name = "__v" + std::to_string(nextValueNameId++);
++  }
++
++  std::string result = "t" + name;
++  valueNameCache[V] = result;
++  return result;
+ }
+ 
+ std::string MetalEmitter::basicBlockName(const BasicBlock* BB) {
+@@ -1449,8 +1599,8 @@ std::string MetalEmitter::mapType(const Type* T) {
+   } else if (T->isFloatTy()) {
+     return typeCache[T] = "float";
+   } else if (T->isDoubleTy()) {
+-    errorMsg = "Error: Double type is not supported on Metal GPU\n";
+-    return "";
++    // Metal GPUs do not have native FP64 support; demote parser-side doubles.
++    return typeCache[T] = "float";
+   } else if (T->isHalfTy()) {
+     return typeCache[T] = "half";
+   } else {
+@@ -1535,7 +1685,21 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
+     return (inferredPtrAS[V] = 5 /* private */);
+   }
+   if (auto* ASC = dyn_cast<AddrSpaceCastInst>(V)) {
+-    return (inferredPtrAS[V] = getPhysicalPointerAddressSpace(ASC->getOperand(0)));
++    unsigned srcAS = ASC->getSrcTy()->getPointerAddressSpace();
++    unsigned destAS = ASC->getDestTy()->getPointerAddressSpace();
++    if (destAS != 0) {
++      return (inferredPtrAS[V] = destAS);
++    }
++    if (srcAS == 3) {
++      return (inferredPtrAS[V] = 3);
++    }
++    if (srcAS == 5) {
++      return (inferredPtrAS[V] = 5);
++    }
++    return (inferredPtrAS[V] = 1);
++  }
++  if (auto* BC = dyn_cast<BitCastInst>(V)) {
++    return (inferredPtrAS[V] = getPhysicalPointerAddressSpace(BC->getOperand(0)));
+   }
+   if (auto* GEP = dyn_cast<GetElementPtrInst>(V)) {
+     return (inferredPtrAS[V] = getPhysicalPointerAddressSpace(GEP->getPointerOperand()));
+@@ -1549,14 +1713,130 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
+         if (deducedAS == 0) {
+           deducedAS = incomingAS;
+         } else if (deducedAS != incomingAS) {
+-          errorMsg = "Error: Conflicting address space information in PHI node\n";
+-          return 0;
++          return (inferredPtrAS[V] = 1);
+         }
+       }
+     }
+     if (deducedAS != 0) {
+       return (inferredPtrAS[V] = deducedAS);
+     }
++
++    // Resolve pointer PHI/load cycles without losing concrete AS3/AS5 roots.
++    // Unknown or mixed generic roots fall back to device AS1 instead of AS0.
++    SmallPtrSet<const Value*, 16> visited;
++    std::function<unsigned(const Value*)> classifyPointerAS =
++      [&](const Value* Cur) -> unsigned {
++      if (!Cur || !Cur->getType()->isPointerTy()) {
++        return 0;
++      }
++      if (!visited.insert(Cur).second) {
++        return 0;
++      }
++      unsigned CurAS = Cur->getType()->getPointerAddressSpace();
++      if (CurAS == 3 || CurAS == 5) {
++        return CurAS;
++      }
++      if (CurAS != 0) {
++        return 1;
++      }
++      if (isa<AllocaInst>(Cur)) {
++        return 5;
++      }
++      if (auto* InnerASC = dyn_cast<AddrSpaceCastInst>(Cur)) {
++        unsigned srcAS = InnerASC->getSrcTy()->getPointerAddressSpace();
++        unsigned destAS = InnerASC->getDestTy()->getPointerAddressSpace();
++        if (destAS == 3 || destAS == 5) {
++          return destAS;
++        }
++        if (destAS != 0) {
++          return 1;
++        }
++        if (srcAS == 3 || srcAS == 5) {
++          return srcAS;
++        }
++        return classifyPointerAS(InnerASC->getPointerOperand());
++      }
++      if (auto* InnerBC = dyn_cast<BitCastInst>(Cur)) {
++        return classifyPointerAS(InnerBC->getOperand(0));
++      }
++      if (auto* InnerGEP = dyn_cast<GetElementPtrInst>(Cur)) {
++        return classifyPointerAS(InnerGEP->getPointerOperand());
++      }
++      if (auto* OtherPHI = dyn_cast<PHINode>(Cur)) {
++        unsigned phiAS = 0;
++        for (unsigned j = 0; j < OtherPHI->getNumIncomingValues(); ++j) {
++          const Value* OtherIncoming = OtherPHI->getIncomingValue(j);
++          if (isa<UndefValue>(OtherIncoming) || isa<PoisonValue>(OtherIncoming) ||
++              isa<ConstantPointerNull>(OtherIncoming)) {
++            continue;
++          }
++          unsigned incomingAS = classifyPointerAS(OtherIncoming);
++          if (incomingAS == 0) {
++            continue;
++          }
++          if (incomingAS == 1) {
++            return 1;
++          }
++          if (phiAS == 0) {
++            phiAS = incomingAS;
++          } else if (phiAS != incomingAS) {
++            return 1;
++          }
++        }
++        return phiAS;
++      }
++      if (auto* LI = dyn_cast<LoadInst>(Cur)) {
++        const Value* root = stripToRootObject(LI->getPointerOperand());
++        unsigned loadAS = 0;
++        for (const User* U : root->users()) {
++          const StoreInst* SI = dyn_cast<StoreInst>(U);
++          if (!SI) {
++            continue;
++          }
++          if (stripToRootObject(SI->getPointerOperand()) != root) {
++            continue;
++          }
++          unsigned storedAS = classifyPointerAS(SI->getValueOperand());
++          if (storedAS == 0) {
++            continue;
++          }
++          if (storedAS == 1) {
++            return 1;
++          }
++          if (loadAS == 0) {
++            loadAS = storedAS;
++          } else if (loadAS != storedAS) {
++            return 1;
++          }
++        }
++        return loadAS;
++      }
++      return 1;
++    };
++    unsigned concreteAS = 0;
++    for (unsigned i = 0; i < PHI->getNumIncomingValues(); ++i) {
++      Value* incomingV = PHI->getIncomingValue(i);
++      if (isa<UndefValue>(incomingV) || isa<PoisonValue>(incomingV) ||
++          isa<ConstantPointerNull>(incomingV)) {
++        continue;
++      }
++      visited.clear();
++      unsigned incomingAS = classifyPointerAS(incomingV);
++      if (incomingAS == 0) {
++        continue;
++      }
++      if (incomingAS == 1) {
++        return (inferredPtrAS[V] = 1);
++      }
++      if (concreteAS == 0) {
++        concreteAS = incomingAS;
++      } else if (concreteAS != incomingAS) {
++        return (inferredPtrAS[V] = 1);
++      }
++    }
++    if (concreteAS == 3 || concreteAS == 5) {
++      return (inferredPtrAS[V] = concreteAS);
++    }
+   }
+   if (auto* Select = dyn_cast<SelectInst>(V)) {
+     unsigned trueAS = getPhysicalPointerAddressSpace(Select->getTrueValue());
+@@ -1633,6 +1913,8 @@ void MetalEmitter::collectVariablesInfo(const Function& F) {
+   phiIncomingFromBlock.clear();
+   phiNodes.clear();
+   valuesToDeclare.clear();
++  valueNameCache.clear();
++  nextValueNameId = 0;
+ 
+   for (const BasicBlock& BB : F) {
+     for (const Instruction& I : BB) {
+@@ -1779,6 +2061,149 @@ bool MetalEmitter::emitMetalInlineCall(const llvm::CallInst* CI, const std::stri
+     return true;
+   }
+ 
++  auto emitExprArg = [&](unsigned i) -> std::string {
++    return emitExpr(CI->getArgOperand(i));
++  };
++
++  auto emitFetch64 = [&](const std::string& type) -> bool {
++    if (CI->arg_size() < 3 || CI->getType()->isVoidTy()) {
++      return false;
++    }
++
++    auto emitLowWordFetch64 = [&](const std::string& op) -> bool {
++      const bool isSigned = type == "long";
++      os << indent(level) << "{\n";
++      os << indent(level + 1) << "auto ptr = " << emitExprArg(1) << ";\n";
++      os << indent(level + 1) << type << " val = " << emitExprArg(2) << ";\n";
++      if (isSigned) {
++        os << indent(level + 1) << "uint old_lo = (uint)atomic_fetch_" << op
++           << "_explicit(__atomic_pointer_cast<int>(ptr), (int)val, memory_order_relaxed);\n";
++      } else {
++        os << indent(level + 1) << "uint old_lo = atomic_fetch_" << op
++           << "_explicit(__atomic_pointer_cast<uint>(ptr), (uint)val, memory_order_relaxed);\n";
++      }
++      os << indent(level + 1) << name << " = (" << type << ")old_lo;\n";
++      os << indent(level) << "}\n";
++      return true;
++    };
++
++    if (funcName->find("atomic_fetch_add_explicit") != std::string::npos) {
++      return emitLowWordFetch64("add");
++    } else if (funcName->find("atomic_fetch_sub_explicit") != std::string::npos) {
++      return emitLowWordFetch64("sub");
++    }
++
++    std::string expr;
++    if (funcName->find("atomic_fetch_and_explicit") != std::string::npos) {
++      expr = "old & val";
++    } else if (funcName->find("atomic_fetch_or_explicit") != std::string::npos) {
++      expr = "old | val";
++    } else if (funcName->find("atomic_fetch_xor_explicit") != std::string::npos) {
++      expr = "old ^ val";
++    } else if (funcName->find("atomic_fetch_min_explicit") != std::string::npos) {
++      expr = "(old < val) ? old : val";
++    } else if (funcName->find("atomic_fetch_max_explicit") != std::string::npos) {
++      expr = "(old > val) ? old : val";
++    } else {
++      return false;
++    }
++
++    os << indent(level) << "{\n";
++    os << indent(level + 1) << "auto ptr = __pointer_cast<" << type
++       << ">(" << emitExprArg(1) << ");\n";
++    os << indent(level + 1) << type << " old = *ptr;\n";
++    os << indent(level + 1) << type << " val = " << emitExprArg(2) << ";\n";
++    os << indent(level + 1) << "*ptr = " << expr << ";\n";
++    os << indent(level + 1) << name << " = old;\n";
++    os << indent(level) << "}\n";
++    return true;
++  };
++
++  if (CI->getType()->isIntegerTy(64) &&
++      funcName->find("atomic_fetch_") != std::string::npos &&
++      funcName->find("_explicit") != std::string::npos &&
++      emitFetch64("ulong")) {
++    return true;
++  }
++
++  auto emitAtomic64Inline = [&]() -> bool {
++    auto hasSuffix = [](const std::string& value, const std::string& suffix) {
++      return value.size() >= suffix.size() &&
++             value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
++    };
++
++    std::string type;
++    std::string suffix;
++    if (hasSuffix(ctx->name, "_i64")) {
++      type = "long";
++      suffix = "_i64";
++    } else if (hasSuffix(ctx->name, "_u64")) {
++      type = "ulong";
++      suffix = "_u64";
++    } else {
++      return false;
++    }
++
++    if (ctx->name.find("__acpp_sscp_metal_atomic_load" + suffix) == 0) {
++      if (CI->arg_size() < 2 || CI->getType()->isVoidTy()) {
++        return false;
++      }
++      os << indent(level) << name << " = *__pointer_cast<" << type << ">("
++         << emitExprArg(1) << ");\n";
++      return true;
++    }
++
++    if (ctx->name.find("__acpp_sscp_metal_atomic_store" + suffix) == 0) {
++      if (CI->arg_size() < 3) {
++        return false;
++      }
++      os << indent(level) << "*__pointer_cast<" << type << ">(" << emitExprArg(1)
++         << ") = " << emitExprArg(2) << ";\n";
++      return true;
++    }
++
++    if (ctx->name.find("__acpp_sscp_metal_atomic_exchange" + suffix) == 0) {
++      if (CI->arg_size() < 3 || CI->getType()->isVoidTy()) {
++        return false;
++      }
++      os << indent(level) << "{\n";
++      os << indent(level + 1) << "auto ptr = __pointer_cast<" << type
++         << ">(" << emitExprArg(1) << ");\n";
++      os << indent(level + 1) << type << " old = *ptr;\n";
++      os << indent(level + 1) << "*ptr = " << emitExprArg(2) << ";\n";
++      os << indent(level + 1) << name << " = old;\n";
++      os << indent(level) << "}\n";
++      return true;
++    }
++
++    if (ctx->name.find("__acpp_sscp_metal_atomic_cmpxchg" + suffix) == 0) {
++      if (CI->arg_size() < 4 || CI->getType()->isVoidTy()) {
++        return false;
++      }
++      os << indent(level) << "{\n";
++      os << indent(level + 1) << "auto ptr = __pointer_cast<" << type
++         << ">(" << emitExprArg(1) << ");\n";
++      os << indent(level + 1) << "auto expected = __pointer_cast<" << type
++         << ">(" << emitExprArg(2) << ");\n";
++      os << indent(level + 1) << type << " old = *ptr;\n";
++      os << indent(level + 1) << "if (old == *expected) { *ptr = "
++         << emitExprArg(3) << "; " << name << " = true; } else { *expected = old; "
++         << name << " = false; }\n";
++      os << indent(level) << "}\n";
++      return true;
++    }
++
++    if (ctx->name.find("__acpp_sscp_metal_atomic_fetch" + suffix) == 0) {
++      return emitFetch64(type);
++    }
++
++    return false;
++  };
++
++  if (emitAtomic64Inline()) {
++    return true;
++  }
++
+   std::string result;
+   if (funcName->find("%s") != std::string::npos) {
+     // expand printf-style format string with arguments
+diff --git a/src/compiler/llvm-to-backend/metal/Emitter.hpp b/src/compiler/llvm-to-backend/metal/Emitter.hpp
+index 92bab3b..d0650fc 100644
+--- a/src/compiler/llvm-to-backend/metal/Emitter.hpp
++++ b/src/compiler/llvm-to-backend/metal/Emitter.hpp
+@@ -12,6 +12,7 @@
+ #define EMITTER_HPP
+ 
+ #include <string>
++#include <unordered_map>
+ #include <unordered_set>
+ #include <sstream>
+ #include <map>
+@@ -105,6 +106,8 @@ private:
+   std::map<std::pair<const llvm::BasicBlock*, const llvm::PHINode*>, const llvm::Value*> phiIncomingFromBlock;
+   std::unordered_set<const llvm::PHINode*> phiNodes;
+   std::unordered_map<const llvm::Value*, std::string> valuesToDeclare;
++  std::unordered_map<const llvm::Value*, std::string> valueNameCache;
++  int nextValueNameId = 0;
+   //
+   std::unordered_map<const llvm::Value*, unsigned> inferredPtrAS;
+ 
+@@ -118,4 +121,4 @@ private:
+ } // namespace compiler
+ } // namespace hipsycl
+ 
+-#endif // EMITTER_HPP
+\ No newline at end of file
++#endif // EMITTER_HPP
+diff --git a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
+index 5cea593..65a9f21 100644
+--- a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
++++ b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
+@@ -13,6 +13,8 @@
+ #include "hipSYCL/compiler/llvm-to-backend/AddressSpaceMap.hpp"
+ #include "hipSYCL/compiler/llvm-to-backend/LLVMToBackend.hpp"
+ #include "hipSYCL/compiler/llvm-to-backend/Utils.hpp"
++#include "hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp"
++#include "hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp"
+ #include "hipSYCL/compiler/sscp/IRConstantReplacer.hpp"
+ #include "hipSYCL/compiler/utils/LLVMUtils.hpp"
+ #include "hipSYCL/glue/llvm-sscp/jit-reflection/queries.hpp"
+@@ -543,6 +545,8 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
+     llvm::ModulePassManager MPM;
+     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+     MPM.addPass(std::move(ASIPass));
++    MPM.addPass(PointerTranslationAnnotationPass(ASMap[AddressSpace::Global]));
++    MPM.addPass(PointerTranslationPass(ASMap[AddressSpace::Global]));
+     MPM.run(FlavoredModule, MAM);
+     return true;
+   });
+@@ -596,4 +600,4 @@ createLLVMToMetalTranslator(const std::vector<std::string> &KernelNames) {
+ }
+ 
+ } // namespace compiler
+-} // namespace hipsycl
+\ No newline at end of file
++} // namespace hipsycl
+diff --git a/new/src/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.cpp b/src/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.cpp
+new file mode 100644
+index 0000000..7f889f3
+--- /dev/null
++++ b/src/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.cpp
+@@ -0,0 +1,273 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++
++#include "hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp"
++
++#include "hipSYCL/common/debug.hpp"
++
++#include <llvm/ADT/SmallPtrSet.h>
++#include <llvm/IR/Constants.h>
++#include <llvm/IR/Instructions.h>
++#include <llvm/IR/IntrinsicInst.h>
++#include <llvm/IR/LLVMContext.h>
++#include <llvm/IR/MDBuilder.h>
++#include <llvm/IR/Metadata.h>
++#include <llvm/IR/Module.h>
++#include <llvm/IR/Operator.h>
++#include <llvm/IR/PassManager.h>
++#include <llvm/IR/Type.h>
++#include <llvm/IR/Value.h>
++
++using namespace llvm;
++
++namespace hipsycl {
++namespace compiler {
++
++namespace {
++
++bool isNullPointerValue(Value *V) {
++  return isa<ConstantPointerNull>(V) || isa<UndefValue>(V);
++}
++
++AllocaInst *getBaseAlloca(Value *V) {
++  while (V) {
++    if (auto *AI = dyn_cast<AllocaInst>(V)) {
++      return AI;
++    }
++    if (auto *GEP = dyn_cast<GEPOperator>(V)) {
++      V = GEP->getPointerOperand();
++      continue;
++    }
++    if (auto *BC = dyn_cast<BitCastOperator>(V)) {
++      V = BC->getOperand(0);
++      continue;
++    }
++    if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V)) {
++      V = ASC->getOperand(0);
++      continue;
++    }
++    break;
++  }
++  return nullptr;
++}
++
++bool tracesToGlobal(
++  Value *V, unsigned GlobalAS,
++  const SmallPtrSetImpl<AllocaInst *> &TaintedAllocas,
++  SmallPtrSetImpl<Value *> &Visited) {
++  if (!V || !V->getType()->isPointerTy()) {
++    return false;
++  }
++
++  if (isNullPointerValue(V)) {
++    return true;
++  }
++
++  unsigned AS = V->getType()->getPointerAddressSpace();
++  if (AS == GlobalAS) {
++    return true;
++  }
++
++  if (!Visited.insert(V).second) {
++    return false;
++  }
++
++  if (AS == 5) {
++    if (auto *AI = dyn_cast<AllocaInst>(V)) {
++      return TaintedAllocas.count(AI) != 0;
++    }
++    if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
++      return tracesToGlobal(GEP->getPointerOperand(), GlobalAS, TaintedAllocas, Visited);
++    }
++    if (auto *BC = dyn_cast<BitCastInst>(V)) {
++      return tracesToGlobal(BC->getOperand(0), GlobalAS, TaintedAllocas, Visited);
++    }
++    return false;
++  }
++
++  if (AS != 0) {
++    return false;
++  }
++
++  if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V)) {
++    return tracesToGlobal(ASC->getOperand(0), GlobalAS, TaintedAllocas, Visited);
++  }
++  if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
++    return tracesToGlobal(GEP->getPointerOperand(), GlobalAS, TaintedAllocas, Visited);
++  }
++  if (auto *BC = dyn_cast<BitCastInst>(V)) {
++    return tracesToGlobal(BC->getOperand(0), GlobalAS, TaintedAllocas, Visited);
++  }
++  if (auto *PHI = dyn_cast<PHINode>(V)) {
++    for (Value *Inc : PHI->incoming_values()) {
++      if (isNullPointerValue(Inc)) {
++        continue;
++      }
++      if (!tracesToGlobal(Inc, GlobalAS, TaintedAllocas, Visited)) {
++        return false;
++      }
++    }
++    return true;
++  }
++  if (auto *SI = dyn_cast<SelectInst>(V)) {
++    Value *TrueValue = SI->getTrueValue();
++    Value *FalseValue = SI->getFalseValue();
++    if (!isNullPointerValue(TrueValue) &&
++        !tracesToGlobal(TrueValue, GlobalAS, TaintedAllocas, Visited)) {
++      return false;
++    }
++    if (!isNullPointerValue(FalseValue) &&
++        !tracesToGlobal(FalseValue, GlobalAS, TaintedAllocas, Visited)) {
++      return false;
++    }
++    return true;
++  }
++  if (auto *ITP = dyn_cast<IntToPtrInst>(V)) {
++    if (auto *PTI = dyn_cast<PtrToIntOperator>(ITP->getOperand(0))) {
++      return tracesToGlobal(PTI->getPointerOperand(), GlobalAS, TaintedAllocas, Visited);
++    }
++    return false;
++  }
++  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
++    if (CE->getOpcode() == Instruction::IntToPtr) {
++      Value *Operand = CE->getOperand(0);
++      if (auto *PTI = dyn_cast<PtrToIntOperator>(Operand)) {
++        return tracesToGlobal(PTI->getPointerOperand(), GlobalAS, TaintedAllocas, Visited);
++      }
++      return false;
++    }
++  }
++  if (auto *LI = dyn_cast<LoadInst>(V)) {
++    return tracesToGlobal(LI->getPointerOperand(), GlobalAS, TaintedAllocas, Visited);
++  }
++  return false;
++}
++
++bool tracesToGlobal(Value *V, unsigned GlobalAS, const SmallPtrSetImpl<AllocaInst *> &TaintedAllocas) {
++  SmallPtrSet<Value *, 16> Visited;
++  return tracesToGlobal(V, GlobalAS, TaintedAllocas, Visited);
++}
++
++SmallPtrSet<AllocaInst *, 8> computeTaintedAllocas(Function &F, unsigned GlobalAS) {
++  SmallPtrSet<AllocaInst *, 8> Tainted;
++
++  for (BasicBlock &BB : F) {
++    for (Instruction &I : BB) {
++      auto *MI = dyn_cast<MemCpyInst>(&I);
++      if (!MI) {
++        continue;
++      }
++      SmallPtrSet<Value *, 16> Visited;
++      if (!tracesToGlobal(MI->getRawSource(), GlobalAS, Tainted, Visited)) {
++        continue;
++      }
++      if (MI->getRawDest()->getType()->getPointerAddressSpace() != 5) {
++        continue;
++      }
++      if (AllocaInst *AI = getBaseAlloca(MI->getRawDest())) {
++        Tainted.insert(AI);
++      }
++    }
++  }
++
++  bool Changed = true;
++  while (Changed) {
++    Changed = false;
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        auto *SI = dyn_cast<StoreInst>(&I);
++        if (!SI) {
++          continue;
++        }
++        if (SI->getPointerOperand()->getType()->getPointerAddressSpace() != 5) {
++          continue;
++        }
++        Value *Val = SI->getValueOperand();
++        if (!Val->getType()->isPointerTy()) {
++          continue;
++        }
++        AllocaInst *AI = getBaseAlloca(SI->getPointerOperand());
++        if (!AI || Tainted.count(AI)) {
++          continue;
++        }
++        if (tracesToGlobal(Val, GlobalAS, Tainted)) {
++          Tainted.insert(AI);
++          Changed = true;
++        }
++      }
++    }
++  }
++  return Tainted;
++}
++
++} // namespace
++
++PointerTranslationAnnotationPass::PointerTranslationAnnotationPass(unsigned GlobalAS)
++  : GlobalAS(GlobalAS)
++{}
++
++llvm::PreservedAnalyses PointerTranslationAnnotationPass::run(Module &M, ModuleAnalysisManager &MAM) {
++  LLVMContext &Ctx = M.getContext();
++  MDNode *EmptyMD = MDNode::get(Ctx, {});
++
++  unsigned LoadsAnnotated = 0;
++  unsigned StoresAnnotated = 0;
++
++  for (Function &F : M) {
++    auto TaintedAllocas = computeTaintedAllocas(F, GlobalAS);
++
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        if (auto *LI = dyn_cast<LoadInst>(&I)) {
++          if (!LI->getType()->isPointerTy()) {
++            continue;
++          }
++          if (!tracesToGlobal(LI->getPointerOperand(), GlobalAS, TaintedAllocas)) {
++            continue;
++          }
++
++          LI->setMetadata(MetalPtrLoadNeedsTranslationMD, EmptyMD);
++          ++LoadsAnnotated;
++          HIPSYCL_DEBUG_INFO << "Metal PtrTranslation: annotated load in "
++                             << F.getName() << ": " << *LI << "\n";
++          continue;
++        }
++
++        if (auto *SI = dyn_cast<StoreInst>(&I)) {
++          if (!SI->getValueOperand()->getType()->isPointerTy()) {
++            continue;
++          }
++          if (!tracesToGlobal(SI->getPointerOperand(), GlobalAS, TaintedAllocas)) {
++            continue;
++          }
++          if (!tracesToGlobal(SI->getValueOperand(), GlobalAS, TaintedAllocas)) {
++            continue;
++          }
++
++          SI->setMetadata(MetalPtrStoreNeedsTranslationMD, EmptyMD);
++          ++StoresAnnotated;
++          HIPSYCL_DEBUG_INFO << "Metal PtrTranslation: annotated store in "
++                             << F.getName() << ": " << *SI << "\n";
++          continue;
++        }
++      }
++    }
++  }
++
++  HIPSYCL_DEBUG_INFO << "Metal PointerTranslationAnnotationPass: annotated "
++                     << LoadsAnnotated << " load(s) and "
++                     << StoresAnnotated << " store(s) for address translation.\n";
++
++  return (LoadsAnnotated + StoresAnnotated) > 0
++    ? PreservedAnalyses::none()
++    : PreservedAnalyses::all();
++}
++
++} // namespace compiler
++} // namespace hipsycl
+diff --git a/new/src/compiler/llvm-to-backend/metal/PointerTranslationPass.cpp b/src/compiler/llvm-to-backend/metal/PointerTranslationPass.cpp
+new file mode 100644
+index 0000000..683a9bd
+--- /dev/null
++++ b/src/compiler/llvm-to-backend/metal/PointerTranslationPass.cpp
+@@ -0,0 +1,121 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++
++#include "hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp"
++#include "hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp"
++
++#include "hipSYCL/common/debug.hpp"
++
++#include <llvm/IR/Constants.h>
++#include <llvm/IR/Function.h>
++#include <llvm/IR/IRBuilder.h>
++#include <llvm/IR/Instructions.h>
++#include <llvm/IR/Module.h>
++#include <llvm/IR/PassManager.h>
++#include <llvm/IR/Type.h>
++
++using namespace llvm;
++
++namespace hipsycl {
++namespace compiler {
++
++namespace {
++
++static constexpr const char *HostToGpuFuncName = "__acpp_metal_translate_host_addr_to_gpu";
++static constexpr const char *GpuToHostFuncName = "__acpp_metal_translate_gpu_addr_to_host";
++
++FunctionCallee getOrCreateTranslationDecl(Module &M, const char *Name) {
++  Type *I64Ty = Type::getInt64Ty(M.getContext());
++  FunctionType *FT = FunctionType::get(I64Ty, {I64Ty}, /*isVarArg=*/false);
++  return M.getOrInsertFunction(Name, FT);
++}
++
++} // anonymous namespace
++
++PointerTranslationPass::PointerTranslationPass(unsigned GlobalAS)
++  : GlobalAS(GlobalAS)
++{}
++
++PreservedAnalyses PointerTranslationPass::run(Module &M, ModuleAnalysisManager &MAM) {
++  unsigned LoadsTranslated = 0;
++  unsigned StoresTranslated = 0;
++
++  for (Function &F : M) {
++    if (F.isDeclaration()) {
++      continue;
++    }
++
++    SmallVector<LoadInst *, 16> AnnotatedLoads;
++    SmallVector<StoreInst *, 16> AnnotatedStores;
++
++    for (BasicBlock &BB : F) {
++      for (Instruction &I : BB) {
++        if (auto *LI = dyn_cast<LoadInst>(&I)) {
++          if (LI->getMetadata(MetalPtrLoadNeedsTranslationMD)) {
++            AnnotatedLoads.push_back(LI);
++          }
++        } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
++          if (SI->getMetadata(MetalPtrStoreNeedsTranslationMD)) {
++            AnnotatedStores.push_back(SI);
++          }
++        }
++      }
++    }
++
++    for (LoadInst *LI : AnnotatedLoads) {
++      IRBuilder<> B(LI->getNextNode());
++      auto *PtrTy = cast<PointerType>(LI->getType());
++      Value *NullPtr = ConstantPointerNull::get(PtrTy);
++      Value *IsNull = B.CreateICmpEQ(LI, NullPtr, "ptr_loaded_is_null");
++      FunctionCallee TranslateFn = getOrCreateTranslationDecl(M, HostToGpuFuncName);
++      Value *RawAddr = B.CreatePtrToInt(LI, Type::getInt64Ty(M.getContext()), "ptr_host_addr");
++      Value *TranslatedAddr = B.CreateCall(TranslateFn, {RawAddr}, "ptr_gpu_addr");
++      Value *Translated = B.CreateIntToPtr(TranslatedAddr, PtrTy, "ptr_gpu_raw");
++      Value *Adjusted = B.CreateSelect(IsNull, LI, Translated, "ptr_gpu_adjusted");
++      LI->replaceUsesWithIf(Adjusted, [&](Use &U) {
++        return U.getUser() != IsNull && U.getUser() != RawAddr &&
++               U.getUser() != TranslatedAddr && U.getUser() != Translated &&
++               U.getUser() != Adjusted;
++      });
++      LI->setMetadata(MetalPtrLoadNeedsTranslationMD, nullptr);
++      ++LoadsTranslated;
++      HIPSYCL_DEBUG_INFO << "Metal PointerTranslationPass: translated load in "
++                         << F.getName() << "\n";
++    }
++
++    for (StoreInst *SI : AnnotatedStores) {
++      IRBuilder<> B(SI);
++      Value *Val = SI->getValueOperand();
++      auto *PtrTy = cast<PointerType>(Val->getType());
++      Value *NullPtr = ConstantPointerNull::get(PtrTy);
++      Value *IsNull = B.CreateICmpEQ(Val, NullPtr, "ptr_stored_is_null");
++      FunctionCallee TranslateFn = getOrCreateTranslationDecl(M, GpuToHostFuncName);
++      Value *RawAddr = B.CreatePtrToInt(Val, Type::getInt64Ty(M.getContext()), "ptr_gpu_addr");
++      Value *TranslatedAddr = B.CreateCall(TranslateFn, {RawAddr}, "ptr_host_addr");
++      Value *Translated = B.CreateIntToPtr(TranslatedAddr, PtrTy, "ptr_host_raw");
++      Value *Adjusted = B.CreateSelect(IsNull, Val, Translated, "ptr_host_adjusted");
++      SI->setOperand(0, Adjusted);
++      SI->setMetadata(MetalPtrStoreNeedsTranslationMD, nullptr);
++      ++StoresTranslated;
++      HIPSYCL_DEBUG_INFO << "Metal PointerTranslationPass: translated store in "
++                         << F.getName() << "\n";
++    }
++  }
++
++  HIPSYCL_DEBUG_INFO << "Metal PointerTranslationPass: translated "
++                     << LoadsTranslated << " load(s) and "
++                     << StoresTranslated << " store(s).\n";
++
++  return (LoadsTranslated + StoresTranslated) > 0
++    ? PreservedAnalyses::none()
++    : PreservedAnalyses::all();
++}
++
++} // namespace compiler
++} // namespace hipsycl
+diff --git a/src/libkernel/sscp/metal/atomic.cpp b/src/libkernel/sscp/metal/atomic.cpp
+index 5b074e7..6fb25ea 100644
+--- a/src/libkernel/sscp/metal/atomic.cpp
++++ b/src/libkernel/sscp/metal/atomic.cpp
+@@ -23,6 +23,8 @@ HIPSYCL_SSCP_BUILTIN u8  __acpp_sscp_metal_atomic_load_u8(const char* s, u8* ptr
+ HIPSYCL_SSCP_BUILTIN u16 __acpp_sscp_metal_atomic_load_u16(const char* s, u16* ptr);
+ HIPSYCL_SSCP_BUILTIN u32 __acpp_sscp_metal_atomic_load_u32(const char* s, u32* ptr);
+ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_metal_atomic_load_f32(const char* s, f32* ptr);
++HIPSYCL_SSCP_BUILTIN i64 __acpp_sscp_metal_atomic_load_i64(const char* s, i64* ptr);
++HIPSYCL_SSCP_BUILTIN u64 __acpp_sscp_metal_atomic_load_u64(const char* s, u64* ptr);
+ 
+ HIPSYCL_SSCP_BUILTIN void __acpp_sscp_metal_atomic_store_i8(const char* s, i8* ptr, i8 val);
+ HIPSYCL_SSCP_BUILTIN void __acpp_sscp_metal_atomic_store_i16(const char* s, i16* ptr, i16 val);
+@@ -31,6 +33,8 @@ HIPSYCL_SSCP_BUILTIN void __acpp_sscp_metal_atomic_store_u8(const char* s, u8* p
+ HIPSYCL_SSCP_BUILTIN void __acpp_sscp_metal_atomic_store_u16(const char* s, u16* ptr, u16 val);
+ HIPSYCL_SSCP_BUILTIN void __acpp_sscp_metal_atomic_store_u32(const char* s, u32* ptr, u32 val);
+ HIPSYCL_SSCP_BUILTIN void __acpp_sscp_metal_atomic_store_f32(const char* s, f32* ptr, f32 val);
++HIPSYCL_SSCP_BUILTIN void __acpp_sscp_metal_atomic_store_i64(const char* s, i64* ptr, i64 val);
++HIPSYCL_SSCP_BUILTIN void __acpp_sscp_metal_atomic_store_u64(const char* s, u64* ptr, u64 val);
+ 
+ HIPSYCL_SSCP_BUILTIN i8  __acpp_sscp_metal_atomic_exchange_i8(const char* s, i8* ptr, i8 val);
+ HIPSYCL_SSCP_BUILTIN i16 __acpp_sscp_metal_atomic_exchange_i16(const char* s, i16* ptr, i16 val);
+@@ -39,6 +43,8 @@ HIPSYCL_SSCP_BUILTIN u8  __acpp_sscp_metal_atomic_exchange_u8(const char* s, u8*
+ HIPSYCL_SSCP_BUILTIN u16 __acpp_sscp_metal_atomic_exchange_u16(const char* s, u16* ptr, u16 val);
+ HIPSYCL_SSCP_BUILTIN u32 __acpp_sscp_metal_atomic_exchange_u32(const char* s, u32* ptr, u32 val);
+ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_metal_atomic_exchange_f32(const char* s, f32* ptr, f32 val);
++HIPSYCL_SSCP_BUILTIN i64 __acpp_sscp_metal_atomic_exchange_i64(const char* s, i64* ptr, i64 val);
++HIPSYCL_SSCP_BUILTIN u64 __acpp_sscp_metal_atomic_exchange_u64(const char* s, u64* ptr, u64 val);
+ 
+ HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_metal_atomic_cmpxchg_i8(const char* s, i8* ptr, i8* expected, i8 desired);
+ HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_metal_atomic_cmpxchg_i16(const char* s, i16* ptr, i16* expected, i16 desired);
+@@ -46,6 +52,8 @@ HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_metal_atomic_cmpxchg_i32(const char* s, i3
+ HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_metal_atomic_cmpxchg_u8(const char* s, u8* ptr, u8* expected, u8 desired);
+ HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_metal_atomic_cmpxchg_u16(const char* s, u16* ptr, u16* expected, u16 desired);
+ HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_metal_atomic_cmpxchg_u32(const char* s, u32* ptr, u32* expected, u32 desired);
++HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_metal_atomic_cmpxchg_i64(const char* s, i64* ptr, i64* expected, i64 desired);
++HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_metal_atomic_cmpxchg_u64(const char* s, u64* ptr, u64* expected, u64 desired);
+ 
+ HIPSYCL_SSCP_BUILTIN i8  __acpp_sscp_metal_atomic_fetch_i8(const char* s, i8* ptr, i8 val);
+ HIPSYCL_SSCP_BUILTIN i16 __acpp_sscp_metal_atomic_fetch_i16(const char* s, i16* ptr, i16 val);
+@@ -54,6 +62,8 @@ HIPSYCL_SSCP_BUILTIN u8  __acpp_sscp_metal_atomic_fetch_u8(const char* s, u8* pt
+ HIPSYCL_SSCP_BUILTIN u16 __acpp_sscp_metal_atomic_fetch_u16(const char* s, u16* ptr, u16 val);
+ HIPSYCL_SSCP_BUILTIN u32 __acpp_sscp_metal_atomic_fetch_u32(const char* s, u32* ptr, u32 val);
+ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_metal_atomic_fetch_f32(const char* s, f32* ptr, f32 val);
++HIPSYCL_SSCP_BUILTIN i64 __acpp_sscp_metal_atomic_fetch_i64(const char* s, i64* ptr, i64 val);
++HIPSYCL_SSCP_BUILTIN u64 __acpp_sscp_metal_atomic_fetch_u64(const char* s, u64* ptr, u64 val);
+ 
+ // ********************** atomic load ***************************
+ 
+@@ -75,6 +85,18 @@ HIPSYCL_SSCP_BUILTIN i32 __acpp_sscp_atomic_load_i32(
+   return __acpp_sscp_metal_atomic_load_i32("atomic_load_explicit(__atomic_pointer_cast<int>(%s), memory_order_relaxed)", ptr);
+ }
+ 
++HIPSYCL_SSCP_BUILTIN i64 __acpp_sscp_atomic_load_i64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order order,
++    __acpp_sscp_memory_scope scope, i64 *ptr) {
++  return __acpp_sscp_metal_atomic_load_i64("atomic_load_explicit(__atomic_pointer_cast<long>(%s), memory_order_relaxed)", ptr);
++}
++
++HIPSYCL_SSCP_BUILTIN u64 __acpp_sscp_atomic_load_u64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order order,
++    __acpp_sscp_memory_scope scope, u64 *ptr) {
++  return __acpp_sscp_metal_atomic_load_u64("atomic_load_explicit(__atomic_pointer_cast<ulong>(%s), memory_order_relaxed)", ptr);
++}
++
+ // ********************** atomic store ***************************
+ 
+ HIPSYCL_SSCP_BUILTIN void __acpp_sscp_atomic_store_i8(
+@@ -95,6 +117,18 @@ HIPSYCL_SSCP_BUILTIN void __acpp_sscp_atomic_store_i32(
+   __acpp_sscp_metal_atomic_store_i32("atomic_store_explicit(__atomic_pointer_cast<int>(%s), %s, memory_order_relaxed)", ptr, x);
+ }
+ 
++HIPSYCL_SSCP_BUILTIN void __acpp_sscp_atomic_store_i64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order order,
++    __acpp_sscp_memory_scope scope, i64 *ptr, i64 x) {
++  __acpp_sscp_metal_atomic_store_i64("atomic_store_explicit(__atomic_pointer_cast<long>(%s), %s, memory_order_relaxed)", ptr, x);
++}
++
++HIPSYCL_SSCP_BUILTIN void __acpp_sscp_atomic_store_u64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order order,
++    __acpp_sscp_memory_scope scope, u64 *ptr, u64 x) {
++  __acpp_sscp_metal_atomic_store_u64("atomic_store_explicit(__atomic_pointer_cast<ulong>(%s), %s, memory_order_relaxed)", ptr, x);
++}
++
+ // ********************** atomic exchange ***************************
+ 
+ HIPSYCL_SSCP_BUILTIN i8 __acpp_sscp_atomic_exchange_i8(
+@@ -115,6 +149,18 @@ HIPSYCL_SSCP_BUILTIN i32 __acpp_sscp_atomic_exchange_i32(
+   return __acpp_sscp_metal_atomic_exchange_i32("atomic_exchange_explicit(__atomic_pointer_cast<int>(%s), %s, memory_order_relaxed)", ptr, x);
+ }
+ 
++HIPSYCL_SSCP_BUILTIN i64 __acpp_sscp_atomic_exchange_i64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order order,
++    __acpp_sscp_memory_scope scope, i64 *ptr, i64 x) {
++  return __acpp_sscp_metal_atomic_exchange_i64("atomic_exchange_explicit(__atomic_pointer_cast<long>(%s), %s, memory_order_relaxed)", ptr, x);
++}
++
++HIPSYCL_SSCP_BUILTIN u64 __acpp_sscp_atomic_exchange_u64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order order,
++    __acpp_sscp_memory_scope scope, u64 *ptr, u64 x) {
++  return __acpp_sscp_metal_atomic_exchange_u64("atomic_exchange_explicit(__atomic_pointer_cast<ulong>(%s), %s, memory_order_relaxed)", ptr, x);
++}
++
+ // ********************** atomic compare exchange weak **********************
+ 
+ HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_cmp_exch_weak_i8(
+@@ -187,6 +233,50 @@ HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_cmp_exch_strong_i32(
+   return true;
+ }
+ 
++HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_cmp_exch_weak_i64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order success,
++    __acpp_sscp_memory_order failure, __acpp_sscp_memory_scope scope,
++    i64 *ptr, i64 *expected, i64 desired) {
++  return __acpp_sscp_metal_atomic_cmpxchg_i64(
++    "atomic_compare_exchange_weak_explicit(__atomic_pointer_cast<long>(%s), __pointer_cast<long>(%s), %s, memory_order_relaxed, memory_order_relaxed)",
++    ptr, expected, desired);
++}
++
++HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_cmp_exch_strong_i64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order success,
++    __acpp_sscp_memory_order failure, __acpp_sscp_memory_scope scope,
++    i64 *ptr, i64 *expected, i64 desired) {
++  i64 old = *expected;
++  while (!__acpp_sscp_metal_atomic_cmpxchg_i64(
++    "atomic_compare_exchange_weak_explicit(__atomic_pointer_cast<long>(%s), __pointer_cast<long>(%s), %s, memory_order_relaxed, memory_order_relaxed)",
++    ptr, expected, desired)) {
++    if (*expected != old) return false;
++  }
++  return true;
++}
++
++HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_cmp_exch_weak_u64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order success,
++    __acpp_sscp_memory_order failure, __acpp_sscp_memory_scope scope,
++    u64 *ptr, u64 *expected, u64 desired) {
++  return __acpp_sscp_metal_atomic_cmpxchg_u64(
++    "atomic_compare_exchange_weak_explicit(__atomic_pointer_cast<ulong>(%s), __pointer_cast<ulong>(%s), %s, memory_order_relaxed, memory_order_relaxed)",
++    ptr, expected, desired);
++}
++
++HIPSYCL_SSCP_BUILTIN bool __acpp_sscp_cmp_exch_strong_u64(
++    __acpp_sscp_address_space as, __acpp_sscp_memory_order success,
++    __acpp_sscp_memory_order failure, __acpp_sscp_memory_scope scope,
++    u64 *ptr, u64 *expected, u64 desired) {
++  u64 old = *expected;
++  while (!__acpp_sscp_metal_atomic_cmpxchg_u64(
++    "atomic_compare_exchange_weak_explicit(__atomic_pointer_cast<ulong>(%s), __pointer_cast<ulong>(%s), %s, memory_order_relaxed, memory_order_relaxed)",
++    ptr, expected, desired)) {
++    if (*expected != old) return false;
++  }
++  return true;
++}
++
+ // ********************* atomic fetch add ************************************
+ 
+ HIPSYCL_SSCP_BUILTIN i8 __acpp_sscp_atomic_fetch_add_i8(
+@@ -229,26 +319,25 @@ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_atomic_fetch_add_f32(
+   __acpp_sscp_address_space as, __acpp_sscp_memory_order order,
+   __acpp_sscp_memory_scope scope, f32 *ptr, f32 x) {
+ 
+-  if (as == __acpp_sscp_address_space::local_space) {
+-    u32 *addr = (u32 *)ptr;
+-    u32 old_bits = __acpp_sscp_metal_atomic_load_u32(
+-      "atomic_load_explicit(__atomic_pointer_cast<uint>(%s), memory_order_relaxed)", addr);
+-    while (true) {
+-      f32 old_val = *((f32 *)&old_bits);
+-      f32 new_val = old_val + x;
+-      u32 new_bits = *((u32 *)&new_val);
+-      u32 expected = old_bits;
+-      bool ok = __acpp_sscp_metal_atomic_cmpxchg_u32(
+-        "atomic_compare_exchange_weak_explicit(__atomic_pointer_cast<uint>(%s), __pointer_cast<uint>(%s), %s, memory_order_relaxed, memory_order_relaxed)",
+-        addr, &expected, new_bits);
+-      if (ok) {
+-        return old_val;
+-      }
+-      old_bits = expected;
++  (void)as;
++  (void)order;
++  (void)scope;
++  u32 *addr = (u32 *)ptr;
++  u32 old_bits = __acpp_sscp_metal_atomic_load_u32(
++    "atomic_load_explicit(__atomic_pointer_cast<uint>(%s), memory_order_relaxed)", addr);
++  while (true) {
++    f32 old_val = *((f32 *)&old_bits);
++    f32 new_val = old_val + x;
++    u32 new_bits = *((u32 *)&new_val);
++    u32 expected = old_bits;
++    bool ok = __acpp_sscp_metal_atomic_cmpxchg_u32(
++      "atomic_compare_exchange_weak_explicit(__atomic_pointer_cast<uint>(%s), __pointer_cast<uint>(%s), %s, memory_order_relaxed, memory_order_relaxed)",
++      addr, &expected, new_bits);
++    if (ok) {
++      return old_val;
+     }
++    old_bits = expected;
+   }
+-  return __acpp_sscp_metal_atomic_fetch_f32(
+-    "atomic_fetch_add_explicit(__atomic_pointer_cast<float>(%s), %s, memory_order_relaxed)", ptr, x);
+ }
+ 
+ // ********************* atomic fetch sub ************************************
+@@ -293,27 +382,26 @@ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_atomic_fetch_sub_f32(
+   __acpp_sscp_address_space as, __acpp_sscp_memory_order order,
+   __acpp_sscp_memory_scope scope, f32 *ptr, f32 x) {
+ 
+-  if (as == __acpp_sscp_address_space::local_space) {
+-    u32 *addr = (u32 *)ptr;
+-    u32 old_bits = __acpp_sscp_metal_atomic_load_u32(
+-      "atomic_load_explicit(__atomic_pointer_cast<uint>(%s), memory_order_relaxed)", addr);
+-
+-    while (true) {
+-      f32 old_val = *((f32 *)&old_bits);
+-      f32 new_val = old_val - x;
+-      u32 new_bits = *((u32 *)&new_val);
+-      u32 expected = old_bits;
+-      bool ok = __acpp_sscp_metal_atomic_cmpxchg_u32(
+-        "atomic_compare_exchange_weak_explicit(__atomic_pointer_cast<uint>(%s), __pointer_cast<uint>(%s), %s, memory_order_relaxed, memory_order_relaxed)",
+-        addr, &expected, new_bits);
+-      if (ok) {
+-        return old_val;
+-      }
+-      old_bits = expected;
++  (void)as;
++  (void)order;
++  (void)scope;
++  u32 *addr = (u32 *)ptr;
++  u32 old_bits = __acpp_sscp_metal_atomic_load_u32(
++    "atomic_load_explicit(__atomic_pointer_cast<uint>(%s), memory_order_relaxed)", addr);
++
++  while (true) {
++    f32 old_val = *((f32 *)&old_bits);
++    f32 new_val = old_val - x;
++    u32 new_bits = *((u32 *)&new_val);
++    u32 expected = old_bits;
++    bool ok = __acpp_sscp_metal_atomic_cmpxchg_u32(
++      "atomic_compare_exchange_weak_explicit(__atomic_pointer_cast<uint>(%s), __pointer_cast<uint>(%s), %s, memory_order_relaxed, memory_order_relaxed)",
++      addr, &expected, new_bits);
++    if (ok) {
++      return old_val;
+     }
++    old_bits = expected;
+   }
+-  return __acpp_sscp_metal_atomic_fetch_f32(
+-    "atomic_fetch_sub_explicit(__atomic_pointer_cast<float>(%s), %s, memory_order_relaxed)", ptr, x);
+ }
+ 
+ // ********************* atomic fetch and ************************************
+@@ -499,3 +587,32 @@ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_atomic_fetch_max_f32(
+     old_bits = expected;
+   }
+ }
++
++// ********************* 64-bit atomic fetch operations ***********************
++
++#define ACPP_METAL_FETCH_OP_64(type, metal_type, op)                         \
++  HIPSYCL_SSCP_BUILTIN type __acpp_sscp_atomic_fetch_##op##_##type(          \
++      __acpp_sscp_address_space as, __acpp_sscp_memory_order order,          \
++      __acpp_sscp_memory_scope scope, type *ptr, type x) {                   \
++    return __acpp_sscp_metal_atomic_fetch_##type(                            \
++        "atomic_fetch_" #op "_explicit(__atomic_pointer_cast<" #metal_type   \
++        ">(%s), %s, memory_order_relaxed)",                                  \
++        ptr, x);                                                             \
++  }
++
++ACPP_METAL_FETCH_OP_64(i64, long, add)
++ACPP_METAL_FETCH_OP_64(u64, ulong, add)
++ACPP_METAL_FETCH_OP_64(i64, long, sub)
++ACPP_METAL_FETCH_OP_64(u64, ulong, sub)
++ACPP_METAL_FETCH_OP_64(i64, long, and)
++ACPP_METAL_FETCH_OP_64(u64, ulong, and)
++ACPP_METAL_FETCH_OP_64(i64, long, or)
++ACPP_METAL_FETCH_OP_64(u64, ulong, or)
++ACPP_METAL_FETCH_OP_64(i64, long, xor)
++ACPP_METAL_FETCH_OP_64(u64, ulong, xor)
++ACPP_METAL_FETCH_OP_64(i64, long, min)
++ACPP_METAL_FETCH_OP_64(u64, ulong, min)
++ACPP_METAL_FETCH_OP_64(i64, long, max)
++ACPP_METAL_FETCH_OP_64(u64, ulong, max)
++
++#undef ACPP_METAL_FETCH_OP_64
+diff --git a/src/libkernel/sscp/metal/math.cpp b/src/libkernel/sscp/metal/math.cpp
+index ff1d8da..803c34a 100644
+--- a/src/libkernel/sscp/metal/math.cpp
++++ b/src/libkernel/sscp/metal/math.cpp
+@@ -37,6 +37,21 @@ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_metal_math_f32_f32_f32_f32(const char* name
+     return __acpp_sscp_metal_math_f32_f32_f32_f32(#name, x, y, z); \
+   }
+ 
++#define ACPP_SSCP_MAP_METAL_F64_BUILTIN(name) \
++  HIPSYCL_SSCP_BUILTIN double __acpp_sscp_##name##_f64(double x) { \
++    return __acpp_sscp_metal_math_f32_f32(#name, x); \
++  }
++
++#define ACPP_SSCP_MAP_METAL_F64_BUILTIN2(name) \
++  HIPSYCL_SSCP_BUILTIN double __acpp_sscp_##name##_f64(double x, double y) { \
++    return __acpp_sscp_metal_math_f32_f32_f32(#name, x, y); \
++  }
++
++#define ACPP_SSCP_MAP_METAL_F64_BUILTIN3(name) \
++  HIPSYCL_SSCP_BUILTIN double __acpp_sscp_##name##_f64(double x, double y, double z) { \
++    return __acpp_sscp_metal_math_f32_f32_f32_f32(#name, x, y, z); \
++  }
++
+ ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN(tan)
+ ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN(asin)
+ ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN(acos)
+@@ -76,6 +91,50 @@ ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN(acosh)
+ ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN(asinh)
+ ACPP_SSCP_MAP_METAL_FLOAT_BUILTIN(atanh)
+ 
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(tan)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(asin)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(acos)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(atan)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN2(atan2)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(sinh)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(cosh)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(tanh)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(tanpi)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(cos)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(cospi)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(sin)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(sinpi)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(exp)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(exp2)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(exp10)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(log)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(log2)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(log10)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(sqrt)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(rsqrt)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(floor)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(ceil)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(round)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(trunc)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(rint)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(fabs)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN2(copysign)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN3(fma)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN2(fmin)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN2(fmax)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN2(fmod)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN2(fdim)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN2(pow)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN2(nextafter)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(acosh)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(asinh)
++ACPP_SSCP_MAP_METAL_F64_BUILTIN(atanh)
++
++HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_erf_f32(f32 x);
++HIPSYCL_SSCP_BUILTIN double __acpp_sscp_erf_f64(double x) {
++  return __acpp_sscp_erf_f32(x);
++}
++
+ // See: https://en.wikipedia.org/wiki/Gamma_function  (Log-gamma function)
+ // log Gamma(z) = (z - 1/2) log(z) - z + 1/2 log(2pi) + 1/(12z) - 1/(360 z^3) + 1/(1260 z^5) + ....
+ // log Gamma(z-m) = log Gamma(z) - sum_{k=1}^{m} log(z-k)
+@@ -278,6 +337,10 @@ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_powr_f32(f32 x, f32 n) {
+   return __acpp_sscp_metal_math_f32_f32_f32("pow", x, n);
+ }
+ 
++HIPSYCL_SSCP_BUILTIN double __acpp_sscp_powr_f64(double x, double n) {
++  return __acpp_sscp_metal_math_f32_f32_f32("pow", x, n);
++}
++
+ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_hypot_f32(f32 x, f32 y) {
+   return __acpp_sscp_metal_math_f32_f32_f32("length(float2(%s, %s))", x, y);
+ }
+diff --git a/src/runtime/metal/metal_allocator.cpp b/src/runtime/metal/metal_allocator.cpp
+index 672578a..643f704 100644
+--- a/src/runtime/metal/metal_allocator.cpp
++++ b/src/runtime/metal/metal_allocator.cpp
+@@ -16,6 +16,8 @@
+ #include <sys/sysctl.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
++#include <cstdlib>
+ #include <iostream>
+ 
+ namespace hipsycl {
+@@ -34,6 +36,19 @@ namespace {
+     return 8ULL << 30; // fallback: 8 GiB
+   }
+ 
++  size_t metal_mmap_capacity() {
++    constexpr size_t default_capacity = 64ULL << 30;
++    size_t requested = default_capacity;
++    if (const char* env = std::getenv("ACPP_METAL_USM_MMAP_CAP_GB")) {
++      char* end = nullptr;
++      const unsigned long long gb = std::strtoull(env, &end, 10);
++      if (end != env && gb > 0) {
++        requested = static_cast<size_t>(gb) << 30;
++      }
++    }
++    return std::min(get_total_ram(), requested);
++  }
++
+   // Metal allocates MTL::Buffer storage in page_size units and always appends
+   // one extra gap page after the user data.  The total page count must be even,
+   // so we round up (sz + 1 gap page) to the next multiple of 2 pages.
+@@ -43,8 +58,6 @@ namespace {
+   }
+ }
+ 
+-static constexpr double mmap_region_size_fraction = 10.0;
+-
+ struct metal_mmap_region {
+   metal_mmap_region(size_t capacity, size_t alignment)
+     : _mmap_size(capacity), _alignment(alignment)
+@@ -181,12 +194,9 @@ metal_allocator::metal_allocator(MTL::Device* device, const device_id &id)
+   : _device{device}
+   , _device_id{id}
+   , _page_size{static_cast<size_t>(getpagesize())}
+-  , _delta{(size_t)-1}
+   , _mmap_region(std::make_shared<metal_mmap_region>(
+-      static_cast<size_t>(get_total_ram() * mmap_region_size_fraction), _page_size))
+-{
+-  calibrate();
+-}
++      metal_mmap_capacity(), _page_size))
++{}
+ 
+ metal_allocator::~metal_allocator() {
+   for (auto& [ptr, block] : _ptr_to_block) {
+@@ -311,59 +321,24 @@ device_id metal_allocator::get_device() const {
+ MTL::Buffer* metal_allocator::alloc_buffer(size_t size_bytes) {
+   const size_t aligned = align_up(size_bytes, _page_size);
+   const size_t stride  = metal_gpu_stride(aligned, _page_size);
+-  void* region_ptr = nullptr;
+-  size_t delta = 0;
+-  MTL::Buffer* buffer = nullptr;
+-
+-  auto make_buffer = [this, stride, aligned](MTL::Buffer* buffer, void* region_ptr) -> MTL::Buffer* {
+-    if (buffer) {
+-      region_ptr = reinterpret_cast<void*>(buffer->gpuAddress() - _delta);
+-      buffer->release();
+-    }
+-    region_ptr = _mmap_region->alloc_at(region_ptr, stride);
+-    if (!region_ptr) {
+-      return nullptr;
+-    }
+-
+-    auto mmap_region = _mmap_region;
+-    buffer = _device->newBuffer(
+-      region_ptr, aligned, MTL::ResourceStorageModeShared,
+-      ^(void*, NS::UInteger) {
+-        mmap_region->free(region_ptr, stride);
+-      });
+-    if (!buffer) {
+-      mmap_region->free(region_ptr, stride);
+-      return nullptr;
+-    }
+ 
+-    return buffer;
+-  };
++  void* region_ptr = _mmap_region->alloc(stride);
++  if (!region_ptr) {
++    return nullptr;
++  }
+ 
+-  buffer = make_buffer(buffer, region_ptr);
++  auto mmap_region = _mmap_region;
++  auto* buffer = _device->newBuffer(
++    region_ptr, aligned, MTL::ResourceStorageModeShared,
++    ^(void*, NS::UInteger) {
++      mmap_region->free(region_ptr, stride);
++    });
+   if (!buffer) {
++    _mmap_region->free(region_ptr, stride);
+     return nullptr;
+   }
+-  delta = buffer->gpuAddress() - reinterpret_cast<uintptr_t>(buffer->contents());
+-  int it = 0, max_iterations = 10;
+-  while (delta != _delta) {
+-    buffer = make_buffer(buffer, region_ptr);
+-    if (!buffer) {
+-      return nullptr;
+-    }
+-    delta = buffer->gpuAddress() - reinterpret_cast<uintptr_t>(buffer->contents());
+-    if (++it > max_iterations) {
+-      buffer->release();
+-      return nullptr;
+-    }
+-  }
+-  return buffer;
+-}
+ 
+-void metal_allocator::calibrate() {
+-  auto* buffer = _device->newBuffer(_mmap_region->midpoint(), _page_size, MTL::ResourceStorageModeShared,
+-    ^(void*, NS::UInteger) { });
+-  _delta = buffer->gpuAddress() - reinterpret_cast<uintptr_t>(buffer->contents());
+-  buffer->release();
++  return buffer;
+ }
+ 
+ std::tuple<MTL::Buffer*, size_t, metal_allocator::usm_alloc_type> metal_allocator::get_usm_block(const void* ptr) const {
+@@ -385,5 +360,27 @@ std::tuple<MTL::Buffer*, size_t, metal_allocator::usm_alloc_type> metal_allocato
+   return {nullptr, 0, usm_alloc_type::undefined};
+ }
+ 
++std::vector<metal_allocator::pointer_translation_entry>
++metal_allocator::get_pointer_translation_entries() const {
++  std::vector<pointer_translation_entry> entries;
++  std::lock_guard<std::mutex> lock{_mutex};
++  for (const auto& [host_ptr, block] : _ptr_to_block) {
++    if (!block.buffer) {
++      continue;
++    }
++    std::uint64_t host_addr = reinterpret_cast<std::uint64_t>(host_ptr);
++    std::uint64_t gpu_addr = static_cast<std::uint64_t>(block.buffer->gpuAddress());
++    if (block.alloc_type == usm_alloc_type::device) {
++      host_addr = gpu_addr;
++    }
++    entries.push_back(pointer_translation_entry{
++      host_addr,
++      gpu_addr,
++      static_cast<std::uint64_t>(block.buffer->length())
++    });
++  }
++  return entries;
++}
++
+ } // namespace rt
+ } // namespace hipsycl
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index 4085305..25cb5fb 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -18,6 +18,11 @@
+ #include "hipSYCL/common/debug.hpp"
+ 
+ #include <Metal/Metal.hpp>
++#include <algorithm>
++#include <cstdlib>
++#include <cstdint>
++#include <iostream>
++#include <sstream>
+ #include <utility>
+ 
+ #undef nil
+@@ -33,11 +38,99 @@ namespace {
+ // This value is passed to the compiler via kernel_build_option::metal_max_args_for_flat_mode,
+ // which sets MetalEmitterOptions::maxArgsForFlatMode in LLVMToMetal.
+ static constexpr int metal_max_args_for_flat_mode = 6;
++// 4096 entries keeps the device lookup linear and cheap enough for the
++// point-of-use nested-pointer path, while covering production decks that exceed
++// the old 128-entry single-box-era table by a wide margin.
++static constexpr std::size_t metal_pointer_translation_max_entries = 4096;
++static constexpr NS::UInteger metal_local_mem_size_buffer_index = 0;
++static constexpr NS::UInteger metal_pointer_translation_table_buffer_index = 1;
++static constexpr NS::UInteger metal_user_arg_buffer_offset = 2;
++static constexpr NS::UInteger metal_pointer_translation_miss_buffer_index = 30;
+ 
+ inline unsigned align_up(unsigned x, unsigned a) {
+   return (x + (a - 1)) & ~(a - 1);
+ }
+ 
++struct metal_pointer_translation_entry {
++  std::uint64_t host_base;
++  std::uint64_t gpu_base;
++  std::uint64_t length;
++};
++
++struct metal_pointer_translation_table {
++  std::uint32_t count = 0;
++  std::uint32_t capacity = metal_pointer_translation_max_entries;
++  std::uint64_t reserved1 = 0;
++  metal_pointer_translation_entry entries[metal_pointer_translation_max_entries] = {};
++};
++
++struct metal_pointer_translation_miss_flag {
++  std::uint32_t code = 0;
++  std::uint32_t direction = 0;
++  std::uint32_t table_count = 0;
++  std::uint32_t table_capacity = 0;
++  std::uint64_t raw_addr = 0;
++};
++
++const char* pointer_translation_miss_direction(std::uint32_t direction) {
++  switch (direction) {
++  case 1:
++    return "host_to_gpu";
++  case 2:
++    return "gpu_to_host";
++  case 4:
++    return "table_count_exceeds_capacity";
++  default:
++    return "unknown";
++  }
++}
++
++std::string make_pointer_translation_miss_error(
++    std::string_view kernel_name,
++    const metal_pointer_translation_miss_flag& flag,
++    std::uint32_t launch_table_count,
++    std::uint32_t launch_table_capacity) {
++  std::ostringstream os;
++  os << "metal_queue: pointer translation miss: kernel=" << kernel_name
++     << " code=" << flag.code
++     << " direction=" << pointer_translation_miss_direction(flag.direction)
++     << " raw_addr=0x" << std::hex << flag.raw_addr << std::dec
++     << " flag_table_count=" << flag.table_count
++     << " flag_table_capacity=" << flag.table_capacity
++     << " registered_buffers=" << launch_table_count
++     << " capacity=" << launch_table_capacity
++     << " offending_buffer_index=miss";
++  return os.str();
++}
++
++bool make_pointer_translation_table(
++    metal_allocator* allocator,
++    metal_pointer_translation_table& table,
++    std::string& error_msg) {
++  if (!allocator) {
++    return true;
++  }
++
++  auto entries = allocator->get_pointer_translation_entries();
++  if (entries.size() > metal_pointer_translation_max_entries) {
++    std::ostringstream os;
++    os << "metal_queue: pointer translation table overflow: registered_buffers="
++       << entries.size() << " capacity=" << metal_pointer_translation_max_entries;
++    error_msg = os.str();
++    return false;
++  }
++  table.count = static_cast<std::uint32_t>(
++    entries.size());
++  for (std::uint32_t i = 0; i < table.count; ++i) {
++    table.entries[i] = metal_pointer_translation_entry{
++      entries[i].host_base,
++      entries[i].gpu_base,
++      entries[i].length
++    };
++  }
++  return true;
++}
++
+ void encode_arguments(
+   MTL::ComputeCommandEncoder* encoder,
+   MTL::Device* device,
+@@ -183,9 +276,40 @@ result launch_kernel_from_library(
+ 
+   encoder->setThreadgroupMemoryLength(align_up(local_mem_size, 16), 0);
+ 
+-  const NS::UInteger buf_offset = 1; // buffer(0) is reserved for dynamic local memory size, so start from 1
+-  encoder->setBytes(&user_local_mem_size, sizeof(uint32_t), 0);
++  const NS::UInteger buf_offset = metal_user_arg_buffer_offset;
++  encoder->setBytes(&user_local_mem_size, sizeof(uint32_t), metal_local_mem_size_buffer_index);
+   std::vector<NS::SharedPtr<MTL::Buffer>> buffers_out;
++  metal_pointer_translation_table pointer_translation_table;
++  std::string pointer_translation_error;
++  if (!make_pointer_translation_table(allocator, pointer_translation_table, pointer_translation_error)) {
++    encoder->endEncoding();
++    return make_error(__acpp_here(), error_info{pointer_translation_error});
++  }
++  auto pointer_translation_buffer = NS::TransferPtr(
++      device->newBuffer(&pointer_translation_table,
++                        sizeof(pointer_translation_table),
++                        MTL::ResourceStorageModeShared));
++  if (!pointer_translation_buffer) {
++    encoder->endEncoding();
++    return make_error(__acpp_here(),
++                      error_info{"metal_queue: failed to allocate pointer translation table buffer"});
++  }
++  encoder->setBuffer(pointer_translation_buffer.get(), 0, metal_pointer_translation_table_buffer_index);
++  buffers_out.push_back(std::move(pointer_translation_buffer));
++
++  metal_pointer_translation_miss_flag pointer_translation_miss_flag;
++  auto pointer_translation_miss_buffer = NS::TransferPtr(
++      device->newBuffer(&pointer_translation_miss_flag,
++                        sizeof(pointer_translation_miss_flag),
++                        MTL::ResourceStorageModeShared));
++  if (!pointer_translation_miss_buffer) {
++    encoder->endEncoding();
++    return make_error(__acpp_here(),
++                      error_info{"metal_queue: failed to allocate pointer translation miss flag buffer"});
++  }
++  encoder->setBuffer(pointer_translation_miss_buffer.get(), 0, metal_pointer_translation_miss_buffer_index);
++  buffers_out.push_back(pointer_translation_miss_buffer);
++
+   if (!arg_buffer_used) {
+     encode_arguments(encoder, device, allocator, args, arg_sizes, num_args, is_pointer_arg, buf_offset);
+   } else {
+@@ -215,7 +339,24 @@ result launch_kernel_from_library(
+ 
+   encoder->endEncoding();
+ 
+-  command_buffer->addCompletedHandler([=](MTL::CommandBuffer* command_buffer) {
++  auto miss_buffer_for_handler = pointer_translation_miss_buffer;
++  const std::string kernel_name_for_handler{kernel_name};
++  const std::uint32_t launch_table_count = pointer_translation_table.count;
++  const std::uint32_t launch_table_capacity = pointer_translation_table.capacity;
++
++  command_buffer->addCompletedHandler([miss_buffer_for_handler,
++                                       kernel_name_for_handler,
++                                       launch_table_count,
++                                       launch_table_capacity](MTL::CommandBuffer* command_buffer) {
++    auto* flag = reinterpret_cast<const metal_pointer_translation_miss_flag*>(
++        miss_buffer_for_handler->contents());
++    if (flag && flag->code != 0) {
++      register_error(make_error(
++          __acpp_here(),
++          error_info{make_pointer_translation_miss_error(
++              kernel_name_for_handler, *flag, launch_table_count, launch_table_capacity)}));
++    }
++
+     if (NS::Error* err = command_buffer->error()) {
+       std::string msg = "metal: Command buffer failed: ";
+       if (err->localizedDescription()) {
+@@ -224,7 +365,7 @@ result launch_kernel_from_library(
+       register_error(make_error(__acpp_here(), error_info{msg}));
+     }
+ 
+-    HIPSYCL_DEBUG_INFO << "metal: Kernel '" << kernel_name
++    HIPSYCL_DEBUG_INFO << "metal: Kernel '" << kernel_name_for_handler
+                       << "' executed successfully" << std::endl;
+   });
+ 
