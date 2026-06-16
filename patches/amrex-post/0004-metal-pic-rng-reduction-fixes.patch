@@ -1,28 +1,5 @@
-diff --git a/Src/Base/AMReX_GpuAsyncArray.H b/Src/Base/AMReX_GpuAsyncArray.H
-index 681bfcd..9abf930 100644
---- a/Src/Base/AMReX_GpuAsyncArray.H
-+++ b/Src/Base/AMReX_GpuAsyncArray.H
-@@ -95,14 +95,11 @@ public:
-                 auto* ph = h_data;
-                 auto& q = *(Gpu::gpuStream().queue);
-                 try {
--                    q.submit([&] (sycl::handler& h) {
--                        h.host_task([=] () {
--                            The_Arena()->free(pd);
--                            The_Pinned_Arena()->free(ph);
--                        });
--                    });
-+                    (void)q;
-+                    Gpu::Device::freeAsync(The_Arena(), pd);
-+                    Gpu::Device::freeAsync(The_Pinned_Arena(), ph);
-                 } catch (sycl::exception const& ex) {
--                    amrex::Abort(std::string("host_task: ")+ex.what()+"!!!!!");
-+                    amrex::Abort(std::string("async cleanup: ")+ex.what()+"!!!!!");
-                 }
- #endif
-             }
 diff --git a/Src/Base/AMReX_GpuAtomic.H b/Src/Base/AMReX_GpuAtomic.H
-index ae64909..b181d3c 100644
+index ae6490936..b181d3cff 100644
 --- a/Src/Base/AMReX_GpuAtomic.H
 +++ b/Src/Base/AMReX_GpuAtomic.H
 @@ -7,6 +7,7 @@
@@ -191,7 +168,7 @@ index ae64909..b181d3c 100644
  
  }
 diff --git a/Src/Base/AMReX_GpuDevice.cpp b/Src/Base/AMReX_GpuDevice.cpp
-index 1e5423b..41a8416 100644
+index 1e5423bdb..41a8416e2 100644
 --- a/Src/Base/AMReX_GpuDevice.cpp
 +++ b/Src/Base/AMReX_GpuDevice.cpp
 @@ -1404,8 +1404,12 @@ bool isStreamActive (gpuStream_t s)
@@ -207,37 +184,108 @@ index 1e5423b..41a8416 100644
  }
  #endif
  
-diff --git a/Src/Base/AMReX_GpuElixir.cpp b/Src/Base/AMReX_GpuElixir.cpp
-index 3ec2e76..f60c9cb 100644
---- a/Src/Base/AMReX_GpuElixir.cpp
-+++ b/Src/Base/AMReX_GpuElixir.cpp
-@@ -49,17 +49,12 @@ Elixir::clear ()
- #endif
- #elif defined(AMREX_USE_SYCL)
-         auto lpa = std::move(m_pa);
--        auto& q = *(Gpu::gpuStream().queue);
-         try {
--            q.submit([&] (sycl::handler& h) {
--                h.host_task([=] () {
--                    for (auto const& pa : lpa) {
--                        pa.second->free(pa.first);
--                    }
--                });
--            });
-+            for (auto const& pa : lpa) {
-+                Gpu::Device::freeAsync(pa.second, pa.first);
-+            }
-         } catch (sycl::exception const& ex) {
--            amrex::Abort(std::string("host_task: ")+ex.what()+"!!!!!");
-+            amrex::Abort(std::string("async cleanup: ")+ex.what()+"!!!!!");
-         }
- #endif
-         }
 diff --git a/Src/Base/AMReX_GpuLaunchFunctsG.H b/Src/Base/AMReX_GpuLaunchFunctsG.H
-index e4d377f..5ef801b 100644
+index 560fd3e07..5ef801bcd 100644
 --- a/Src/Base/AMReX_GpuLaunchFunctsG.H
 +++ b/Src/Base/AMReX_GpuLaunchFunctsG.H
-@@ -541,7 +541,14 @@ void ParallelForRNG (T n, L const& f)
+@@ -188,6 +188,7 @@ void launch (int nblocks, int nthreads_per_block, std::size_t shared_mem_bytes,
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 if constexpr (detail::is_big_kernel<L>()) {
+                     (*pf)(Gpu::Handler{&item,shared_data.get_multi_ptr<sycl::access::decorated::yes>().get()});
+@@ -215,6 +216,7 @@ void launch (int nblocks, int nthreads_per_block, gpuStream_t stream, L const& f
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 if constexpr (detail::is_big_kernel<L>()) {
+                     (*pf)(item);
+@@ -247,6 +249,8 @@ void launch (int nblocks, std::size_t shared_mem_bytes, gpuStream_t stream,
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(MT)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(MT)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 if constexpr (detail::is_big_kernel<L>()) {
+                     (*pf)(Gpu::Handler{&item,shared_data.get_multi_ptr<sycl::access::decorated::yes>().get()});
+@@ -274,6 +278,8 @@ void launch (int nblocks, gpuStream_t stream, L const& f)
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(MT)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(MT)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 if constexpr (detail::is_big_kernel<L>()) {
+                     (*pf)(item);
+@@ -305,6 +311,8 @@ void launch (T const& n, L const& f)
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(MT)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 for (auto const i : Gpu::Range(n,item.get_global_id(0),item.get_global_range(0))) {
+                     if constexpr (detail::is_big_kernel<L>()) {
+@@ -341,6 +349,8 @@ void ParallelFor (Gpu::KernelInfo const& info, T n, L const& f)
+                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                                  sycl::range<1>(nthreads_per_block)),
+                 [=] (sycl::nd_item<1> item)
++                [[sycl::reqd_work_group_size(MT)]]
++                [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+                 {
+                     for (std::size_t i = item.get_global_id(0), stride = item.get_global_range(0);
+                          i < std::size_t(n); i += stride) {
+@@ -363,6 +373,8 @@ void ParallelFor (Gpu::KernelInfo const& info, T n, L const& f)
+                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                                  sycl::range<1>(nthreads_per_block)),
+                 [=] (sycl::nd_item<1> item)
++                [[sycl::reqd_work_group_size(MT)]]
++                [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+                 {
+                     for (std::size_t i = item.get_global_id(0), stride = item.get_global_range(0);
+                          i < std::size_t(n); i += stride) {
+@@ -402,6 +414,8 @@ void ParallelFor (Gpu::KernelInfo const& info, BoxND<dim> const& box, L const& f
+                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                                  sycl::range<1>(nthreads_per_block)),
+                 [=] (sycl::nd_item<1> item)
++                [[sycl::reqd_work_group_size(MT)]]
++                [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+                 {
+                     for (std::uint64_t icell = item.get_global_id(0), stride = item.get_global_range(0);
+                          icell < indexer.numPts(); icell += stride) {
+@@ -427,6 +441,8 @@ void ParallelFor (Gpu::KernelInfo const& info, BoxND<dim> const& box, L const& f
+                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                                  sycl::range<1>(nthreads_per_block)),
+                 [=] (sycl::nd_item<1> item)
++                [[sycl::reqd_work_group_size(MT)]]
++                [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+                 {
+                     for (std::uint64_t icell = item.get_global_id(0), stride = item.get_global_range(0);
+                          icell < indexer.numPts(); icell += stride) {
+@@ -467,6 +483,8 @@ void ParallelFor (Gpu::KernelInfo const& info, BoxND<dim> const& box, T ncomp, L
+                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                                  sycl::range<1>(nthreads_per_block)),
+                 [=] (sycl::nd_item<1> item)
++                [[sycl::reqd_work_group_size(MT)]]
++                [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+                 {
+                     for (std::uint64_t icell = item.get_global_id(0), stride = item.get_global_range(0);
+                          icell < indexer.numPts(); icell += stride) {
+@@ -490,6 +508,8 @@ void ParallelFor (Gpu::KernelInfo const& info, BoxND<dim> const& box, T ncomp, L
+                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                                  sycl::range<1>(nthreads_per_block)),
+                 [=] (sycl::nd_item<1> item)
++                [[sycl::reqd_work_group_size(MT)]]
++                [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+                 {
+                     for (std::uint64_t icell = item.get_global_id(0), stride = item.get_global_range(0);
+                          icell < indexer.numPts(); icell += stride) {
+@@ -521,13 +541,22 @@ void ParallelForRNG (T n, L const& f)
      const auto nthreads_per_block = ec.numThreads.x;
      const auto nthreads_total = std::size_t(nthreads_per_block) * amrex::min(ec.numBlocks.x,Gpu::Device::maxBlocksPerLaunch());
      auto& q = Gpu::Device::streamQueue();
@@ -253,8 +301,70 @@ index e4d377f..5ef801b 100644
      try {
          q.submit([&] (sycl::handler& h) {
              auto engine_acc = engdescr.get_access(h);
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(AMREX_GPU_MAX_THREADS)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 auto const tid = item.get_global_id(0);
+                 auto engine = engine_acc.load(tid);
+@@ -569,6 +598,8 @@ void ParallelForRNG (BoxND<dim> const& box, L const& f)
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(AMREX_GPU_MAX_THREADS)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 auto const tid = item.get_global_id(0);
+                 auto engine = engine_acc.load(tid);
+@@ -612,6 +643,8 @@ void ParallelForRNG (BoxND<dim> const& box, T ncomp, L const& f)
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(AMREX_GPU_MAX_THREADS)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 auto const tid = item.get_global_id(0);
+                 auto engine = engine_acc.load(tid);
+@@ -655,6 +688,8 @@ void ParallelFor (Gpu::KernelInfo const& /*info*/, BoxND<dim> const& box1, BoxND
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(MT)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 auto const ncells = std::max(indexer1.numPts(), indexer2.numPts());
+                 for (std::uint64_t icell = item.get_global_id(0), stride = item.get_global_range(0);
+@@ -708,6 +743,8 @@ void ParallelFor (Gpu::KernelInfo const& /*info*/,
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(MT)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 auto const ncells = amrex::max(indexer1.numPts(), indexer2.numPts(), indexer3.numPts());
+                 for (std::uint64_t icell = item.get_global_id(0), stride = item.get_global_range(0);
+@@ -769,6 +806,8 @@ void ParallelFor (Gpu::KernelInfo const& /*info*/,
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(MT)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 auto const ncells = std::max(indexer1.numPts(), indexer2.numPts());
+                 for (std::uint64_t icell = item.get_global_id(0), stride = item.get_global_range(0);
+@@ -826,6 +865,8 @@ void ParallelFor (Gpu::KernelInfo const& /*info*/,
+             h.parallel_for(sycl::nd_range<1>(sycl::range<1>(nthreads_total),
+                                              sycl::range<1>(nthreads_per_block)),
+             [=] (sycl::nd_item<1> item)
++            [[sycl::reqd_work_group_size(MT)]]
++            [[sycl::reqd_sub_group_size(Gpu::Device::warp_size)]]
+             {
+                 auto const ncells = amrex::max(indexer1.numPts(), indexer2.numPts(), indexer3.numPts());
+                 for (std::uint64_t icell = item.get_global_id(0), stride = item.get_global_range(0);
 diff --git a/Src/Base/AMReX_Random.H b/Src/Base/AMReX_Random.H
-index f9416f9..aec027d 100644
+index f9416f98c..aec027db1 100644
 --- a/Src/Base/AMReX_Random.H
 +++ b/Src/Base/AMReX_Random.H
 @@ -26,7 +26,9 @@ namespace amrex
@@ -301,326 +411,163 @@ index f9416f9..aec027d 100644
          mkl::rng::device::uniform<unsigned int> distr(0,n);
          return mkl::rng::device::generate(distr, *random_engine.engine);
  #else
-diff --git a/Src/Base/AMReX_Random.cpp b/Src/Base/AMReX_Random.cpp
-index 47431a5..767b082 100644
---- a/Src/Base/AMReX_Random.cpp
-+++ b/Src/Base/AMReX_Random.cpp
-@@ -20,7 +20,7 @@ namespace amrex {
- #if defined(AMREX_USE_SYCL) && !defined(SYCL_IMPLEMENTATION_ACPP) && !defined(SYCL_IMPLEMENTATION_HIPSYCL)
-     sycl_rng_descr* rand_engine_descr = nullptr;
- #elif defined(AMREX_USE_SYCL)
--    // AdaptiveCpp: no MKL RNG — GPU RNG stub
-+    sycl_rng_descr* rand_engine_descr = nullptr;
- #else
-     amrex::randState_t* gpu_rand_state = nullptr;
- #endif
-@@ -30,7 +30,7 @@ namespace {
- #if defined(AMREX_USE_SYCL) && !defined(SYCL_IMPLEMENTATION_ACPP) && !defined(SYCL_IMPLEMENTATION_HIPSYCL)
-     oneapi::mkl::rng::philox4x32x10* gpu_rand_generator = nullptr;
- #elif defined(AMREX_USE_SYCL)
--    // AdaptiveCpp: no MKL RNG generator
-+    amrex::sycl_rng_engine* gpu_rand_state = nullptr;
- #else
-     amrex::randGenerator_t gpu_rand_generator = nullptr;
- #endif
-@@ -58,8 +58,13 @@ void ResizeRandomSeed (amrex::ULong gpu_seed)
-         (Gpu::Device::streamQueue(), gpu_seed+1234ULL);
- 
- #elif defined(AMREX_USE_SYCL)
--    // AdaptiveCpp: GPU RNG not yet supported — skip initialization.
--    amrex::ignore_unused(N, gpu_seed);
-+    gpu_rand_state = static_cast<sycl_rng_engine*>(The_Arena()->alloc(N*sizeof(sycl_rng_engine)));
-+    rand_engine_descr = new sycl_rng_descr(gpu_rand_state, static_cast<std::size_t>(N));
-+    sycl_rng_engine* gpu_rand_state_local = gpu_rand_state;
-+    amrex::ParallelFor(N, [=] AMREX_GPU_DEVICE (int idx) noexcept
-+    {
-+        gpu_rand_state_local[idx] = sycl_rng_engine(gpu_seed, static_cast<ULong>(idx));
-+    });
- 
- #elif defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
- 
-@@ -238,7 +243,16 @@ DeallocateRandomSeedDevArray ()
-         gpu_rand_generator = nullptr;
-     }
- #elif defined(AMREX_USE_SYCL)
--    // AdaptiveCpp: no MKL RNG to deallocate
-+    if (rand_engine_descr) {
-+        delete rand_engine_descr;
-+        Gpu::streamSynchronize();
-+        rand_engine_descr = nullptr;
-+    }
-+    if (gpu_rand_state != nullptr)
-+    {
-+        The_Arena()->free(gpu_rand_state);
-+        gpu_rand_state = nullptr;
-+    }
- #else
-     if (gpu_rand_state != nullptr)
+diff --git a/Src/Base/Parser/AMReX_Parser.H b/Src/Base/Parser/AMReX_Parser.H
+index 7c9c2b1c3..22ac08a92 100644
+--- a/Src/Base/Parser/AMReX_Parser.H
++++ b/Src/Base/Parser/AMReX_Parser.H
+@@ -43,7 +43,7 @@ struct ParserExecutor
+      */
+     template <int M=N, std::enable_if_t<M==0,int> = 0>
+     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+-    double operator() () const noexcept
++    ParserExeReal operator() () const noexcept
      {
-@@ -284,6 +298,14 @@ void FillRandom (Real* p, Long N)
-     auto event = oneapi::mkl::rng::generate(distr, *gpu_rand_generator, N, p);
-     event.wait();
+         AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, nullptr);))
+         AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, nullptr);))
+@@ -57,10 +57,10 @@ struct ParserExecutor
+      */
+     template <typename... Ts>
+     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+-    std::enable_if_t<sizeof...(Ts) == N && !amrex::Same<float,Ts...>::value, double>
++    std::enable_if_t<sizeof...(Ts) == N && !amrex::Same<float,Ts...>::value, ParserExeReal>
+     operator() (Ts... var) const noexcept
+     {
+-        amrex::GpuArray<double,N> l_var{var...};
++        amrex::GpuArray<ParserExeReal,N> l_var{static_cast<ParserExeReal>(var)...};
+         AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, l_var.data());))
+         AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, l_var.data());))
+     }
+@@ -77,7 +77,7 @@ struct ParserExecutor
+     std::enable_if_t<sizeof...(Ts) == N &&  amrex::Same<float,Ts...>::value, float>
+     operator() (Ts... var) const noexcept
+     {
+-        amrex::GpuArray<double,N> l_var{var...};
++        amrex::GpuArray<ParserExeReal,N> l_var{static_cast<ParserExeReal>(var)...};
+         AMREX_IF_ON_DEVICE((return static_cast<float>(parser_exe_eval(m_device_executor, l_var.data()));))
+         AMREX_IF_ON_HOST((return static_cast<float>(parser_exe_eval(m_host_executor, l_var.data()));))
+     }
+@@ -88,10 +88,12 @@ struct ParserExecutor
+      * \return Expression value promoted to double precision.
+      */
+     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+-    double operator() (GpuArray<double,N> const& var) const noexcept
++    ParserExeReal operator() (GpuArray<double,N> const& var) const noexcept
+     {
+-        AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, var.data());))
+-        AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, var.data());))
++        GpuArray<ParserExeReal,N> l_var{};
++        for (int i = 0; i < N; ++i) { l_var[i] = static_cast<ParserExeReal>(var[i]); }
++        AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, l_var.data());))
++        AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, l_var.data());))
+     }
  
-+#elif defined(AMREX_USE_SYCL)
-+
-+    amrex::ParallelForRNG(N, [=] AMREX_GPU_DEVICE (Long i, RandomEngine const& engine) noexcept
-+    {
-+        p[i] = amrex::Random(engine);
-+    });
-+    Gpu::synchronize();
-+
- #else
-     std::uniform_real_distribution<Real> distribution(Real(0.0), Real(1.0));
-     auto& gen = generators[OpenMP::get_thread_num()];
-@@ -330,6 +352,14 @@ void FillRandomNormal (Real* p, Long N, Real mean, Real stddev)
-     auto event = oneapi::mkl::rng::generate(distr, *gpu_rand_generator, N, p);
-     event.wait();
- 
-+#elif defined(AMREX_USE_SYCL)
-+
-+    amrex::ParallelForRNG(N, [=] AMREX_GPU_DEVICE (Long i, RandomEngine const& engine) noexcept
-+    {
-+        p[i] = amrex::RandomNormal(mean, stddev, engine);
-+    });
-+    Gpu::synchronize();
-+
- #else
- 
-     std::normal_distribution<Real> distribution(mean, stddev);
-diff --git a/Src/Base/AMReX_RandomEngine.H b/Src/Base/AMReX_RandomEngine.H
-index 0fc09af..f8a19e6 100644
---- a/Src/Base/AMReX_RandomEngine.H
-+++ b/Src/Base/AMReX_RandomEngine.H
-@@ -4,6 +4,11 @@
- 
- #include <AMReX_GpuQualifiers.H>
- #include <AMReX_Extension.H>
-+#include <cmath>
-+#include <cstddef>
-+#include <cstdint>
-+#include <cstdlib>
-+#include <limits>
- #ifdef AMREX_USE_OMP
- #  include <AMReX_BLassert.H>
- #  include <omp.h>
-@@ -54,29 +59,197 @@ namespace amrex
-         AMREX_GPU_HOST_DEVICE RandomEngine (sycl_rng_engine* e) : engine(e) {}
-     };
- #else
--    // AdaptiveCpp: GPU RNG not yet supported — stub types for compilation.
--    // ParallelForRNG will compile but abort at runtime if actually invoked.
--    struct acpp_rng_engine_stub {
--        AMREX_GPU_HOST_DEVICE acpp_rng_engine_stub () {}
--        AMREX_GPU_HOST_DEVICE acpp_rng_engine_stub (void*, std::size_t) {}
-+    struct acpp_rng_engine {
-+        std::uint64_t counter;
-+        std::uint32_t key0;
-+        std::uint32_t key1;
-+
-+        AMREX_GPU_HOST_DEVICE acpp_rng_engine () : counter(0), key0(0), key1(0) {}
-+        AMREX_GPU_HOST_DEVICE explicit acpp_rng_engine (std::uint64_t s)
-+            : counter(0),
-+              key0(static_cast<std::uint32_t>(s)),
-+              key1(static_cast<std::uint32_t>(s >> 32U)) {}
-+        AMREX_GPU_HOST_DEVICE acpp_rng_engine (std::uint64_t seed, std::uint64_t seq)
-+            : counter(seq),
-+              key0(static_cast<std::uint32_t>(seed) ^
-+                   static_cast<std::uint32_t>(seq * 0x9e3779b97f4a7c15ULL)),
-+              key1(static_cast<std::uint32_t>(seed >> 32U) ^
-+                   static_cast<std::uint32_t>((seq * 0xbf58476d1ce4e5b9ULL) >> 32U)) {}
-+
-+        AMREX_GPU_HOST_DEVICE static void bump_key (
-+            std::uint32_t& k0, std::uint32_t& k1)
-+        {
-+            k0 += 0x9e3779b9U;
-+            k1 += 0xbb67ae85U;
-+        }
-+
-+        AMREX_GPU_HOST_DEVICE static void philox_round (
-+            std::uint32_t& c0, std::uint32_t& c1,
-+            std::uint32_t& c2, std::uint32_t& c3,
-+            std::uint32_t k0, std::uint32_t k1)
-+        {
-+            std::uint64_t const p0 = std::uint64_t(0xd2511f53U) * c0;
-+            std::uint64_t const p1 = std::uint64_t(0xcd9e8d57U) * c2;
-+            std::uint32_t const hi0 = static_cast<std::uint32_t>(p0 >> 32U);
-+            std::uint32_t const lo0 = static_cast<std::uint32_t>(p0);
-+            std::uint32_t const hi1 = static_cast<std::uint32_t>(p1 >> 32U);
-+            std::uint32_t const lo1 = static_cast<std::uint32_t>(p1);
-+
-+            std::uint32_t const n0 = hi1 ^ c1 ^ k0;
-+            std::uint32_t const n1 = lo1;
-+            std::uint32_t const n2 = hi0 ^ c3 ^ k1;
-+            std::uint32_t const n3 = lo0;
-+            c0 = n0;
-+            c1 = n1;
-+            c2 = n2;
-+            c3 = n3;
-+        }
-+
-+        AMREX_GPU_HOST_DEVICE std::uint64_t next_u64 () {
-+            std::uint64_t const ctr = counter++;
-+            std::uint32_t c0 = static_cast<std::uint32_t>(ctr);
-+            std::uint32_t c1 = static_cast<std::uint32_t>(ctr >> 32U);
-+            std::uint32_t c2 = key0 ^ 0x243f6a88U;
-+            std::uint32_t c3 = key1 ^ 0x85a308d3U;
-+            std::uint32_t k0 = key0;
-+            std::uint32_t k1 = key1;
-+
-+            for (int round = 0; round < 10; ++round) {
-+                philox_round(c0, c1, c2, c3, k0, k1);
-+                bump_key(k0, k1);
-+            }
-+
-+            return (std::uint64_t(c0) << 32U) | std::uint64_t(c2);
-+        }
-+
-+        template <typename RealType>
-+        AMREX_GPU_HOST_DEVICE RealType uniform () {
-+            if constexpr (std::numeric_limits<RealType>::digits <= 24) {
-+                return static_cast<RealType>(next_u64() >> 40U) *
-+                       (RealType(1.0) / RealType(16777216.0));
-+            } else {
-+                return static_cast<RealType>(next_u64() >> 11U) *
-+                       (RealType(1.0) / RealType(9007199254740992.0));
-+            }
-+        }
-+
-+        AMREX_GPU_HOST_DEVICE unsigned int uniform_uint (unsigned int n) {
-+            if (n == 0) {
-+                return 0;
-+            }
-+            std::uint64_t const limit =
-+                std::numeric_limits<std::uint64_t>::max() -
-+                (std::numeric_limits<std::uint64_t>::max() % n);
-+            std::uint64_t r;
-+            do {
-+                r = next_u64();
-+            } while (r >= limit);
-+            return static_cast<unsigned int>(r % n);
-+        }
-+
-+        template <typename RealType>
-+        AMREX_GPU_HOST_DEVICE RealType normal () {
-+            RealType u1 = uniform<RealType>();
-+            RealType const min_u = std::numeric_limits<RealType>::min();
-+            if (u1 < min_u) {
-+                u1 = min_u;
-+            }
-+            RealType const u2 = uniform<RealType>();
-+            RealType const two = RealType(2.0);
-+            RealType const pi = RealType(3.141592653589793238462643383279502884);
-+            return std::sqrt(-two * std::log(u1)) * std::cos(two * pi * u2);
-+        }
-+
-+        template <typename RealType>
-+        AMREX_GPU_HOST_DEVICE unsigned int poisson (RealType lambda) {
-+            if (lambda <= RealType(0.0)) {
-+                return 0;
-+            }
-+            if (lambda < RealType(64.0)) {
-+                RealType const threshold = std::exp(-lambda);
-+                RealType product = RealType(1.0);
-+                unsigned int k = 0;
-+                do {
-+                    ++k;
-+                    product *= uniform<RealType>();
-+                } while (product > threshold);
-+                return k - 1U;
-+            }
-+
-+            // PTRS transformed-rejection sampler (Hoermann 1993), driven only by
-+            // this engine's Philox uniforms. This preserves Poisson tails and
-+            // discreteness where the old rounded-normal branch was biased.
-+            RealType const slam = std::sqrt(lambda);
-+            RealType const loglam = std::log(lambda);
-+            RealType const b = RealType(0.931) + RealType(2.53) * slam;
-+            RealType const a = RealType(-0.059) + RealType(0.02483) * b;
-+            RealType const inv_alpha = RealType(1.1239) + RealType(1.1328) / (b - RealType(3.4));
-+            RealType const v_r = RealType(0.9277) - RealType(3.6224) / (b - RealType(2.0));
-+
-+            while (true) {
-+                RealType const u = uniform<RealType>() - RealType(0.5);
-+                RealType const v = uniform<RealType>();
-+                RealType const us = RealType(0.5) - std::abs(u);
-+                if (us <= RealType(0.0) || v <= RealType(0.0)) {
-+                    continue;
-+                }
-+
-+                RealType const k_real = std::floor((RealType(2.0) * a / us + b) * u + lambda + RealType(0.43));
-+                if (k_real < RealType(0.0)) {
-+                    continue;
-+                }
-+                if (us >= RealType(0.07) && v <= v_r) {
-+                    return static_cast<unsigned int>(k_real);
-+                }
-+                if (us < RealType(0.013) && v > us) {
-+                    continue;
-+                }
-+
-+                RealType const lhs = std::log(v * inv_alpha / (a / (us * us) + b));
-+                RealType const rhs = -lambda + k_real * loglam - std::lgamma(k_real + RealType(1.0));
-+                if (lhs <= rhs) {
-+                    if (k_real > RealType(std::numeric_limits<unsigned int>::max())) {
-+                        return std::numeric_limits<unsigned int>::max();
-+                    }
-+                    return static_cast<unsigned int>(k_real);
-+                }
-+            }
-+        }
-     };
- 
--    struct acpp_rng_acc_stub {
--        AMREX_GPU_HOST_DEVICE acpp_rng_engine_stub load (std::size_t) const {
--            return acpp_rng_engine_stub{};
-+    struct acpp_rng_acc {
-+        acpp_rng_engine* engines;
-+        std::size_t size;
-+
-+        AMREX_GPU_HOST_DEVICE acpp_rng_engine load (std::size_t i) const {
-+            return engines[i];
-+        }
-+        AMREX_GPU_HOST_DEVICE void store (acpp_rng_engine const& engine, std::size_t i) const {
-+            engines[i] = engine;
-         }
--        AMREX_GPU_HOST_DEVICE void store (acpp_rng_engine_stub, std::size_t) const {}
-     };
- 
--    struct acpp_rng_descr_stub {
--        acpp_rng_acc_stub get_access (sycl::handler&) { return acpp_rng_acc_stub{}; }
-+    struct acpp_rng_descr {
-+        acpp_rng_engine* engines = nullptr;
-+        std::size_t size = 0;
-+
-+        acpp_rng_descr () = default;
-+        acpp_rng_descr (acpp_rng_engine* p, std::size_t n) : engines(p), size(n) {}
-+        acpp_rng_acc get_access (sycl::handler&) const { return acpp_rng_acc{engines, size}; }
-     };
- 
--    using sycl_rng_engine = acpp_rng_engine_stub;
--    using sycl_rng_descr = acpp_rng_descr_stub;
--    using sycl_rng_acc = acpp_rng_acc_stub;
-+    using sycl_rng_engine = acpp_rng_engine;
-+    using sycl_rng_descr = acpp_rng_descr;
-+    using sycl_rng_acc = acpp_rng_acc;
-+
-+    extern sycl_rng_descr* rand_engine_descr;
- 
--    inline acpp_rng_descr_stub* getRandEngineDescriptor () { return nullptr; }
-+    inline sycl_rng_descr* getRandEngineDescriptor () {
-+#ifdef AMREX_USE_OMP
-+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(! omp_in_parallel(), "RNG on GPU is not OpenMP thread safe");
-+#endif
-+        return rand_engine_descr;
-+    }
- 
-     struct RandomEngine {
-         sycl_rng_engine* engine;
+     /**
 diff --git a/Src/Base/Parser/AMReX_Parser_Exe.H b/Src/Base/Parser/AMReX_Parser_Exe.H
-index 0a62f2e..6a3d048 100644
+index 0a62f2ed6..89e4275df 100644
 --- a/Src/Base/Parser/AMReX_Parser_Exe.H
 +++ b/Src/Base/Parser/AMReX_Parser_Exe.H
-@@ -246,6 +246,9 @@ namespace parser_detail
+@@ -23,6 +23,14 @@
+ 
+ namespace amrex {
+ 
++#if defined(AMREX_USE_SYCL) && defined(AMREX_USE_FLOAT) && \
++    (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || \
++     defined(__ADAPTIVECPP__) || defined(__HIPSYCL__))
++using ParserExeReal = float;
++#else
++using ParserExeReal = double;
++#endif
++
+ // N: node
+ // P: pointer offset
+ // V: value (i.e., double literal)
+@@ -70,7 +78,7 @@ struct alignas(8) ParserExeNull {
+ 
+ struct alignas(8) ParserExeNumber {
+     enum parser_exe_t type = PARSER_EXE_NUMBER;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeSymbol {
+@@ -120,25 +128,25 @@ struct alignas(8) ParserExeF2_B {
+ struct alignas(8) ParserExeADD_VP {
+     enum parser_exe_t type = PARSER_EXE_ADD_VP;
+     int i;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeSUB_VP {
+     enum parser_exe_t type = PARSER_EXE_SUB_VP;
+     int i;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeMUL_VP {
+     enum parser_exe_t type = PARSER_EXE_MUL_VP;
+     int i;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeDIV_VP {
+     enum parser_exe_t type = PARSER_EXE_DIV_VP;
+     int i;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeADD_PP {
+@@ -167,22 +175,22 @@ struct alignas(8) ParserExeDIV_PP {
+ 
+ struct alignas(8) ParserExeADD_VN {
+     enum parser_exe_t type = PARSER_EXE_ADD_VN;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeSUB_VN {
+     enum parser_exe_t type = PARSER_EXE_SUB_VN;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeMUL_VN {
+     enum parser_exe_t type = PARSER_EXE_MUL_VN;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeDIV_VN {
+     enum parser_exe_t type = PARSER_EXE_DIV_VN;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeADD_PN {
+@@ -193,7 +201,7 @@ struct alignas(8) ParserExeADD_PN {
+ struct alignas(8) ParserExeSUB_PN {
+     enum parser_exe_t type = PARSER_EXE_SUB_PN;
+     int i;
+-    double sign;
++    ParserExeReal sign;
+ };
+ 
+ struct alignas(8) ParserExeMUL_PN {
+@@ -219,8 +227,8 @@ struct alignas(8) ParserExePOWI {
+ struct alignas(8) ParserExeFMA_VPV {
+     enum parser_exe_t type = PARSER_EXE_FMA_VPV;
+     int i;       // variable index
+-    double a;    // multiplier
+-    double b;    // addend
++    ParserExeReal a;    // multiplier
++    ParserExeReal b;    // addend
+ };
+ 
+ struct alignas(8) ParserExeIF {
+@@ -246,6 +254,9 @@ namespace parser_detail
      AMREX_GPU_HOST_DEVICE AMREX_NO_INLINE
      void call_user_fn (ParserExeUserFn* p, Stack<T,N>& pstack)
      {
@@ -630,7 +577,7 @@ index 0a62f2e..6a3d048 100644
          short argc = p->argc;
          if (argc == 1) {
              AMREX_IF_ON_HOST  (( pstack.top() = ParserUserFn1(p->fh)(pstack.top()); ))
-@@ -286,6 +289,7 @@ namespace parser_detail
+@@ -286,15 +297,16 @@ namespace parser_detail
              AMREX_IF_ON_DEVICE(( pstack.top() = ParserUserFn4(p->fd)(pstack.top(),a1,a2,a3); ))
  #endif
          }
@@ -638,8 +585,383 @@ index 0a62f2e..6a3d048 100644
      }
  }
  
+ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+-double parser_exe_eval (const char* p, double const* x)
++ParserExeReal parser_exe_eval (const char* p, ParserExeReal const* x)
+ {
+-    if (p == nullptr) { return std::numeric_limits<double>::max(); }
++    if (p == nullptr) { return std::numeric_limits<ParserExeReal>::max(); }
+ 
+-    Stack<double, AMREX_PARSER_STACK_SIZE> pstack;
++    Stack<ParserExeReal, AMREX_PARSER_STACK_SIZE> pstack;
+     while (*((parser_exe_t*)p) != PARSER_EXE_NULL) { // NOLINT
+         switch (*((parser_exe_t*)p))
+         {
+@@ -307,14 +319,14 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_SYMBOL:
+         {
+             int i = ((ParserExeSymbol*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d);
+             p     += sizeof(ParserExeSymbol);
+             break;
+         }
+         case PARSER_EXE_ADD:
+         {
+-            double b = pstack.top(); // NOLINT
++            ParserExeReal b = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() += b; // NOLINT
+             p += sizeof(ParserExeADD);
+@@ -322,7 +334,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_SUB_F:
+         {
+-            double b = pstack.top(); // NOLINT
++            ParserExeReal b = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() -= b; // NOLINT
+             p += sizeof(ParserExeSUB_F);
+@@ -330,7 +342,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_SUB_B:
+         {
+-            double b = pstack.top(); // NOLINT
++            ParserExeReal b = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() = b - pstack.top(); // NOLINT
+             p += sizeof(ParserExeSUB_B);
+@@ -338,7 +350,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_MUL:
+         {
+-            double b = pstack.top(); // NOLINT
++            ParserExeReal b = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() *= b; // NOLINT
+             p += sizeof(ParserExeMUL);
+@@ -346,7 +358,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_DIV_F:
+         {
+-            double v = pstack.top(); // NOLINT
++            ParserExeReal v = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() /= v; // NOLINT
+             p += sizeof(ParserExeDIV_F);
+@@ -354,7 +366,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_DIV_B:
+         {
+-            double v = pstack.top(); // NOLINT
++            ParserExeReal v = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() = v / pstack.top(); // NOLINT
+             p += sizeof(ParserExeDIV_B);
+@@ -368,7 +380,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_F2_F:
+         {
+-            double v = pstack.top(); // NOLINT
++            ParserExeReal v = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() = parser_call_f2(((ParserExeF2_F*)p)->ftype, pstack.top(), v); // NOLINT
+             p += sizeof(ParserExeF2_F);
+@@ -376,7 +388,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_F2_B:
+         {
+-            double v = pstack.top(); // NOLINT
++            ParserExeReal v = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() = parser_call_f2(((ParserExeF2_B*)p)->ftype, v, pstack.top()); // NOLINT
+             p += sizeof(ParserExeF2_B);
+@@ -385,7 +397,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_ADD_VP:
+         {
+             int i = ((ParserExeADD_VP*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeADD_VP*)p)->v + d);
+             p     += sizeof(ParserExeADD_VP);
+             break;
+@@ -393,7 +405,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_SUB_VP:
+         {
+             int i = ((ParserExeSUB_VP*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeSUB_VP*)p)->v - d);
+             p     += sizeof(ParserExeSUB_VP);
+             break;
+@@ -401,7 +413,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_MUL_VP:
+         {
+             int i = ((ParserExeMUL_VP*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeMUL_VP*)p)->v * d);
+             p     += sizeof(ParserExeMUL_VP);
+             break;
+@@ -409,7 +421,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_DIV_VP:
+         {
+             int i = ((ParserExeDIV_VP*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeDIV_VP*)p)->v / d);
+             p     += sizeof(ParserExeDIV_VP);
+             break;
+@@ -417,9 +429,9 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_ADD_PP:
+         {
+             int i = ((ParserExeADD_PP*)p)->i1;
+-            double d1 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d1 = AMREX_PARSER_GET_DATA(i);
+             i     = ((ParserExeADD_PP*)p)->i2;
+-            double d2 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d2 = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d1+d2);
+             p     += sizeof(ParserExeADD_PP);
+             break;
+@@ -427,9 +439,9 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_SUB_PP:
+         {
+             int i = ((ParserExeSUB_PP*)p)->i1;
+-            double d1 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d1 = AMREX_PARSER_GET_DATA(i);
+             i     = ((ParserExeSUB_PP*)p)->i2;
+-            double d2 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d2 = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d1-d2);
+             p     += sizeof(ParserExeSUB_PP);
+             break;
+@@ -437,9 +449,9 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_MUL_PP:
+         {
+             int i = ((ParserExeMUL_PP*)p)->i1;
+-            double d1 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d1 = AMREX_PARSER_GET_DATA(i);
+             i     = ((ParserExeMUL_PP*)p)->i2;
+-            double d2 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d2 = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d1*d2);
+             p     += sizeof(ParserExeMUL_PP);
+             break;
+@@ -447,9 +459,9 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_DIV_PP:
+         {
+             int i = ((ParserExeDIV_PP*)p)->i1;
+-            double d1 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d1 = AMREX_PARSER_GET_DATA(i);
+             i     = ((ParserExeDIV_PP*)p)->i2;
+-            double d2 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d2 = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d1/d2);
+             p      += sizeof(ParserExeDIV_PP);
+             break;
+@@ -481,7 +493,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_ADD_PN:
+         {
+             int i = ((ParserExeADD_PN*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.top() += d; // NOLINT
+             p         += sizeof(ParserExeADD_PN);
+             break;
+@@ -489,7 +501,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_SUB_PN:
+         {
+             int i = ((ParserExeSUB_PN*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.top() = (d - pstack.top()) * (((ParserExeSUB_PN*)p)->sign); // NOLINT
+             p         += sizeof(ParserExeSUB_PN);
+             break;
+@@ -497,7 +509,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_MUL_PN:
+         {
+             int i = ((ParserExeMUL_PN*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.top() *= d; // NOLINT
+             p         += sizeof(ParserExeMUL_PN);
+             break;
+@@ -505,7 +517,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_DIV_PN:
+         {
+             int i = ((ParserExeDIV_PN*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             if (((ParserExeDIV_PN*)p)->reverse) {
+                 pstack.top() /= d; // NOLINT
+             } else {
+@@ -516,21 +528,21 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_SQUARE:
+         {
+-            double& d = pstack.top();
++            ParserExeReal& d = pstack.top();
+             d *= d;
+             p += sizeof(ParserExeSquare);
+             break;
+         }
+         case PARSER_EXE_POWI:
+         {
+-            double& d = pstack.top();
++            ParserExeReal& d = pstack.top();
+             int n = ((ParserExePOWI*)p)->i;
+             if (n != 0) {
+                 if (n < 0) {
+                     d = 1.0/d;
+                     n = -n;
+                 }
+-                double y = 1.0;
++                ParserExeReal y = 1.0;
+                 while (n > 1) {
+                     if (n % 2 == 0) {
+                         d *= d;
+@@ -551,14 +563,14 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_FMA_VPV:
+         {
+             int i = ((ParserExeFMA_VPV*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeFMA_VPV*)p)->a * d + ((ParserExeFMA_VPV*)p)->b);
+             p += sizeof(ParserExeFMA_VPV);
+             break;
+         }
+         case PARSER_EXE_IF:
+         {
+-            double cond = pstack.top(); // NOLINT
++            ParserExeReal cond = pstack.top(); // NOLINT
+             pstack.pop();
+             if (cond == 0.0) { // false branch
+                 p += ((ParserExeIF*)p)->offset;
+diff --git a/Src/Base/Parser/AMReX_Parser_Y.H b/Src/Base/Parser/AMReX_Parser_Y.H
+index d5771581e..8ce5cdce3 100644
+--- a/Src/Base/Parser/AMReX_Parser_Y.H
++++ b/Src/Base/Parser/AMReX_Parser_Y.H
+@@ -476,63 +476,65 @@ T parser_math_yn (int a, T b)
+ #endif
+ }
+ 
+-AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE double
+-parser_call_f1 (enum parser_f1_t type, double a)
++template <typename T>
++AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE T
++parser_call_f1 (enum parser_f1_t type, T a)
+ {
+     switch (type) {
+     case PARSER_SQRT:        return std::sqrt(a);
+-    case PARSER_EXP:         return parser_math_exp<double>(a);
+-    case PARSER_LOG:         return parser_math_log<double>(a);
+-    case PARSER_LOG10:       return parser_math_log10<double>(a);
+-    case PARSER_SIN:         return parser_math_sin<double>(a);
+-    case PARSER_COS:         return parser_math_cos<double>(a);
+-    case PARSER_TAN:         return parser_math_tan<double>(a);
+-    case PARSER_ASIN:        return parser_math_asin<double>(a);
+-    case PARSER_ACOS:        return parser_math_acos<double>(a);
+-    case PARSER_ATAN:        return parser_math_atan<double>(a);
+-    case PARSER_SINH:        return parser_math_sinh<double>(a);
+-    case PARSER_COSH:        return parser_math_cosh<double>(a);
+-    case PARSER_TANH:        return parser_math_tanh<double>(a);
++    case PARSER_EXP:         return parser_math_exp<T>(a);
++    case PARSER_LOG:         return parser_math_log<T>(a);
++    case PARSER_LOG10:       return parser_math_log10<T>(a);
++    case PARSER_SIN:         return parser_math_sin<T>(a);
++    case PARSER_COS:         return parser_math_cos<T>(a);
++    case PARSER_TAN:         return parser_math_tan<T>(a);
++    case PARSER_ASIN:        return parser_math_asin<T>(a);
++    case PARSER_ACOS:        return parser_math_acos<T>(a);
++    case PARSER_ATAN:        return parser_math_atan<T>(a);
++    case PARSER_SINH:        return parser_math_sinh<T>(a);
++    case PARSER_COSH:        return parser_math_cosh<T>(a);
++    case PARSER_TANH:        return parser_math_tanh<T>(a);
+     case PARSER_ASINH:       return parser_math_asinh<double>(a);
+     case PARSER_ACOSH:       return parser_math_acosh<double>(a);
+     case PARSER_ATANH:       return parser_math_atanh<double>(a);
+     case PARSER_ABS:         return std::abs(a);
+     case PARSER_FLOOR:       return std::floor(a);
+     case PARSER_CEIL:        return std::ceil(a);
+-    case PARSER_COMP_ELLINT_1: return parser_math_comp_ellint_1<double>(a);
+-    case PARSER_COMP_ELLINT_2: return parser_math_comp_ellint_2<double>(a);
+-    case PARSER_ERF:         return parser_math_erf<double>(a);
++    case PARSER_COMP_ELLINT_1: return parser_math_comp_ellint_1<T>(a);
++    case PARSER_COMP_ELLINT_2: return parser_math_comp_ellint_2<T>(a);
++    case PARSER_ERF:         return static_cast<T>(parser_math_erf<double>(static_cast<double>(a)));
+     default:
+         amrex::Abort("parser_call_f1: Unknown function ");
+-        return 0.0;
++        return T(0.0);
+     }
+ }
+ 
+-AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE double
+-parser_call_f2 (enum parser_f2_t type, double a, double b)
++template <typename T>
++AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE T
++parser_call_f2 (enum parser_f2_t type, T a, T b)
+ {
+     switch (type) {
+     case PARSER_POW:
+-        return parser_math_pow<double>(a,b);
++        return parser_math_pow<T>(a,b);
+     case PARSER_ATAN2:
+-        return parser_math_atan2<double>(a,b);
++        return parser_math_atan2<T>(a,b);
+     case PARSER_GT:
+-        return (a > b) ? 1.0 : 0.0;
++        return (a > b) ? T(1.0) : T(0.0);
+     case PARSER_LT:
+-        return (a < b) ? 1.0 : 0.0;
++        return (a < b) ? T(1.0) : T(0.0);
+     case PARSER_GEQ:
+-        return (a >= b) ? 1.0 : 0.0;
++        return (a >= b) ? T(1.0) : T(0.0);
+     case PARSER_LEQ:
+-        return (a <= b) ? 1.0 : 0.0;
++        return (a <= b) ? T(1.0) : T(0.0);
+     case PARSER_EQ:
+-        return (a == b) ? 1.0 : 0.0;
++        return (a == b) ? T(1.0) : T(0.0);
+     case PARSER_NEQ:
+-        return (a != b) ? 1.0 : 0.0;
++        return (a != b) ? T(1.0) : T(0.0);
+     case PARSER_CMP_CHAIN:
+     case PARSER_AND:
+-        return ((a != 0.0) && (b != 0.0)) ? 1.0 : 0.0;
++        return ((a != 0.0) && (b != 0.0)) ? T(1.0) : T(0.0);
+     case PARSER_OR:
+-        return ((a != 0.0) || (b != 0.0)) ? 1.0 : 0.0;
++        return ((a != 0.0) || (b != 0.0)) ? T(1.0) : T(0.0);
+     case PARSER_HEAVISIDE:
+         if (a < 0.0) {
+             return 0.0;
+@@ -542,9 +544,9 @@ parser_call_f2 (enum parser_f2_t type, double a, double b)
+             return b;
+         }
+     case PARSER_JN:
+-        return parser_math_jn<double>(int(a),b);
++        return parser_math_jn<T>(int(a),b);
+     case PARSER_YN:
+-        return parser_math_yn<double>(int(a),b);
++        return parser_math_yn<T>(int(a),b);
+     case PARSER_MIN:
+         return (a < b) ? a : b;
+     case PARSER_MAX:
+@@ -553,7 +555,7 @@ parser_call_f2 (enum parser_f2_t type, double a, double b)
+         return std::fmod(a,b);
+     default:
+         amrex::Abort("parser_call_f2: Unknown function");
+-        return 0.0;
++        return T(0.0);
+     }
+ }
+ 
 diff --git a/Src/Particle/AMReX_DenseBins.H b/Src/Particle/AMReX_DenseBins.H
-index 743673b..a98ae51 100644
+index 743673b8b..a98ae517c 100644
 --- a/Src/Particle/AMReX_DenseBins.H
 +++ b/Src/Particle/AMReX_DenseBins.H
 @@ -37,12 +37,28 @@ struct DenseBinIteratorFactory
@@ -706,10 +1028,69 @@ index 743673b..a98ae51 100644
  
  }
 diff --git a/Src/Particle/AMReX_ParticleContainerI.H b/Src/Particle/AMReX_ParticleContainerI.H
-index e0eb6c8..43b1b18 100644
+index e0eb6c849..a67703a60 100644
 --- a/Src/Particle/AMReX_ParticleContainerI.H
 +++ b/Src/Particle/AMReX_ParticleContainerI.H
-@@ -1489,6 +1489,7 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+@@ -1143,8 +1143,9 @@ void
+ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssignor>::
+ copyParticles (const PCType& other, bool local)
+ {
+-    using PData = typename ParticleTileType::ConstParticleTileDataType;
+-    copyParticles(other, [] AMREX_GPU_HOST_DEVICE (const PData& /*data*/, int /*i*/) { return 1; }, local);
++    BL_PROFILE("ParticleContainer::copyParticles");
++    clearParticles();
++    addParticles(other, local);
+ }
+ 
+ template <typename ParticleType, int NArrayReal, int NArrayInt,
+@@ -1154,8 +1155,44 @@ void
+ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssignor>::
+ addParticles (const PCType& other, bool local)
+ {
+-    using PData = typename ParticleTileType::ConstParticleTileDataType;
+-    addParticles(other, [] AMREX_GPU_HOST_DEVICE (const PData& /*data*/, int /*i*/) { return 1; }, local);
++    BL_PROFILE("ParticleContainer::addParticles");
++
++    for (int lev = 0; lev < other.numLevels(); ++lev)
++    {
++        [[maybe_unused]] Gpu::NoSyncRegion no_sync{};
++        const auto& plevel_other = other.GetParticles(lev);
++        for (MFIter mfi = other.MakeMFIter(lev); mfi.isValid(); ++mfi)
++        {
++            auto index = std::make_pair(mfi.index(), mfi.LocalTileIndex());
++            if (!plevel_other.contains(index)) { continue; }
++            DefineAndReturnParticleTile(lev, mfi.index(), mfi.LocalTileIndex());
++        }
++    }
++
++#ifdef AMREX_USE_OMP
++#pragma omp parallel if (Gpu::notInLaunchRegion())
++#endif
++    for (int lev = 0; lev < other.numLevels(); ++lev)
++    {
++        const auto& plevel_other = other.GetParticles(lev);
++        for (MFIter mfi = other.MakeMFIter(lev); mfi.isValid(); ++mfi)
++        {
++            auto index = std::make_pair(mfi.index(), mfi.LocalTileIndex());
++            if (!plevel_other.contains(index)) { continue; }
++
++            auto& ptile = ParticlesAt(lev, mfi.index(), mfi.LocalTileIndex());
++            const auto& ptile_other = plevel_other.at(index);
++            auto np = ptile_other.numParticles();
++            if (np == 0) { continue; }
++
++            auto dst_index = ptile.numParticles();
++            ptile.resize(dst_index + np);
++            amrex::copyParticles(ptile, ptile_other, 0, dst_index, np);
++        }
++    }
++
++    Gpu::streamSynchronize();
++    if (! local) { Redistribute(); }
+ }
+ 
+ template <typename ParticleType, int NArrayReal, int NArrayInt,
+@@ -1489,6 +1526,7 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
      auto assign_grid = m_particle_locator.getGridAssignor();
      const auto plo    = Geom(0).ProbLoArray();
      const auto phi    = Geom(0).ProbHiArray();
@@ -717,7 +1098,7 @@ index e0eb6c8..43b1b18 100644
      const auto rlo    = Geom(0).ProbLoArrayInParticleReal();
      const auto rhi    = Geom(0).ProbHiArrayInParticleReal();
      const auto is_per = Geom(0).isPeriodicArray();
-@@ -1585,7 +1586,7 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+@@ -1585,7 +1623,7 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
          int num_stay = partitionParticlesByDest(src_tile, assign_grid,
                                                  std::forward<CellAssignor>(CellAssignor{}),
                                                  BufferMap(),
@@ -727,7 +1108,7 @@ index e0eb6c8..43b1b18 100644
  
          int num_move = np - num_stay;
 diff --git a/Src/Particle/AMReX_ParticleLocator.H b/Src/Particle/AMReX_ParticleLocator.H
-index 75fa01a..1aa805a 100644
+index 75fa01ae9..9f9e26664 100644
 --- a/Src/Particle/AMReX_ParticleLocator.H
 +++ b/Src/Particle/AMReX_ParticleLocator.H
 @@ -51,6 +51,28 @@ struct AssignGrid
@@ -759,7 +1140,15 @@ index 75fa01a..1aa805a 100644
      [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
      int getTile (const IntVect& iv, const Box& bx) const noexcept
      {
-@@ -211,6 +233,63 @@ public:
+@@ -187,6 +209,7 @@ public:
+ 
+         m_num_bins = (m_bins_hi - m_bins_lo + m_bin_size) / m_bin_size;
+ 
++
+         Box bins_box(IntVect::TheZeroVector(), m_num_bins-IntVect::TheUnitVector());
+         IntVect bin_size = m_bin_size;
+         IntVect bins_lo = m_bins_lo;
+@@ -211,6 +234,63 @@ public:
                                                m_do_tiling, m_tile_size);
      }
  
@@ -823,7 +1212,7 @@ index 75fa01a..1aa805a 100644
      bool isValid (const BoxArray& ba,
                    bool a_do_tiling = false,
                    const IntVect& a_tile_size = IntVect(AMREX_D_DECL(1024000, 1024000, 1024000))) const noexcept
-@@ -240,7 +319,7 @@ protected:
+@@ -240,7 +320,7 @@ protected:
      Bins m_bins;
  
      Gpu::HostVector<Box> m_host_boxes;
@@ -832,7 +1221,7 @@ index 75fa01a..1aa805a 100644
  };
  
  template <class BinIteratorFactory>
-@@ -285,7 +364,7 @@ public:
+@@ -285,7 +365,7 @@ public:
  
  private:
      Vector<ParticleLocator<Bins> > m_locators;
@@ -841,7 +1230,7 @@ index 75fa01a..1aa805a 100644
      bool m_defined = false;
  
  public:
-@@ -317,14 +396,11 @@ public:
+@@ -317,14 +397,11 @@ public:
          m_locators.resize(num_levels);
          m_grid_assignors.resize(num_levels);
  #ifdef AMREX_USE_GPU
@@ -857,7 +1246,7 @@ index 75fa01a..1aa805a 100644
          Gpu::streamSynchronize();
  #else
          for (int lev = 0; lev < num_levels; ++lev)
-@@ -380,14 +456,11 @@ public:
+@@ -380,14 +457,11 @@ public:
      {
          int num_levels = a_gdb->finestLevel()+1;
  #ifdef AMREX_USE_GPU
@@ -874,7 +1263,7 @@ index 75fa01a..1aa805a 100644
  #else
          for (int lev = 0; lev < num_levels; ++lev)
 diff --git a/Src/Particle/AMReX_ParticleUtil.H b/Src/Particle/AMReX_ParticleUtil.H
-index d0b1f2d..31be202 100644
+index d0b1f2d23..e2e8d1e5f 100644
 --- a/Src/Particle/AMReX_ParticleUtil.H
 +++ b/Src/Particle/AMReX_ParticleUtil.H
 @@ -649,6 +649,7 @@ partitionParticlesByDest (PTile& ptile, const PLocator& ploc, CellAssignor const
@@ -885,7 +1274,15 @@ index d0b1f2d..31be202 100644
                            const GpuArray<ParticleReal,AMREX_SPACEDIM>& rlo,
                            const GpuArray<ParticleReal,AMREX_SPACEDIM>& rhi,
                            const GpuArray<int ,AMREX_SPACEDIM>& is_per,
-@@ -703,16 +704,19 @@ partitionParticlesByDest (PTile& ptile, const PLocator& ploc, CellAssignor const
+@@ -658,6 +659,7 @@ partitionParticlesByDest (PTile& ptile, const PLocator& ploc, CellAssignor const
+     auto getPID = pmap.getPIDFunctor();
+     int pid = ParallelContext::MyProcSub();
+ 
++
+     Gpu::DeviceVector<uint8_t> particle_stays(ptile.numParticles());
+     uint8_t * const p_particle_stays = particle_stays.dataPtr();
+     auto ptd = ptile.getParticleTileData();
+@@ -703,10 +705,11 @@ partitionParticlesByDest (PTile& ptile, const PLocator& ploc, CellAssignor const
                  }
              }
  
@@ -897,26 +1294,4 @@ index d0b1f2d..31be202 100644
 +            p_particle_stays[i] = stays;
          });
  
--    return partitionParticles(ptile,
-+    int num_stay_device = partitionParticles(ptile,
-         [=] AMREX_GPU_DEVICE (auto& /* ptd */, int i) -> bool {
-             return p_particle_stays[i];
-         });
-+
-+    return num_stay_device;
- }
- 
- template <class PC1, class PC2>
-diff --git a/Tools/CMake/AMReXSYCL.cmake b/Tools/CMake/AMReXSYCL.cmake
-index 5839724..e8cc54b 100644
---- a/Tools/CMake/AMReXSYCL.cmake
-+++ b/Tools/CMake/AMReXSYCL.cmake
-@@ -37,7 +37,7 @@ if (_amrex_sycl_adaptivecpp)
-     # Disable __int128 support: the Metal emitter cannot translate i128
-     # (maps to uint4 in MSL, casts unsupported). All i128 codepaths
-     # (umulhi, FastDivmodU64) have safe non-128 fallbacks.
--    target_compile_definitions(SYCL INTERFACE AMREX_NO_INT128)
-+    target_compile_definitions(SYCL INTERFACE AMREX_NO_INT128 AMREX_SYCL_NO_MULTIPASS_SCAN)
- 
- else()
-     # ==============================================================
+     return partitionParticles(ptile,

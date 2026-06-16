@@ -1,0 +1,337 @@
+diff --git a/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp b/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp
+index 6f374467..c4949e90 100644
+--- a/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp
++++ b/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp
+@@ -434,32 +434,43 @@ FlushFormatPlotfile::WriteParticles(const std::string& dir,
+         parser_filter.m_units = InputUnits::SI;
+         GeometryFilter const geometry_filter(part_diag.m_do_geom_filter,
+                                              part_diag.m_diag_domain);
++        const bool has_particle_filter = part_diag.m_do_random_filter ||
++            part_diag.m_do_uniform_filter || part_diag.m_do_parser_filter ||
++            part_diag.m_do_geom_filter;
+ 
+         if (!isBTD) {
+             particlesConvertUnits(ConvertDirection::WarpX_to_SI, pc, mass);
+             using SrcData = WarpXParticleContainer::ParticleTileType::ConstParticleTileDataType;
+-            tmp.copyParticles(*pc,
+-                              [random_filter,uniform_filter,parser_filter,geometry_filter]
+-                              AMREX_GPU_HOST_DEVICE
+-                              (const SrcData& src, int ip, const amrex::RandomEngine& engine)
+-            {
+-                const SuperParticleType& p = src.getSuperParticle(ip);
+-                return random_filter(p, engine) * uniform_filter(p, engine)
+-                    * parser_filter(p, engine) * geometry_filter(p, engine);
+-            }, true);
++            if (has_particle_filter) {
++                tmp.copyParticles(*pc,
++                                  [random_filter,uniform_filter,parser_filter,geometry_filter]
++                                  AMREX_GPU_HOST_DEVICE
++                                  (const SrcData& src, int ip, const amrex::RandomEngine& engine)
++                {
++                    const SuperParticleType& p = src.getSuperParticle(ip);
++                    return random_filter(p, engine) * uniform_filter(p, engine)
++                        * parser_filter(p, engine) * geometry_filter(p, engine);
++                }, true);
++            } else {
++                tmp.copyParticles(*pc, true);
++            }
+             particlesConvertUnits(ConvertDirection::SI_to_WarpX, pc, mass);
+         } else {
+             particlesConvertUnits(ConvertDirection::WarpX_to_SI, pinned_pc, mass);
+             using SrcData = WarpXParticleContainer::ParticleTileType::ConstParticleTileDataType;
+-            tmp.copyParticles(*pinned_pc,
+-                              [random_filter,uniform_filter,parser_filter,geometry_filter]
+-                              AMREX_GPU_HOST_DEVICE
+-                              (const SrcData& src, int ip, const amrex::RandomEngine& engine)
+-            {
+-                const SuperParticleType& p = src.getSuperParticle(ip);
+-                return random_filter(p, engine) * uniform_filter(p, engine)
+-                    * parser_filter(p, engine) * geometry_filter(p, engine);
+-            }, true);
++            if (has_particle_filter) {
++                tmp.copyParticles(*pinned_pc,
++                                  [random_filter,uniform_filter,parser_filter,geometry_filter]
++                                  AMREX_GPU_HOST_DEVICE
++                                  (const SrcData& src, int ip, const amrex::RandomEngine& engine)
++                {
++                    const SuperParticleType& p = src.getSuperParticle(ip);
++                    return random_filter(p, engine) * uniform_filter(p, engine)
++                        * parser_filter(p, engine) * geometry_filter(p, engine);
++                }, true);
++            } else {
++                tmp.copyParticles(*pinned_pc, true);
++            }
+             particlesConvertUnits(ConvertDirection::SI_to_WarpX, pinned_pc, mass);
+         }
+ 
+diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
+index 21af87bd..75f582a1 100644
+--- a/Source/Evolve/WarpXEvolve.cpp
++++ b/Source/Evolve/WarpXEvolve.cpp
+@@ -54,10 +54,20 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cerrno>
++#include <cstdint>
++#include <cstdlib>
++#include <iomanip>
+ #include <memory>
+ #include <ostream>
++#include <sstream>
+ #include <vector>
+ 
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <sys/sysctl.h>
++#endif
++
+ using namespace amrex;
+ using ablastr::utils::SignalHandling;
+ 
+@@ -107,6 +117,91 @@ namespace
+             }
+         }
+     }
++
++    constexpr double default_max_mem_fraction = 0.70;
++
++    double readMaxMemFraction ()
++    {
++        const char* value = std::getenv("WARPX_MAX_MEM_FRACTION");
++        if (value == nullptr || value[0] == '\0') {
++            return default_max_mem_fraction;
++        }
++
++        errno = 0;
++        char* end = nullptr;
++        double parsed = std::strtod(value, &end);
++        if (errno != 0 || end == value || parsed <= 0.0 || parsed > 1.0) {
++            return default_max_mem_fraction;
++        }
++        return parsed;
++    }
++
++#ifdef __APPLE__
++    bool sampleSystemMemoryBytes (std::uint64_t& used_bytes, std::uint64_t& physical_bytes)
++    {
++        physical_bytes = 0;
++        std::size_t physical_size = sizeof(physical_bytes);
++        if (sysctlbyname("hw.memsize", &physical_bytes, &physical_size, nullptr, 0) != 0 ||
++            physical_bytes == 0)
++        {
++            return false;
++        }
++
++        vm_size_t page_size = 0;
++        if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS || page_size == 0) {
++            return false;
++        }
++
++        vm_statistics64_data_t stats {};
++        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++        if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
++                              reinterpret_cast<host_info64_t>(&stats), &count) != KERN_SUCCESS)
++        {
++            return false;
++        }
++
++        const auto free_bytes = static_cast<std::uint64_t>(stats.free_count) *
++            static_cast<std::uint64_t>(page_size);
++        used_bytes = physical_bytes > free_bytes ? physical_bytes - free_bytes : 0;
++        return true;
++    }
++#else
++    bool sampleSystemMemoryBytes (std::uint64_t& used_bytes, std::uint64_t& physical_bytes)
++    {
++        used_bytes = 0;
++        physical_bytes = 0;
++        return false;
++    }
++#endif
++
++    void CheckSystemMemoryPressure ()
++    {
++        std::uint64_t used_bytes = 0;
++        std::uint64_t physical_bytes = 0;
++        if (!sampleSystemMemoryBytes(used_bytes, physical_bytes)) {
++            return;
++        }
++
++        const double max_fraction = readMaxMemFraction();
++        const long double threshold_bytes =
++            static_cast<long double>(physical_bytes) * max_fraction;
++        if (static_cast<long double>(used_bytes) < threshold_bytes) {
++            return;
++        }
++
++        constexpr long double gib = 1024.0L * 1024.0L * 1024.0L;
++        std::ostringstream msg;
++        msg << std::fixed << std::setprecision(1)
++            << "WarpX: system memory pressure exceeded "
++            << static_cast<int>(max_fraction * 100.0 + 0.5)
++            << "% of physical RAM (used "
++            << static_cast<long double>(used_bytes) / gib
++            << " GiB / "
++            << static_cast<long double>(physical_bytes) / gib
++            << " GiB) \u2014 deck too large for this machine; reduce resolution/particles "
++               "or raise WARPX_MAX_MEM_FRACTION at your own risk.";
++        amrex::Abort(msg.str());
++    }
+ }
+ 
+ void
+@@ -152,6 +247,7 @@ WarpX::Evolve (int numsteps)
+     using ablastr::fields::Direction;
+ 
+     Real cur_time = t_new[0];
++    ::CheckSystemMemoryPressure();
+ 
+     // Note that the default argument is numsteps = -1
+     const int numsteps_max = (numsteps < 0)?(max_step):(istep[0] + numsteps);
+@@ -169,6 +265,7 @@ WarpX::Evolve (int numsteps)
+ 
+         // Check and clear signal flags and asynchronously broadcast them from process 0
+         SignalHandling::CheckSignals();
++        ::CheckSystemMemoryPressure();
+ 
+         multi_diags->NewIteration();
+ 
+diff --git a/Source/Initialization/PlasmaInjector.cpp b/Source/Initialization/PlasmaInjector.cpp
+index 97c66605..a95d5b95 100644
+--- a/Source/Initialization/PlasmaInjector.cpp
++++ b/Source/Initialization/PlasmaInjector.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstring>
+ #include <map>
+ #include <memory>
+ #include <set>
+diff --git a/Source/Particles/ParticleCreation/AddParticles.cpp b/Source/Particles/ParticleCreation/AddParticles.cpp
+index 93b25f6a..539bd527 100644
+--- a/Source/Particles/ParticleCreation/AddParticles.cpp
++++ b/Source/Particles/ParticleCreation/AddParticles.cpp
+@@ -777,6 +777,10 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
+     InjectorPosition* inj_pos = plasma_injector.getInjectorPosition();
+     InjectorMomentum* inj_mom = plasma_injector.getInjectorMomentumDevice();
+     InjectorMomentum* h_inj_mom = plasma_injector.getInjectorMomentumHost();
++#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) && defined(WARPX_DIM_XZ)
++    const bool sycl_parser_momentum =
++        h_inj_mom && h_inj_mom->type == InjectorMomentum::Type::parser;
++#endif
+     const amrex::Real gamma_boost = WarpX::gamma_boost;
+     const amrex::Real beta_boost = WarpX::beta_boost;
+     const amrex::Real t = WarpX::GetInstance().gett_new(lev);
+@@ -1204,6 +1208,64 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
+ 
+         amrex::Gpu::synchronize();
+ 
++#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) && defined(WARPX_DIM_XZ)
++        if (sycl_parser_momentum && max_new_particles > 0) {
++            const auto np = static_cast<std::size_t>(max_new_particles);
++            amrex::Vector<uint64_t> h_idcpu(np);
++            amrex::Vector<ParticleReal> h_x(np);
++            amrex::Vector<ParticleReal> h_z(np);
++            amrex::Vector<ParticleReal> h_ux(np);
++            amrex::Vector<ParticleReal> h_uy(np);
++            amrex::Vector<ParticleReal> h_uz(np);
++
++            amrex::Gpu::dtoh_memcpy_async(h_idcpu.data(), pa_idcpu,
++                                          np*sizeof(uint64_t));
++            amrex::Gpu::dtoh_memcpy_async(h_x.data(), pa[PIdx::x],
++                                          np*sizeof(ParticleReal));
++            amrex::Gpu::dtoh_memcpy_async(h_z.data(), pa[PIdx::z],
++                                          np*sizeof(ParticleReal));
++            amrex::Gpu::dtoh_memcpy_async(h_ux.data(), pa[PIdx::ux],
++                                          np*sizeof(ParticleReal));
++            amrex::Gpu::dtoh_memcpy_async(h_uy.data(), pa[PIdx::uy],
++                                          np*sizeof(ParticleReal));
++            amrex::Gpu::dtoh_memcpy_async(h_uz.data(), pa[PIdx::uz],
++                                          np*sizeof(ParticleReal));
++            amrex::Gpu::synchronize();
++
++            for (std::size_t ip = 0; ip < np; ++ip) {
++                if (amrex::particle_impl::is_valid(h_idcpu[ip])) {
++                    const amrex::Real x = h_x[ip];
++                    const amrex::Real z = h_z[ip];
++                    const amrex::XDim3 pos{x, 0._rt, z};
++                    amrex::XDim3 u;
++                    if (gamma_boost == 1._rt) {
++                        const amrex::Real z0 = applyBallisticCorrection(
++                            pos, h_inj_mom, gamma_boost, beta_boost, t);
++                        u = h_inj_mom->getMomentum(
++                            x, 0._rt, z0, amrex::RandomEngine{nullptr});
++                    } else {
++                        u = h_inj_mom->getMomentum(
++                            x, 0._rt, 0._rt, amrex::RandomEngine{nullptr});
++                        const amrex::Real gamma_lab = std::sqrt(
++                            1._rt+(u.x*u.x+u.y*u.y+u.z*u.z) );
++                        u.z = gamma_boost * ( u.z - beta_boost*gamma_lab );
++                    }
++                    h_ux[ip] = static_cast<ParticleReal>(u.x * PhysConst::c);
++                    h_uy[ip] = static_cast<ParticleReal>(u.y * PhysConst::c);
++                    h_uz[ip] = static_cast<ParticleReal>(u.z * PhysConst::c);
++                }
++            }
++
++            amrex::Gpu::htod_memcpy_async(pa[PIdx::ux], h_ux.data(),
++                                          np*sizeof(ParticleReal));
++            amrex::Gpu::htod_memcpy_async(pa[PIdx::uy], h_uy.data(),
++                                          np*sizeof(ParticleReal));
++            amrex::Gpu::htod_memcpy_async(pa[PIdx::uz], h_uz.data(),
++                                          np*sizeof(ParticleReal));
++            amrex::Gpu::synchronize();
++        }
++#endif
++
+         if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+         {
+             wt = static_cast<amrex::Real>(amrex::second()) - wt;
+diff --git a/Source/Particles/PhysicalParticleContainer.cpp b/Source/Particles/PhysicalParticleContainer.cpp
+index a2c6d874..10daad2c 100644
+--- a/Source/Particles/PhysicalParticleContainer.cpp
++++ b/Source/Particles/PhysicalParticleContainer.cpp
+@@ -429,7 +429,9 @@ PhysicalParticleContainer::BackwardCompatibility ()
+ void PhysicalParticleContainer::InitData ()
+ {
+     AddParticles(0); // Note - add on level 0
++    (void) TotalNumberOfParticles(/*only_valid=*/false, /*only_local=*/true);
+     Redistribute();  // We then redistribute
++    (void) TotalNumberOfParticles(/*only_valid=*/false, /*only_local=*/true);
+ }
+ 
+ void
+diff --git a/Source/WarpX.cpp b/Source/WarpX.cpp
+index 1b039603..b78e389d 100644
+--- a/Source/WarpX.cpp
++++ b/Source/WarpX.cpp
+@@ -1464,7 +1464,11 @@ WarpX::ReadParameters ()
+ 
+             // default sort interval for particles if species or lasers vector is not empty
+ #ifdef AMREX_USE_GPU
++#  if defined(AMREX_USE_SYCL) && (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__ADAPTIVECPP__) || defined(__HIPSYCL__))
++            sort_intervals_string_vec = {"-1"};
++#  else
+             sort_intervals_string_vec = {"4"};
++#  endif
+ #else
+             sort_intervals_string_vec = {"-1"};
+ #endif
+@@ -1472,6 +1476,15 @@ WarpX::ReadParameters ()
+ 
+         const amrex::ParmParse pp_warpx("warpx");
+         pp_warpx.queryarr("sort_intervals", sort_intervals_string_vec);
++#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) &&     (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) ||      defined(__ADAPTIVECPP__) || defined(__HIPSYCL__))
++        if (!(sort_intervals_string_vec.size() == 1 && sort_intervals_string_vec[0] == "-1")) {
++            ablastr::warn_manager::WMRecordWarning(
++                "Particles",
++                "Disabling warpx.sort_intervals on AdaptiveCpp/HipSYCL SYCL because the Metal GPU sort path corrupts particle attributes on this backend.",
++                ablastr::warn_manager::WarnPriority::high);
++            sort_intervals_string_vec = {"-1"};
++        }
++#endif
+         sort_intervals = utils::parser::IntervalsParser(sort_intervals_string_vec);
+ 
+         Vector<int> vect_sort_bin_size(AMREX_SPACEDIM,1);

@@ -1,6 +1,6 @@
-diff --git a/new/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp
+diff --git a/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp
 new file mode 100644
-index 0000000..74e8dd9
+index 00000000..74e8dd9b
 --- /dev/null
 +++ b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp
 @@ -0,0 +1,34 @@
@@ -38,9 +38,9 @@ index 0000000..74e8dd9
 +} // namespace hipsycl
 +
 +#endif // HIPSYCL_SSCP_POINTER_TRANSLATION_ANNOTATION_PASS_HPP
-diff --git a/new/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp
+diff --git a/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp
 new file mode 100644
-index 0000000..d0f07e8
+index 00000000..d0f07e8f
 --- /dev/null
 +++ b/include/hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp
 @@ -0,0 +1,31 @@
@@ -76,7 +76,7 @@ index 0000000..d0f07e8
 +
 +#endif // HIPSYCL_SSCP_POINTER_TRANSLATION_PASS_HPP
 diff --git a/include/hipSYCL/runtime/metal/metal_allocator.hpp b/include/hipSYCL/runtime/metal/metal_allocator.hpp
-index 21c76b9..70dfeff 100644
+index 21c76b94..70dfeff6 100644
 --- a/include/hipSYCL/runtime/metal/metal_allocator.hpp
 +++ b/include/hipSYCL/runtime/metal/metal_allocator.hpp
 @@ -14,8 +14,10 @@
@@ -128,8 +128,179 @@ index 21c76b9..70dfeff 100644
  
    struct usm_block {
      MTL::Buffer* buffer;
+diff --git a/include/hipSYCL/runtime/metal/metal_code_object.hpp b/include/hipSYCL/runtime/metal/metal_code_object.hpp
+index f099d294..1eaa44e1 100644
+--- a/include/hipSYCL/runtime/metal/metal_code_object.hpp
++++ b/include/hipSYCL/runtime/metal/metal_code_object.hpp
+@@ -20,6 +20,7 @@
+ #include "hipSYCL/runtime/kernel_cache.hpp"
+ 
+ namespace MTL {
++class BinaryArchive;
+ class Device;
+ class Library;
+ class Function;
+@@ -29,12 +30,25 @@ class ComputePipelineState;
+ namespace hipsycl {
+ namespace rt {
+ 
++enum class metal_library_input_kind {
++  source,
++  metallib
++};
++
++result compile_metal_source_to_metallib(
++    const std::string &metal_source,
++    kernel_cache::code_object_id id_of_binary,
++    std::string &metallib);
++
+ class metal_executable_object : public code_object {
+ public:
+   virtual ~metal_executable_object() {}
+ 
+   virtual MTL::Library* get_library() const = 0;
+ 
++  virtual MTL::BinaryArchive* get_binary_archive() const = 0;
++  virtual const std::string& get_binary_archive_path() const = 0;
++
+   virtual result get_build_result() const = 0;
+ 
+   virtual MTL::Device* get_device() const = 0;
+@@ -47,7 +61,9 @@ public:
+                                hcf_object_id hcf_source,
+                                const std::vector<std::string> &kernel_names,
+                                MTL::Device* device,
+-                               const kernel_configuration &config);
++                               const kernel_configuration &config,
++                               metal_library_input_kind input_kind =
++                                   metal_library_input_kind::source);
+ 
+   virtual ~metal_sscp_executable_object();
+ 
+@@ -65,12 +81,15 @@ public:
+   virtual bool contains(const std::string &backend_kernel_name) const override;
+ 
+   virtual MTL::Library* get_library() const override;
++  virtual MTL::BinaryArchive* get_binary_archive() const override;
++  virtual const std::string& get_binary_archive_path() const override;
+   virtual MTL::Device* get_device() const override;
+ 
+   const std::string& get_msl_source() const { return _msl_source; }
+ 
+ private:
+-  result build(const std::string& source);
++  result build(const std::string& input,
++               metal_library_input_kind input_kind);
+ 
+   std::string _target_arch;
+   hcf_object_id _hcf;
+@@ -79,6 +98,8 @@ private:
+   kernel_configuration::id_type _id;
+   MTL::Device* _device;
+   MTL::Library* _library;
++  MTL::BinaryArchive* _binary_archive;
++  std::string _binary_archive_path;
+ 
+   // Keep the MSL source for potential debugging
+   std::string _msl_source;
+diff --git a/include/hipSYCL/runtime/metal/metal_jit_guard.hpp b/include/hipSYCL/runtime/metal/metal_jit_guard.hpp
+new file mode 100644
+index 00000000..ae6784e4
+--- /dev/null
++++ b/include/hipSYCL/runtime/metal/metal_jit_guard.hpp
+@@ -0,0 +1,90 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#pragma once
++
++#include "hipSYCL/runtime/error.hpp"
++
++#include <cerrno>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <thread>
++
++namespace hipsycl {
++namespace rt {
++namespace metal_jit_guard {
++
++inline constexpr std::size_t default_compile_yield_ms = 20;
++inline constexpr std::size_t default_postcheck_ms = 1000;
++
++inline std::size_t read_size_env(const char* name, std::size_t fallback) {
++  const char* value = std::getenv(name);
++  if (!value || value[0] == '\0') {
++    return fallback;
++  }
++
++  errno = 0;
++  char* end = nullptr;
++  unsigned long long parsed = std::strtoull(value, &end, 10);
++  if (errno != 0 || end == value) {
++    return fallback;
++  }
++  return static_cast<std::size_t>(parsed);
++}
++
++inline std::size_t compile_yield_ms() {
++  return read_size_env("ACPP_METAL_JIT_YIELD_MS", default_compile_yield_ms);
++}
++
++inline std::size_t postcheck_ms() {
++  return read_size_env("ACPP_METAL_JIT_POSTCHECK_MS",
++                       default_postcheck_ms);
++}
++
++inline std::mutex& compile_mutex() {
++  static std::mutex mutex;
++  return mutex;
++}
++
++class scoped_compile {
++public:
++  scoped_compile(const char* phase, std::size_t submitted_source_bytes = 0)
++      : _phase{phase}, _submitted_source_bytes{submitted_source_bytes},
++        _lock{compile_mutex()} {}
++
++  scoped_compile(const scoped_compile&) = delete;
++  scoped_compile& operator=(const scoped_compile&) = delete;
++
++  ~scoped_compile() {
++    const std::size_t yield_ms = compile_yield_ms();
++    if (yield_ms != 0) {
++      std::this_thread::sleep_for(std::chrono::milliseconds{yield_ms});
++    }
++  }
++
++  result check(const char* phase) const {
++    if (phase && std::strncmp(phase, "after ", 6) == 0) {
++      const std::size_t settle_ms = postcheck_ms();
++      if (settle_ms != 0) {
++        std::this_thread::sleep_for(std::chrono::milliseconds{settle_ms});
++      }
++    }
++    return make_success();
++  }
++
++private:
++  const char* _phase;
++  std::size_t _submitted_source_bytes;
++  std::unique_lock<std::mutex> _lock;
++};
++
++} // namespace metal_jit_guard
++} // namespace rt
++} // namespace hipsycl
 diff --git a/src/compiler/llvm-to-backend/CMakeLists.txt b/src/compiler/llvm-to-backend/CMakeLists.txt
-index 5c8d9cd..33e3ba4 100644
+index 5c8d9cda..33e3ba4c 100644
 --- a/src/compiler/llvm-to-backend/CMakeLists.txt
 +++ b/src/compiler/llvm-to-backend/CMakeLists.txt
 @@ -307,6 +307,8 @@ if(WITH_SSCP_COMPILER)
@@ -142,7 +313,7 @@ index 5c8d9cd..33e3ba4 100644
          metal/Emitter.cpp
        TOOL metal/LLVMToMetalTool.cpp)
 diff --git a/src/compiler/llvm-to-backend/metal/Emitter.cpp b/src/compiler/llvm-to-backend/metal/Emitter.cpp
-index ce6949d..0453d0d 100644
+index 8cb4afdf..0453d0dd 100644
 --- a/src/compiler/llvm-to-backend/metal/Emitter.cpp
 +++ b/src/compiler/llvm-to-backend/metal/Emitter.cpp
 @@ -13,6 +13,7 @@
@@ -174,7 +345,7 @@ index ce6949d..0453d0d 100644
  }
  
  std::optional<uint64_t> getConstU64(llvm::Value* V) {
-@@ -224,18 +224,111 @@ uint3 __acpp_sscp_metal_local_size [[threads_per_threadgroup]];
+@@ -224,6 +224,111 @@ uint3 __acpp_sscp_metal_local_size [[threads_per_threadgroup]];
  threadgroup void * constant __acpp_sscp_metal_dynamic_local_memory [[threadgroup(0)]];
  constant uint& constant __acpp_sscp_metal_dynamic_local_memory_size [[buffer(0)]];
  
@@ -257,22 +428,18 @@ index ce6949d..0453d0d 100644
 +  return 0;
 +}
 +
- inline uint __acpp_sscp_get_num_subgroups() {
-   return (__acpp_sscp_metal_local_size.x + __simd_size - 1u) / __simd_size;
- }
- 
--inline ulong __acpp_sscp_atomic_load_i64(uint, uint, uint, device void* ptr) {
--  return *((device ulong*)ptr);
++inline uint __acpp_sscp_get_num_subgroups() {
++  return (__acpp_sscp_metal_local_size.x + __simd_size - 1u) / __simd_size;
++}
++
 +inline long __acpp_sscp_atomic_load_i64(uint, uint, uint, device void* ptr) {
 +  return *__pointer_cast<long>(ptr);
- }
- 
--inline ulong __acpp_sscp_atomic_load_i64(uint, uint, uint, threadgroup void* ptr) {
--  return *((threadgroup ulong*)ptr);
++}
++
 +inline long __acpp_sscp_atomic_load_i64(uint, uint, uint, threadgroup void* ptr) {
 +  return *__pointer_cast<long>(ptr);
- }
- 
++}
++
 +inline ulong __acpp_sscp_atomic_load_u64(uint, uint, uint, device void* ptr) {
 +  return *__pointer_cast<ulong>(ptr);
 +}
@@ -290,7 +457,7 @@ index ce6949d..0453d0d 100644
  )__";
  
    emitTypes();
-@@ -526,8 +619,14 @@ bool MetalEmitter::emitSignature(Function& F) {
+@@ -514,8 +619,14 @@ bool MetalEmitter::emitSignature(Function& F) {
    os << returnType << " " << F.getName().str() << " (";
  
    bool first = true;
@@ -306,7 +473,7 @@ index ce6949d..0453d0d 100644
      first = false;
      os << "device " << inputStructName << "& __args [[buffer(" << bufIdx++ << ")]]";
    } else {
-@@ -947,9 +1046,15 @@ bool MetalEmitter::emitCastInstruction(const CastInst* CI, const std::string& na
+@@ -935,9 +1046,15 @@ bool MetalEmitter::emitCastInstruction(const CastInst* CI, const std::string& na
      return false;
    };
  
@@ -325,7 +492,7 @@ index ce6949d..0453d0d 100644
    } else if (dyn_cast<BitCastInst>(CI)) {
      os << indent(level) << name << " = as_type<" << destType << ">(" << src << "); // " << instToString(*CI) << "\n";
    } else if (dyn_cast<SExtInst>(CI)) {
-@@ -1182,6 +1287,13 @@ void MetalEmitter::emitGEPInstruction(const GetElementPtrInst* GEP, const std::s
+@@ -1170,6 +1287,13 @@ void MetalEmitter::emitGEPInstruction(const GetElementPtrInst* GEP, const std::s
    std::string base = emitExpr(GEP->getPointerOperand());
    Type* srcElemType = GEP->getSourceElementType();
    std::string typeName = mapType(srcElemType);
@@ -339,7 +506,19 @@ index ce6949d..0453d0d 100644
  
    unsigned physAS = getPhysicalPointerAddressSpace(GEP->getPointerOperand());
    std::string addrSpace = getAddressSpaceKeyword(physAS);
-@@ -1253,6 +1365,14 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
+@@ -1229,6 +1353,11 @@ void MetalEmitter::emitGEPInstruction(const GetElementPtrInst* GEP, const std::s
+ 
+ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& name, int level) {
+   Function *callee = CI->getCalledFunction();
++  if (!callee) {
++    if (Value *calledOp = CI->getCalledOperand()) {
++      callee = dyn_cast<Function>(calledOp->stripPointerCastsAndAliases());
++    }
++  }
+   if (!callee) {
+     errorMsg = "Error: Indirect call not supported: " + instToString(*CI);
+     return false;
+@@ -1236,6 +1365,14 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
  
    std::string calleeName = callee->getName().str();
  
@@ -354,7 +533,7 @@ index ce6949d..0453d0d 100644
    if (calleeName.find("__acpp_sscp_metal") == 0) {
      return emitMetalInlineCall(CI, name, level);
    }
-@@ -1320,8 +1440,18 @@ std::string MetalEmitter::emitExpr(const Value* V) {
+@@ -1303,8 +1440,18 @@ std::string MetalEmitter::emitExpr(const Value* V) {
  
    // Strip pointer casts (addrspacecast, bitcast)
    if (auto *CE = dyn_cast<ConstantExpr>(V)) {
@@ -375,7 +554,7 @@ index ce6949d..0453d0d 100644
        return emitExpr(CE->getOperand(0));
      }
    }
-@@ -1335,19 +1465,39 @@ std::string MetalEmitter::emitExpr(const Value* V) {
+@@ -1318,19 +1465,39 @@ std::string MetalEmitter::emitExpr(const Value* V) {
  }
  
  std::string MetalEmitter::valueName(const Value* V) {
@@ -422,7 +601,7 @@ index ce6949d..0453d0d 100644
  }
  
  std::string MetalEmitter::basicBlockName(const BasicBlock* BB) {
-@@ -1449,8 +1599,8 @@ std::string MetalEmitter::mapType(const Type* T) {
+@@ -1432,8 +1599,8 @@ std::string MetalEmitter::mapType(const Type* T) {
    } else if (T->isFloatTy()) {
      return typeCache[T] = "float";
    } else if (T->isDoubleTy()) {
@@ -433,7 +612,7 @@ index ce6949d..0453d0d 100644
    } else if (T->isHalfTy()) {
      return typeCache[T] = "half";
    } else {
-@@ -1535,7 +1685,21 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
+@@ -1518,7 +1685,21 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
      return (inferredPtrAS[V] = 5 /* private */);
    }
    if (auto* ASC = dyn_cast<AddrSpaceCastInst>(V)) {
@@ -456,7 +635,7 @@ index ce6949d..0453d0d 100644
    }
    if (auto* GEP = dyn_cast<GetElementPtrInst>(V)) {
      return (inferredPtrAS[V] = getPhysicalPointerAddressSpace(GEP->getPointerOperand()));
-@@ -1549,14 +1713,130 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
+@@ -1532,14 +1713,130 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
          if (deducedAS == 0) {
            deducedAS = incomingAS;
          } else if (deducedAS != incomingAS) {
@@ -589,7 +768,7 @@ index ce6949d..0453d0d 100644
    }
    if (auto* Select = dyn_cast<SelectInst>(V)) {
      unsigned trueAS = getPhysicalPointerAddressSpace(Select->getTrueValue());
-@@ -1633,6 +1913,8 @@ void MetalEmitter::collectVariablesInfo(const Function& F) {
+@@ -1616,6 +1913,8 @@ void MetalEmitter::collectVariablesInfo(const Function& F) {
    phiIncomingFromBlock.clear();
    phiNodes.clear();
    valuesToDeclare.clear();
@@ -598,7 +777,7 @@ index ce6949d..0453d0d 100644
  
    for (const BasicBlock& BB : F) {
      for (const Instruction& I : BB) {
-@@ -1779,6 +2061,149 @@ bool MetalEmitter::emitMetalInlineCall(const llvm::CallInst* CI, const std::stri
+@@ -1762,6 +2061,149 @@ bool MetalEmitter::emitMetalInlineCall(const llvm::CallInst* CI, const std::stri
      return true;
    }
  
@@ -749,7 +928,7 @@ index ce6949d..0453d0d 100644
    if (funcName->find("%s") != std::string::npos) {
      // expand printf-style format string with arguments
 diff --git a/src/compiler/llvm-to-backend/metal/Emitter.hpp b/src/compiler/llvm-to-backend/metal/Emitter.hpp
-index 92bab3b..d0650fc 100644
+index 92bab3b4..d0650fc9 100644
 --- a/src/compiler/llvm-to-backend/metal/Emitter.hpp
 +++ b/src/compiler/llvm-to-backend/metal/Emitter.hpp
 @@ -12,6 +12,7 @@
@@ -777,7 +956,7 @@ index 92bab3b..d0650fc 100644
 \ No newline at end of file
 +#endif // EMITTER_HPP
 diff --git a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
-index 5cea593..65a9f21 100644
+index 5cea593f..65a9f21b 100644
 --- a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
 +++ b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
 @@ -13,6 +13,8 @@
@@ -805,9 +984,9 @@ index 5cea593..65a9f21 100644
 -} // namespace hipsycl
 \ No newline at end of file
 +} // namespace hipsycl
-diff --git a/new/src/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.cpp b/src/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.cpp
+diff --git a/src/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.cpp b/src/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.cpp
 new file mode 100644
-index 0000000..7f889f3
+index 00000000..7f889f3a
 --- /dev/null
 +++ b/src/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.cpp
 @@ -0,0 +1,273 @@
@@ -1084,9 +1263,9 @@ index 0000000..7f889f3
 +
 +} // namespace compiler
 +} // namespace hipsycl
-diff --git a/new/src/compiler/llvm-to-backend/metal/PointerTranslationPass.cpp b/src/compiler/llvm-to-backend/metal/PointerTranslationPass.cpp
+diff --git a/src/compiler/llvm-to-backend/metal/PointerTranslationPass.cpp b/src/compiler/llvm-to-backend/metal/PointerTranslationPass.cpp
 new file mode 100644
-index 0000000..683a9bd
+index 00000000..683a9bd6
 --- /dev/null
 +++ b/src/compiler/llvm-to-backend/metal/PointerTranslationPass.cpp
 @@ -0,0 +1,121 @@
@@ -1212,7 +1391,7 @@ index 0000000..683a9bd
 +} // namespace compiler
 +} // namespace hipsycl
 diff --git a/src/libkernel/sscp/metal/atomic.cpp b/src/libkernel/sscp/metal/atomic.cpp
-index 5b074e7..6fb25ea 100644
+index 5b074e7f..6fb25ea5 100644
 --- a/src/libkernel/sscp/metal/atomic.cpp
 +++ b/src/libkernel/sscp/metal/atomic.cpp
 @@ -23,6 +23,8 @@ HIPSYCL_SSCP_BUILTIN u8  __acpp_sscp_metal_atomic_load_u8(const char* s, u8* ptr
@@ -1492,7 +1671,7 @@ index 5b074e7..6fb25ea 100644
 +
 +#undef ACPP_METAL_FETCH_OP_64
 diff --git a/src/libkernel/sscp/metal/math.cpp b/src/libkernel/sscp/metal/math.cpp
-index ff1d8da..803c34a 100644
+index ff1d8da0..803c34ad 100644
 --- a/src/libkernel/sscp/metal/math.cpp
 +++ b/src/libkernel/sscp/metal/math.cpp
 @@ -37,6 +37,21 @@ HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_metal_math_f32_f32_f32_f32(const char* name
@@ -1579,8 +1758,20 @@ index ff1d8da..803c34a 100644
  HIPSYCL_SSCP_BUILTIN f32 __acpp_sscp_hypot_f32(f32 x, f32 y) {
    return __acpp_sscp_metal_math_f32_f32_f32("length(float2(%s, %s))", x, y);
  }
+diff --git a/src/runtime/CMakeLists.txt b/src/runtime/CMakeLists.txt
+index dd749428..02c01bb3 100644
+--- a/src/runtime/CMakeLists.txt
++++ b/src/runtime/CMakeLists.txt
+@@ -427,6 +427,7 @@ if (WITH_METAL_BACKEND)
+     )
+ 
+   target_compile_definitions(rt-backend-metal PRIVATE -DHIPSYCL_WITH_SSCP_COMPILER)
++  target_compile_options(rt-backend-metal PRIVATE -fblocks)
+   target_link_libraries(rt-backend-metal PRIVATE llvm-to-metal)
+ 
+   target_link_libraries(rt-backend-metal PRIVATE acpp-rt)
 diff --git a/src/runtime/metal/metal_allocator.cpp b/src/runtime/metal/metal_allocator.cpp
-index 672578a..643f704 100644
+index 672578a6..643f7046 100644
 --- a/src/runtime/metal/metal_allocator.cpp
 +++ b/src/runtime/metal/metal_allocator.cpp
 @@ -16,6 +16,8 @@
@@ -1736,11 +1927,340 @@ index 672578a..643f704 100644
 +
  } // namespace rt
  } // namespace hipsycl
+diff --git a/src/runtime/metal/metal_code_object.cpp b/src/runtime/metal/metal_code_object.cpp
+index b9f76f1c..686cc475 100644
+--- a/src/runtime/metal/metal_code_object.cpp
++++ b/src/runtime/metal/metal_code_object.cpp
+@@ -9,18 +9,143 @@
+  */
+ // SPDX-License-Identifier: BSD-2-Clause
+ #include "hipSYCL/runtime/metal/metal_code_object.hpp"
++#include "hipSYCL/runtime/metal/metal_jit_guard.hpp"
+ 
+ #include <Metal/Metal.hpp>
++#include <dispatch/dispatch.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <sstream>
+ 
+ #undef nil
+ 
+ #include "hipSYCL/common/debug.hpp"
++#include "hipSYCL/common/filesystem.hpp"
+ 
+ namespace hipsycl {
+ namespace rt {
+ 
+ namespace {
+ 
++std::string metal_error_message(const std::string& prefix, NS::Error* error) {
++  std::string msg = prefix;
++  if (error && error->localizedDescription()) {
++    msg += ": ";
++    msg += error->localizedDescription()->utf8String();
++  }
++  return msg;
++}
++
++std::string shell_quote(const std::string& value) {
++  std::string result = "'";
++  for (char c : value) {
++    if (c == '\'')
++      result += "'\\''";
++    else
++      result += c;
++  }
++  result += "'";
++  return result;
++}
++
++bool read_binary_file(const std::string& path, std::string& out) {
++  std::ifstream file{path, std::ios::in | std::ios::binary | std::ios::ate};
++  if (!file.is_open())
++    return false;
++
++  std::streamsize file_size = file.tellg();
++  if (file_size < 0)
++    return false;
++
++  file.seekg(0, std::ios::beg);
++  out.resize(static_cast<std::size_t>(file_size));
++  if (file_size == 0)
++    return true;
++  return static_cast<bool>(file.read(out.data(), file_size));
++}
++
++void remove_if_present(const std::string& path) {
++  std::remove(path.c_str());
++}
++
++result run_metal_toolchain(const std::string& source_path,
++                           const std::string& air_path,
++                           const std::string& metallib_path) {
++  std::string command =
++      "xcrun -sdk macosx metal -std=metal4.0 -Osize -c " +
++      shell_quote(source_path) + " -o " + shell_quote(air_path) +
++      " && xcrun -sdk macosx metallib " + shell_quote(air_path) +
++      " -o " + shell_quote(metallib_path);
++
++  int status = std::system(command.c_str());
++  if (status != 0) {
++    std::ostringstream msg;
++    msg << "metal_code_object: Offline Metal library compilation failed"
++        << " with status " << status
++        << "; command=" << command;
++    return make_error(__acpp_here(), error_info{msg.str()});
++  }
++  return make_success();
++}
++
++std::string make_metal_binary_archive_path(MTL::Device* device) {
++  std::ostringstream archive_name;
++  archive_name << "metal-pipeline-";
++  if (device) {
++    archive_name << std::hex << device->registryID();
++  } else {
++    archive_name << "no-device";
++  }
++  archive_name << ".binarchive";
++
++  return common::filesystem::join_path(
++      common::filesystem::persistent_storage::get().get_jit_cache_dir(),
++      archive_name.str());
++}
++
++MTL::BinaryArchive*
++open_metal_binary_archive(MTL::Device* device, const std::string& path) {
++  if (!device || path.empty()) {
++    return nullptr;
++  }
++
++  const char* enable_archive = std::getenv("ACPP_METAL_ENABLE_BINARY_ARCHIVE");
++  if (!enable_archive || std::string{enable_archive} != "1") {
++    return nullptr;
++  }
++
++  NS::Error* error = nullptr;
++  NS::SharedPtr<MTL::BinaryArchiveDescriptor> descriptor =
++      NS::TransferPtr(MTL::BinaryArchiveDescriptor::alloc()->init());
++  std::ifstream existing_archive{path, std::ios::binary};
++  if (existing_archive.good()) {
++    NS::String* path_string =
++        NS::String::string(path.c_str(), NS::UTF8StringEncoding);
++    NS::URL* archive_url = NS::URL::fileURLWithPath(path_string);
++    descriptor->setUrl(archive_url);
++  }
++
++  MTL::BinaryArchive* archive =
++      device->newBinaryArchive(descriptor.get(), &error);
++  if (error || !archive) {
++    HIPSYCL_DEBUG_WARNING
++        << "metal_code_object: Could not open Metal binary archive at "
++        << path;
++    if (error && error->localizedDescription()) {
++      HIPSYCL_DEBUG_WARNING
++          << ": " << error->localizedDescription()->utf8String();
++    }
++    HIPSYCL_DEBUG_WARNING << std::endl;
++    return nullptr;
++  }
++
++  HIPSYCL_DEBUG_INFO << "metal_code_object: Opened Metal binary archive "
++                     << path << std::endl;
++  return archive;
++}
++
+ result build_metal_library_from_source(MTL::Library*& library,
+                                        MTL::Device* device,
+                                        const std::string& source) {
+@@ -30,6 +155,13 @@ result build_metal_library_from_source(MTL::Library*& library,
+   }
+ 
+   NS::Error* error = nullptr;
++  metal_jit_guard::scoped_compile jit_compile{
++      "Metal library source compilation", source.size()};
++  result guard_result =
++      jit_compile.check("before Metal library source compilation");
++  if (!guard_result.is_success()) {
++    return guard_result;
++  }
+ 
+   NS::SharedPtr<MTL::CompileOptions> options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
+   options->setLanguageVersion(MTL::LanguageVersion4_0);
+@@ -40,6 +172,15 @@ result build_metal_library_from_source(MTL::Library*& library,
+ 
+   library = device->newLibrary(sourceString, options.get(), &error);
+ 
++  guard_result = jit_compile.check("after Metal library source compilation");
++  if (!guard_result.is_success()) {
++    if (library) {
++      library->release();
++      library = nullptr;
++    }
++    return guard_result;
++  }
++
+   if (error) {
+     std::string error_msg = "metal_code_object: Shader compilation failed";
+     if (error->localizedDescription()) {
+@@ -61,19 +202,106 @@ result build_metal_library_from_source(MTL::Library*& library,
+   return make_success();
+ }
+ 
++result build_metal_library_from_binary(MTL::Library*& library,
++                                       MTL::Device* device,
++                                       const std::string& metallib) {
++  if (!device) {
++    return make_error(__acpp_here(),
++                      error_info{"metal_code_object: Device is null"});
++  }
++
++  if (metallib.empty()) {
++    return make_error(__acpp_here(),
++                      error_info{"metal_code_object: Metal library binary is empty"});
++  }
++
++  void* data = std::malloc(metallib.size());
++  if (!data) {
++    return make_error(__acpp_here(),
++                      error_info{"metal_code_object: Could not allocate Metal library buffer"});
++  }
++  std::memcpy(data, metallib.data(), metallib.size());
++
++  dispatch_data_t dispatch_data = dispatch_data_create(
++      data, metallib.size(), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
++      DISPATCH_DATA_DESTRUCTOR_FREE);
++  if (!dispatch_data) {
++    std::free(data);
++    return make_error(__acpp_here(),
++                      error_info{"metal_code_object: Could not create dispatch_data for Metal library"});
++  }
++
++  NS::Error* error = nullptr;
++  library = device->newLibrary(dispatch_data, &error);
++  dispatch_release(dispatch_data);
++
++  if (error || !library) {
++    return make_error(__acpp_here(),
++                      error_info{metal_error_message(
++                          "metal_code_object: Could not load cached Metal library",
++                          error)});
++  }
++
++  HIPSYCL_DEBUG_INFO << "metal_code_object: Loaded cached Metal library of size "
++                     << metallib.size() << std::endl;
++  return make_success();
++}
++
+ } // anonymous namespace
+ 
++result compile_metal_source_to_metallib(
++    const std::string &metal_source,
++    kernel_cache::code_object_id id_of_binary,
++    std::string &metallib) {
++  std::string cache_file = kernel_cache::get_persistent_cache_file(id_of_binary);
++  std::string source_path = cache_file + ".metal";
++  std::string air_path = cache_file + ".air";
++  std::string metallib_path = cache_file + ".metallib";
++
++  if (!common::filesystem::atomic_write(source_path, metal_source)) {
++    return make_error(__acpp_here(),
++                      error_info{"metal_code_object: Could not write temporary MSL source"});
++  }
++
++  result compile_result = run_metal_toolchain(source_path, air_path, metallib_path);
++  remove_if_present(source_path);
++  remove_if_present(air_path);
++  if (!compile_result.is_success()) {
++    remove_if_present(metallib_path);
++    return compile_result;
++  }
++
++  if (!read_binary_file(metallib_path, metallib)) {
++    remove_if_present(metallib_path);
++    return make_error(__acpp_here(),
++                      error_info{"metal_code_object: Could not read compiled Metal library"});
++  }
++
++  remove_if_present(metallib_path);
++  return make_success();
++}
++
+ metal_sscp_executable_object::metal_sscp_executable_object(
+-    const std::string &metal_source, const std::string &target_arch,
++    const std::string &metal_input, const std::string &target_arch,
+     hcf_object_id hcf_source, const std::vector<std::string> &kernel_names,
+-    MTL::Device* device, const kernel_configuration &config)
++    MTL::Device* device, const kernel_configuration &config,
++    metal_library_input_kind input_kind)
+     : _target_arch{target_arch}, _hcf{hcf_source}, _kernel_names{kernel_names},
+       _id{config.generate_id()}, _device{device}, _library{nullptr},
+-      _msl_source{metal_source} {
+-  _build_result = build(metal_source);
++      _binary_archive{nullptr},
++      _msl_source{input_kind == metal_library_input_kind::source ? metal_input
++                                                                 : std::string{}} {
++  _build_result = build(metal_input, input_kind);
++  if (_build_result.is_success()) {
++    _binary_archive_path = make_metal_binary_archive_path(_device);
++    _binary_archive = open_metal_binary_archive(_device, _binary_archive_path);
++  }
+ }
+ 
+ metal_sscp_executable_object::~metal_sscp_executable_object() {
++  if (_binary_archive) {
++    _binary_archive->release();
++  }
+   if (_library) {
+     _library->release();
+   }
+@@ -117,15 +345,29 @@ MTL::Library* metal_sscp_executable_object::get_library() const {
+   return _library;
+ }
+ 
++MTL::BinaryArchive*
++metal_sscp_executable_object::get_binary_archive() const {
++  return _binary_archive;
++}
++
++const std::string&
++metal_sscp_executable_object::get_binary_archive_path() const {
++  return _binary_archive_path;
++}
++
+ MTL::Device* metal_sscp_executable_object::get_device() const {
+   return _device;
+ }
+ 
+-result metal_sscp_executable_object::build(const std::string& source) {
++result metal_sscp_executable_object::build(
++    const std::string& input, metal_library_input_kind input_kind) {
+   if (_library != nullptr)
+     return make_success();
+ 
+-  return build_metal_library_from_source(_library, _device, source);
++  if (input_kind == metal_library_input_kind::metallib)
++    return build_metal_library_from_binary(_library, _device, input);
++
++  return build_metal_library_from_source(_library, _device, input);
+ }
+ 
+ bool metal_sscp_executable_object::contains(
 diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
-index 4085305..25cb5fb 100644
+index 8a4625dd..16caa607 100644
 --- a/src/runtime/metal/metal_queue.cpp
 +++ b/src/runtime/metal/metal_queue.cpp
-@@ -18,6 +18,11 @@
+@@ -11,6 +11,7 @@
+ #include "hipSYCL/runtime/metal/metal_queue.hpp"
+ #include "hipSYCL/runtime/metal/metal_code_object.hpp"
+ #include "hipSYCL/runtime/metal/metal_event.hpp"
++#include "hipSYCL/runtime/metal/metal_jit_guard.hpp"
+ #include "hipSYCL/compiler/llvm-to-backend/metal/LLVMToMetalFactory.hpp"
+ #include "hipSYCL/glue/llvm-sscp/jit.hpp"
+ #include "hipSYCL/glue/llvm-sscp/jit-reflection/reflection_map.hpp"
+@@ -18,6 +19,13 @@
  #include "hipSYCL/common/debug.hpp"
  
  #include <Metal/Metal.hpp>
@@ -1748,11 +2268,13 @@ index 4085305..25cb5fb 100644
 +#include <cstdlib>
 +#include <cstdint>
 +#include <iostream>
++#include <mutex>
 +#include <sstream>
++#include <unordered_map>
  #include <utility>
  
  #undef nil
-@@ -33,11 +38,99 @@ namespace {
+@@ -33,11 +41,287 @@ namespace {
  // This value is passed to the compiler via kernel_build_option::metal_max_args_for_flat_mode,
  // which sets MetalEmitterOptions::maxArgsForFlatMode in LLVMToMetal.
  static constexpr int metal_max_args_for_flat_mode = 6;
@@ -1821,6 +2343,194 @@ index 4085305..25cb5fb 100644
 +  return os.str();
 +}
 +
++struct metal_pipeline_cache_key {
++  MTL::Device* device;
++  MTL::Library* library;
++  std::string kernel_name;
++
++  bool operator==(const metal_pipeline_cache_key& other) const {
++    return device == other.device && library == other.library &&
++           kernel_name == other.kernel_name;
++  }
++};
++
++struct metal_pipeline_cache_key_hash {
++  std::size_t operator()(const metal_pipeline_cache_key& key) const {
++    std::size_t seed = std::hash<void*>{}(key.device);
++    seed ^= std::hash<void*>{}(key.library) + 0x9e3779b9 + (seed << 6) +
++            (seed >> 2);
++    seed ^= std::hash<std::string>{}(key.kernel_name) + 0x9e3779b9 +
++            (seed << 6) + (seed >> 2);
++    return seed;
++  }
++};
++
++using metal_pipeline_cache =
++    std::unordered_map<metal_pipeline_cache_key,
++                       NS::SharedPtr<MTL::ComputePipelineState>,
++                       metal_pipeline_cache_key_hash>;
++
++metal_pipeline_cache& get_metal_pipeline_cache() {
++  static metal_pipeline_cache cache;
++  return cache;
++}
++
++std::mutex& get_metal_pipeline_cache_mutex() {
++  static std::mutex mutex;
++  return mutex;
++}
++
++std::string metal_error_message(const char* prefix, NS::Error* error) {
++  std::string error_msg = prefix;
++  if (error && error->localizedDescription()) {
++    error_msg += ": ";
++    error_msg += error->localizedDescription()->utf8String();
++  }
++  return error_msg;
++}
++
++NS::URL* metal_archive_url(const std::string& archive_path) {
++  NS::String* path_string =
++      NS::String::string(archive_path.c_str(), NS::UTF8StringEncoding);
++  return NS::URL::fileURLWithPath(path_string);
++}
++
++NS::SharedPtr<MTL::ComputePipelineState>
++new_pipeline_state_from_archive(MTL::Device* device,
++                                MTL::Function* function,
++                                MTL::BinaryArchive* archive,
++                                const std::string& archive_path,
++                                std::string_view kernel_name,
++                                bool allow_archive_population,
++                                std::string& error_msg) {
++  if (!archive || archive_path.empty()) {
++    return {};
++  }
++
++  NS::SharedPtr<MTL::ComputePipelineDescriptor> descriptor =
++      NS::TransferPtr(MTL::ComputePipelineDescriptor::alloc()->init());
++  descriptor->setComputeFunction(function);
++  NS::Array* archive_array =
++      NS::Array::array(reinterpret_cast<const NS::Object*>(archive));
++  descriptor->setBinaryArchives(archive_array);
++
++  NS::Error* error = nullptr;
++  NS::SharedPtr<MTL::ComputePipelineState> pipeline_state =
++      NS::TransferPtr(device->newComputePipelineState(
++          descriptor.get(), MTL::PipelineOptionFailOnBinaryArchiveMiss,
++          nullptr, &error));
++  if (pipeline_state && !error) {
++    HIPSYCL_DEBUG_INFO
++        << "[Metal] Persistent pipeline archive hit for kernel "
++        << kernel_name << " archive=" << archive_path << std::endl;
++    return pipeline_state;
++  }
++
++  if (!allow_archive_population) {
++    error_msg = metal_error_message(
++        "metal: Binary archive pipeline lookup failed", error);
++    return {};
++  }
++
++  HIPSYCL_DEBUG_INFO
++      << "[Metal] Persistent pipeline archive miss for kernel "
++      << kernel_name << " archive=" << archive_path << std::endl;
++
++  NS::Error* add_error = nullptr;
++  if (!archive->addComputePipelineFunctions(descriptor.get(), &add_error)) {
++    error_msg = metal_error_message(
++        "metal: Failed to populate binary archive", add_error);
++    return {};
++  }
++
++  NS::Error* serialize_error = nullptr;
++  if (!archive->serializeToURL(metal_archive_url(archive_path),
++                               &serialize_error)) {
++    HIPSYCL_DEBUG_WARNING
++        << metal_error_message(
++               "metal: Failed to serialize binary archive", serialize_error)
++        << " path=" << archive_path << std::endl;
++  }
++
++  error = nullptr;
++  pipeline_state = NS::TransferPtr(device->newComputePipelineState(
++      descriptor.get(), MTL::PipelineOptionFailOnBinaryArchiveMiss,
++      nullptr, &error));
++  if (pipeline_state && !error) {
++    HIPSYCL_DEBUG_INFO
++        << "[Metal] Populated persistent pipeline archive for kernel "
++        << kernel_name << " archive=" << archive_path << std::endl;
++    return pipeline_state;
++  }
++
++  error_msg =
++      metal_error_message("metal: Binary archive pipeline retry failed", error);
++  return {};
++}
++
++result get_or_create_metal_pipeline_state(
++    MTL::Device* device, MTL::Library* library, MTL::Function* function,
++    std::string_view kernel_name, MTL::BinaryArchive* archive,
++    const std::string& archive_path,
++    NS::SharedPtr<MTL::ComputePipelineState>& pipeline_state) {
++  metal_pipeline_cache_key key{device, library, std::string{kernel_name}};
++
++  std::lock_guard<std::mutex> lock{get_metal_pipeline_cache_mutex()};
++  auto& cache = get_metal_pipeline_cache();
++  auto existing = cache.find(key);
++  if (existing != cache.end()) {
++    HIPSYCL_DEBUG_INFO << "[Metal] Compute pipeline cache hit for kernel "
++                       << kernel_name << std::endl;
++    pipeline_state = existing->second;
++    return make_success();
++  }
++
++  HIPSYCL_DEBUG_INFO << "[Metal] Compute pipeline cache miss for kernel "
++                     << kernel_name << std::endl;
++
++  metal_jit_guard::scoped_compile jit_compile{
++      "Metal compute pipeline compilation"};
++  result guard_result =
++      jit_compile.check("before Metal compute pipeline compilation");
++  if (!guard_result.is_success()) {
++    return guard_result;
++  }
++
++  std::string archive_error;
++  pipeline_state = new_pipeline_state_from_archive(
++      device, function, archive, archive_path, kernel_name,
++      true, archive_error);
++  guard_result = jit_compile.check("after Metal binary archive pipeline attempt");
++  if (!guard_result.is_success()) {
++    return guard_result;
++  }
++  if (!pipeline_state && archive && !archive_error.empty()) {
++    HIPSYCL_DEBUG_WARNING << archive_error << "; falling back to direct "
++                          << "pipeline compilation for kernel "
++                          << kernel_name << std::endl;
++  }
++
++  if (!pipeline_state) {
++    NS::Error* error = nullptr;
++    pipeline_state = NS::TransferPtr(
++        device->newComputePipelineState(function, &error));
++    guard_result =
++        jit_compile.check("after Metal direct pipeline compilation");
++    if (!guard_result.is_success()) {
++      return guard_result;
++    }
++    if (error || !pipeline_state) {
++      return make_error(
++          __acpp_here(),
++          error_info{metal_error_message(
++              "metal: Failed to create compute pipeline state", error)});
++    }
++  }
++
++  cache.emplace(std::move(key), pipeline_state);
++  return make_success();
++}
++
 +bool make_pointer_translation_table(
 +    metal_allocator* allocator,
 +    metal_pointer_translation_table& table,
@@ -1852,7 +2562,39 @@ index 4085305..25cb5fb 100644
  void encode_arguments(
    MTL::ComputeCommandEncoder* encoder,
    MTL::Device* device,
-@@ -183,9 +276,40 @@ result launch_kernel_from_library(
+@@ -105,6 +389,8 @@ void encode_arguments_argbuffer(
+ result launch_kernel_from_library(
+   MTL::Library* library,
+   MTL::Device* device,
++  MTL::BinaryArchive* archive,
++  const std::string& archive_path,
+   MTL::CommandBuffer* command_buffer,
+   metal_allocator* allocator,
+   std::string_view kernel_name,
+@@ -134,16 +420,12 @@ result launch_kernel_from_library(
+                                  std::string(kernel_name)});
+   }
+ 
+-  NS::Error* error = nullptr;
+-  NS::SharedPtr<MTL::ComputePipelineState> pipeline_state = NS::TransferPtr(device->newComputePipelineState(function.get(), &error));
+-
+-  if (error || !pipeline_state) {
+-    std::string error_msg = "metal: Failed to create compute pipeline state";
+-    if (error && error->localizedDescription()) {
+-      error_msg += ": ";
+-      error_msg += error->localizedDescription()->utf8String();
+-    }
+-    return make_error(__acpp_here(), error_info{error_msg});
++  NS::SharedPtr<MTL::ComputePipelineState> pipeline_state;
++  result pipeline_result = get_or_create_metal_pipeline_state(
++      device, library, function.get(), entry, archive, archive_path,
++      pipeline_state);
++  if (!pipeline_result.is_success()) {
++    return pipeline_result;
+   }
+ 
+   std::vector<int> is_pointer_arg(num_args, 0);
+@@ -183,9 +465,40 @@ result launch_kernel_from_library(
  
    encoder->setThreadgroupMemoryLength(align_up(local_mem_size, 16), 0);
  
@@ -1895,7 +2637,7 @@ index 4085305..25cb5fb 100644
    if (!arg_buffer_used) {
      encode_arguments(encoder, device, allocator, args, arg_sizes, num_args, is_pointer_arg, buf_offset);
    } else {
-@@ -215,7 +339,24 @@ result launch_kernel_from_library(
+@@ -215,7 +528,24 @@ result launch_kernel_from_library(
  
    encoder->endEncoding();
  
@@ -1921,7 +2663,7 @@ index 4085305..25cb5fb 100644
      if (NS::Error* err = command_buffer->error()) {
        std::string msg = "metal: Command buffer failed: ";
        if (err->localizedDescription()) {
-@@ -224,7 +365,7 @@ result launch_kernel_from_library(
+@@ -224,7 +554,7 @@ result launch_kernel_from_library(
        register_error(make_error(__acpp_here(), error_info{msg}));
      }
  
@@ -1930,3 +2672,128 @@ index 4085305..25cb5fb 100644
                        << "' executed successfully" << std::endl;
    });
  
+@@ -406,7 +736,7 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+       // before reading from src_ptr
+       auto val_done = ++_event_counter;
+       _shared_event->notifyListener(_event_listener, prev_cpu_event,
+-        [=](MTL::SharedEvent* evt, uint64_t) {
++        ^(MTL::SharedEvent* evt, uint64_t) {
+           do_h2h_copy();
+           evt->setSignaledValue(val_done);
+         });
+@@ -478,7 +808,7 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+       auto val_done = base + 2;
+       command_buffer->encodeWait(_shared_event, val_stage_ready);
+       _shared_event->notifyListener(_event_listener, prev_cpu_event,
+-      [=](MTL::SharedEvent* evt, uint64_t) {
++      ^(MTL::SharedEvent* evt, uint64_t) {
+         do_h2d_copy();
+         evt->setSignaledValue(val_stage_ready);
+       });
+@@ -554,7 +884,7 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+     command_buffer->commit();
+ 
+     _shared_event->notifyListener(_event_listener, val_blit,
+-      [=](MTL::SharedEvent* evt, uint64_t) {
++      ^(MTL::SharedEvent* evt, uint64_t) {
+         for (std::size_t surface = 0; surface < transferred_range[0]; ++surface) {
+           for (std::size_t row = 0; row < transferred_range[1]; ++row) {
+             id<3> src = dst_staging_offset; src[0] += surface; src[1] += row;
+@@ -736,19 +1066,37 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+ 
+   // Generate configuration IDs for caching
+   auto binary_configuration_id = adaptivity_engine.finalize_binary_configuration(_config);
+-  auto code_object_configuration_id = binary_configuration_id;
+   kernel_configuration::extend_hash(
+-    code_object_configuration_id,
++    binary_configuration_id,
+     kernel_base_config_parameter::runtime_device,
+     static_cast<int>(_device_id.get_id()));
++  kernel_configuration::extend_hash(
++    binary_configuration_id,
++    kernel_base_config_parameter::runtime_device,
++    0x4d534c32);
++  auto code_object_configuration_id = binary_configuration_id;
+ 
+-  // Helper to get image name and kernel names from adaptivity engine
++  const std::string requested_kernel_name{kernel_name};
++
++  // Helper to get image name and kernel names from adaptivity engine.
++  // The Metal compiler service is sensitive to very large MSL translation
++  // units. Compile only the submitted kernel when the selected image contains
++  // it; this keeps helper/dependency resolution in LLVMToMetal while avoiding
++  // a whole-image MSL compile for every first launch.
+   auto get_image_and_kernel_names =
+     [&](std::vector<std::string>& contained_kernels) -> std::string {
+-    return adaptivity_engine.select_image_and_kernels(&contained_kernels);
++    std::string selected_image =
++        adaptivity_engine.select_image_and_kernels(&contained_kernels);
++    if (std::find(contained_kernels.begin(), contained_kernels.end(),
++                  requested_kernel_name) != contained_kernels.end()) {
++      contained_kernels = {requested_kernel_name};
++    }
++    return selected_image;
+   };
+ 
+-  // JIT compiler function - invoked on cache miss to compile LLVM IR to Metal shader
++  // JIT compiler function - invoked on cache miss to lower LLVM IR to MSL.
++  // Metal library compilation stays in-process via MTLDevice::newLibrary so
++  // runtime JIT does not depend on xcrun metal/metallib.
+   auto jit_compiler = [&](std::string& compiled_image) -> bool {
+     std::vector<std::string> kernel_names;
+     std::string selected_image_name = get_image_and_kernel_names(kernel_names);
+@@ -761,9 +1109,10 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+ 
+     bool enable_dead_arg_elimination = kernel_names.size() == 1;
+ 
++    std::string metal_source;
+     rt::result err = glue::jit::compile_and_store_stats(
+       translator.get(), hcf_object, selected_image_name, _config,
+-      binary_configuration_id, _reflection_map, compiled_image,
++      binary_configuration_id, _reflection_map, metal_source,
+       enable_dead_arg_elimination);
+ 
+     if (!err.is_success()) {
+@@ -771,18 +1120,20 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+       return false;
+     }
+ 
++    compiled_image = std::move(metal_source);
+     return true;
+   };
+ 
+-  // Code object constructor - creates executable object from compiled shader
+-  auto code_object_constructor = [&](const std::string& metal_shader) -> code_object* {
++  // Code object constructor - creates executable object from generated MSL.
++  auto code_object_constructor = [&](const std::string& metal_source) -> code_object* {
+     std::vector<std::string> kernel_names;
+     get_image_and_kernel_names(kernel_names);
+ 
+     std::string target_arch = "metal";
+ 
+     metal_sscp_executable_object* exec_obj = new metal_sscp_executable_object{
+-      metal_shader, target_arch, hcf_object, kernel_names, _device, _config};
++      metal_source, target_arch, hcf_object, kernel_names, _device, _config,
++      metal_library_input_kind::source};
+ 
+     result r = exec_obj->get_build_result();
+ 
+@@ -792,7 +1143,7 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+       return nullptr;
+     }
+ 
+-    HIPSYCL_DEBUG_INFO << "[Metal] Successfully compiled shader to Metal library: "
++    HIPSYCL_DEBUG_INFO << "[Metal] Successfully loaded Metal library: "
+                        << exec_obj->get_library() << std::endl;
+ 
+     bool has_dead_arg_elimination = kernel_names.size() == 1;
+@@ -834,7 +1185,8 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+   }
+ 
+   return launch_kernel_from_library(
+-    library, _device, new_command_buffer(), _allocator, kernel_name,
++    library, _device, nullptr, std::string{}, new_command_buffer(), _allocator,
++    kernel_name,
+     num_groups, group_size, local_mem_size,
+     _arg_mapper.get_mapped_args(),
+     const_cast<std::size_t*>(_arg_mapper.get_mapped_arg_sizes()),
