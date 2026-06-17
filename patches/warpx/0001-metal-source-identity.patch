@@ -1,27 +1,15 @@
 diff --git a/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp b/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp
-index 6f374467..c4949e90 100644
+index 6f3744676..f4dbc3b52 100644
 --- a/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp
 +++ b/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp
-@@ -434,32 +434,43 @@ FlushFormatPlotfile::WriteParticles(const std::string& dir,
-         parser_filter.m_units = InputUnits::SI;
-         GeometryFilter const geometry_filter(part_diag.m_do_geom_filter,
-                                              part_diag.m_diag_domain);
-+        const bool has_particle_filter = part_diag.m_do_random_filter ||
-+            part_diag.m_do_uniform_filter || part_diag.m_do_parser_filter ||
-+            part_diag.m_do_geom_filter;
- 
+@@ -438,6 +438,24 @@ FlushFormatPlotfile::WriteParticles(const std::string& dir,
          if (!isBTD) {
              particlesConvertUnits(ConvertDirection::WarpX_to_SI, pc, mass);
              using SrcData = WarpXParticleContainer::ParticleTileType::ConstParticleTileDataType;
--            tmp.copyParticles(*pc,
--                              [random_filter,uniform_filter,parser_filter,geometry_filter]
--                              AMREX_GPU_HOST_DEVICE
--                              (const SrcData& src, int ip, const amrex::RandomEngine& engine)
--            {
--                const SuperParticleType& p = src.getSuperParticle(ip);
--                return random_filter(p, engine) * uniform_filter(p, engine)
--                    * parser_filter(p, engine) * geometry_filter(p, engine);
--            }, true);
++#ifdef AMREX_METAL_PORT
++            const bool has_particle_filter = part_diag.m_do_random_filter ||
++                part_diag.m_do_uniform_filter || part_diag.m_do_parser_filter ||
++                part_diag.m_do_geom_filter;
 +            if (has_particle_filter) {
 +                tmp.copyParticles(*pc,
 +                                  [random_filter,uniform_filter,parser_filter,geometry_filter]
@@ -35,19 +23,23 @@ index 6f374467..c4949e90 100644
 +            } else {
 +                tmp.copyParticles(*pc, true);
 +            }
++#else
+             tmp.copyParticles(*pc,
+                               [random_filter,uniform_filter,parser_filter,geometry_filter]
+                               AMREX_GPU_HOST_DEVICE
+@@ -447,10 +465,29 @@ FlushFormatPlotfile::WriteParticles(const std::string& dir,
+                 return random_filter(p, engine) * uniform_filter(p, engine)
+                     * parser_filter(p, engine) * geometry_filter(p, engine);
+             }, true);
++#endif
              particlesConvertUnits(ConvertDirection::SI_to_WarpX, pc, mass);
          } else {
              particlesConvertUnits(ConvertDirection::WarpX_to_SI, pinned_pc, mass);
              using SrcData = WarpXParticleContainer::ParticleTileType::ConstParticleTileDataType;
--            tmp.copyParticles(*pinned_pc,
--                              [random_filter,uniform_filter,parser_filter,geometry_filter]
--                              AMREX_GPU_HOST_DEVICE
--                              (const SrcData& src, int ip, const amrex::RandomEngine& engine)
--            {
--                const SuperParticleType& p = src.getSuperParticle(ip);
--                return random_filter(p, engine) * uniform_filter(p, engine)
--                    * parser_filter(p, engine) * geometry_filter(p, engine);
--            }, true);
++#ifdef AMREX_METAL_PORT
++            const bool has_particle_filter = part_diag.m_do_random_filter ||
++                part_diag.m_do_uniform_filter || part_diag.m_do_parser_filter ||
++                part_diag.m_do_geom_filter;
 +            if (has_particle_filter) {
 +                tmp.copyParticles(*pinned_pc,
 +                                  [random_filter,uniform_filter,parser_filter,geometry_filter]
@@ -61,15 +53,24 @@ index 6f374467..c4949e90 100644
 +            } else {
 +                tmp.copyParticles(*pinned_pc, true);
 +            }
++#else
+             tmp.copyParticles(*pinned_pc,
+                               [random_filter,uniform_filter,parser_filter,geometry_filter]
+                               AMREX_GPU_HOST_DEVICE
+@@ -460,6 +497,7 @@ FlushFormatPlotfile::WriteParticles(const std::string& dir,
+                 return random_filter(p, engine) * uniform_filter(p, engine)
+                     * parser_filter(p, engine) * geometry_filter(p, engine);
+             }, true);
++#endif
              particlesConvertUnits(ConvertDirection::SI_to_WarpX, pinned_pc, mass);
          }
- 
+
 diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
-index 21af87bd..75f582a1 100644
+index 21af87bd1..75f582a14 100644
 --- a/Source/Evolve/WarpXEvolve.cpp
 +++ b/Source/Evolve/WarpXEvolve.cpp
 @@ -54,10 +54,20 @@
- 
+
  #include <algorithm>
  #include <array>
 +#include <cerrno>
@@ -80,7 +81,7 @@ index 21af87bd..75f582a1 100644
  #include <ostream>
 +#include <sstream>
  #include <vector>
- 
+
 +#ifdef __APPLE__
 +#include <mach/mach.h>
 +#include <sys/sysctl.h>
@@ -88,7 +89,7 @@ index 21af87bd..75f582a1 100644
 +
  using namespace amrex;
  using ablastr::utils::SignalHandling;
- 
+
 @@ -107,6 +117,91 @@ namespace
              }
          }
@@ -179,30 +180,30 @@ index 21af87bd..75f582a1 100644
 +        amrex::Abort(msg.str());
 +    }
  }
- 
+
  void
 @@ -152,6 +247,7 @@ WarpX::Evolve (int numsteps)
      using ablastr::fields::Direction;
- 
+
      Real cur_time = t_new[0];
 +    ::CheckSystemMemoryPressure();
- 
+
      // Note that the default argument is numsteps = -1
      const int numsteps_max = (numsteps < 0)?(max_step):(istep[0] + numsteps);
 @@ -169,6 +265,7 @@ WarpX::Evolve (int numsteps)
- 
+
          // Check and clear signal flags and asynchronously broadcast them from process 0
          SignalHandling::CheckSignals();
 +        ::CheckSystemMemoryPressure();
- 
+
          multi_diags->NewIteration();
- 
+
 diff --git a/Source/Initialization/PlasmaInjector.cpp b/Source/Initialization/PlasmaInjector.cpp
-index 97c66605..a95d5b95 100644
+index 97c66605e..a95d5b95d 100644
 --- a/Source/Initialization/PlasmaInjector.cpp
 +++ b/Source/Initialization/PlasmaInjector.cpp
 @@ -41,6 +41,7 @@
- 
+
  #include <algorithm>
  #include <cctype>
 +#include <cstring>
@@ -210,7 +211,7 @@ index 97c66605..a95d5b95 100644
  #include <memory>
  #include <set>
 diff --git a/Source/Particles/ParticleCreation/AddParticles.cpp b/Source/Particles/ParticleCreation/AddParticles.cpp
-index 93b25f6a..539bd527 100644
+index 93b25f6a4..539bd5275 100644
 --- a/Source/Particles/ParticleCreation/AddParticles.cpp
 +++ b/Source/Particles/ParticleCreation/AddParticles.cpp
 @@ -777,6 +777,10 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
@@ -225,9 +226,9 @@ index 93b25f6a..539bd527 100644
      const amrex::Real beta_boost = WarpX::beta_boost;
      const amrex::Real t = WarpX::GetInstance().gett_new(lev);
 @@ -1204,6 +1208,64 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
- 
+
          amrex::Gpu::synchronize();
- 
+
 +#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) && defined(WARPX_DIM_XZ)
 +        if (sycl_parser_momentum && max_new_particles > 0) {
 +            const auto np = static_cast<std::size_t>(max_new_particles);
@@ -289,26 +290,12 @@ index 93b25f6a..539bd527 100644
          if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
          {
              wt = static_cast<amrex::Real>(amrex::second()) - wt;
-diff --git a/Source/Particles/PhysicalParticleContainer.cpp b/Source/Particles/PhysicalParticleContainer.cpp
-index a2c6d874..10daad2c 100644
---- a/Source/Particles/PhysicalParticleContainer.cpp
-+++ b/Source/Particles/PhysicalParticleContainer.cpp
-@@ -429,7 +429,9 @@ PhysicalParticleContainer::BackwardCompatibility ()
- void PhysicalParticleContainer::InitData ()
- {
-     AddParticles(0); // Note - add on level 0
-+    (void) TotalNumberOfParticles(/*only_valid=*/false, /*only_local=*/true);
-     Redistribute();  // We then redistribute
-+    (void) TotalNumberOfParticles(/*only_valid=*/false, /*only_local=*/true);
- }
- 
- void
 diff --git a/Source/WarpX.cpp b/Source/WarpX.cpp
-index 1b039603..b78e389d 100644
+index 1b0396033..b78e389de 100644
 --- a/Source/WarpX.cpp
 +++ b/Source/WarpX.cpp
 @@ -1464,7 +1464,11 @@ WarpX::ReadParameters ()
- 
+
              // default sort interval for particles if species or lasers vector is not empty
  #ifdef AMREX_USE_GPU
 +#  if defined(AMREX_USE_SYCL) && (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__ADAPTIVECPP__) || defined(__HIPSYCL__))
@@ -320,7 +307,7 @@ index 1b039603..b78e389d 100644
              sort_intervals_string_vec = {"-1"};
  #endif
 @@ -1472,6 +1476,15 @@ WarpX::ReadParameters ()
- 
+
          const amrex::ParmParse pp_warpx("warpx");
          pp_warpx.queryarr("sort_intervals", sort_intervals_string_vec);
 +#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) &&     (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) ||      defined(__ADAPTIVECPP__) || defined(__HIPSYCL__))
@@ -333,5 +320,5 @@ index 1b039603..b78e389d 100644
 +        }
 +#endif
          sort_intervals = utils::parser::IntervalsParser(sort_intervals_string_vec);
- 
+
          Vector<int> vect_sort_bin_size(AMREX_SPACEDIM,1);
