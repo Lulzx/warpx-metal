@@ -40,16 +40,18 @@ standard PIC benchmark suite used during validation.
 
 ## Reliability
 
-The backend includes resolved reliability controls for sustained heavy runs:
+The backend includes reliability controls for heavy runs:
 
 - Runtime Metal JIT compilation is serialized to bound system compiler-service
   memory and process pressure.
-- An opt-in system-memory guard, `warpx.max_system_memory_fraction`, is disabled
-  by default. When enabled, it aborts a too-large run cleanly before the node
-  stalls.
+- The system-memory guard uses reclaimable file-cache aware macOS memory
+  accounting, so cached file data no longer causes a false abort at the default
+  guard threshold.
 
-Together these prevent heavy runs from exhausting display/compiler resources
-instead of treating that failure mode as an operator caveat.
+Known limitation: sustained Metal particle-redistribution runs can still stall
+stochastically when a command buffer is committed and scheduled but its
+completion shared event never signals. Long production runs are not yet reliable;
+short runs and Metal validation-layer runs complete.
 
 ## Remaining Notes
 
