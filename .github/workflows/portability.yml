@@ -26,7 +26,7 @@ jobs:
 
     steps:
       - name: Check out patch repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install Linux build dependencies
         run: |
@@ -44,7 +44,7 @@ jobs:
             python3
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: .ccache
           key: ${{ runner.os }}-gcc-ccache-${{ hashFiles('patches/**', '.github/workflows/portability.yml') }}
@@ -96,22 +96,95 @@ jobs:
 
           source scripts/env.sh
 
-          apply_patch_dir() {
-            local repo_dir="$1"
-            local patch_dir="$2"
-            local label="$3"
-            local count=0
+          assert_exact_files() {
+            local dir="$1"
+            local label="$2"
+            shift 2
+            local expected=("$@")
+            local actual=()
+            local file
+
+            while IFS= read -r -d '' file; do
+              actual+=("$(basename "${file}")")
+            done < <(find "${dir}" -maxdepth 1 -type f ! -name '.gitkeep' -print0 | sort -z)
+
+            if (( ${#expected[@]} == 0 || ${#actual[@]} == 0 )); then
+              echo "::error::${label}: empty manifest is forbidden"
+              exit 1
+            fi
+            if (( ${#actual[@]} != ${#expected[@]} )); then
+              echo "::error::${label}: expected ${#expected[@]} file(s), found ${#actual[@]}"
+              printf 'expected: %s\n' "${expected[*]}"
+              printf 'actual: %s\n' "${actual[*]}"
+              exit 1
+            fi
+
+            local index
+            for index in "${!expected[@]}"; do
+              if [ "${actual[index]}" != "${expected[index]}" ]; then
+                echo "::error::${label}: manifest mismatch at index ${index}"
+                printf 'expected: %s\n' "${expected[*]}"
+                printf 'actual: %s\n' "${actual[*]}"
+                exit 1
+              fi
+            done
+
+            echo "${label}: exact ${#actual[@]}-file manifest verified"
+          }
+
+          assert_patch_manifest() {
+            local patch_dir="$1"
+            local label="$2"
+            shift 2
+            local expected=("$@")
+            local actual=()
             local patch
 
             while IFS= read -r -d '' patch; do
-              count=$((count + 1))
-              echo "::group::${label}: $(basename "${patch}")"
+              actual+=("$(basename "${patch}")")
+            done < <(find "${patch_dir}" -maxdepth 1 -type f -name '*.patch' -print0 | sort -z)
+
+            if (( ${#expected[@]} == 0 || ${#actual[@]} == 0 )); then
+              echo "::error::${label}: zero patches is forbidden"
+              exit 1
+            fi
+            if (( ${#actual[@]} != ${#expected[@]} )); then
+              echo "::error::${label}: expected ${#expected[@]} patch(es), found ${#actual[@]}"
+              printf 'expected: %s\n' "${expected[*]}"
+              printf 'actual: %s\n' "${actual[*]}"
+              exit 1
+            fi
+
+            local index
+            for index in "${!expected[@]}"; do
+              if [ "${actual[index]}" != "${expected[index]}" ]; then
+                echo "::error::${label}: manifest mismatch at index ${index}"
+                printf 'expected: %s\n' "${expected[*]}"
+                printf 'actual: %s\n' "${actual[*]}"
+                exit 1
+              fi
+            done
+
+            echo "${label}: exact ${#actual[@]}-patch manifest verified"
+          }
+
+          apply_patch_manifest() {
+            local repo_dir="$1"
+            local patch_dir="$2"
+            local label="$3"
+            shift 3
+            local manifest=("$@")
+            local patch
+
+            for patch in "${manifest[@]}"; do
+              echo "::group::${label}: ${patch}"
+              patch="${patch_dir}/${patch}"
               git -C "${repo_dir}" apply --check "${patch}"
               git -C "${repo_dir}" apply "${patch}"
               echo "::endgroup::"
-            done < <(find "${patch_dir}" -maxdepth 1 -name '*.patch' -print0 | sort -z)
+            done
 
-            echo "${label}: ${count} git patch(es) applied"
+            echo "${label}: ${#manifest[@]} git patch(es) applied"
           }
 
           copy_amrex_replacement() {
@@ -133,12 +206,29 @@ jobs:
             echo "AMReX replacement applied: ${dst}"
           }
 
-          apply_patch_dir "${AMREX_SOURCE_DIR}" "${PATCHES_DIR}/amrex" "AMReX pre"
+          amrex_replacements=(
+            AMReXSYCL.cmake
+            AMReX_Random.cpp
+            AMReX_RandomEngine.H
+          )
+          amrex_post_patches=(
+            0004-metal-pic-rng-reduction-fixes.patch
+          )
+          warpx_patches=(
+            0001-metal-source-identity.patch
+            0002-fix-addplasma-metal-parser-momentum-oob.patch
+            0003-correct-macos-memory-guard-available-memory.patch
+          )
+
+          assert_exact_files "${PATCHES_DIR}/amrex" "AMReX replacements" "${amrex_replacements[@]}"
+          assert_patch_manifest "${PATCHES_DIR}/amrex-post" "AMReX post" "${amrex_post_patches[@]}"
+          assert_patch_manifest "${PATCHES_DIR}/warpx" "WarpX" "${warpx_patches[@]}"
+
           copy_amrex_replacement "AMReXSYCL.cmake" "Tools/CMake/AMReXSYCL.cmake"
           copy_amrex_replacement "AMReX_RandomEngine.H" "Src/Base/AMReX_RandomEngine.H"
           copy_amrex_replacement "AMReX_Random.cpp" "Src/Base/AMReX_Random.cpp"
-          apply_patch_dir "${AMREX_SOURCE_DIR}" "${PATCHES_DIR}/amrex-post" "AMReX post"
-          apply_patch_dir "${WARPX_SOURCE_DIR}" "${PATCHES_DIR}/warpx" "WarpX"
+          apply_patch_manifest "${AMREX_SOURCE_DIR}" "${PATCHES_DIR}/amrex-post" "AMReX post" "${amrex_post_patches[@]}"
+          apply_patch_manifest "${WARPX_SOURCE_DIR}" "${PATCHES_DIR}/warpx" "WarpX" "${warpx_patches[@]}"
 
           git -C "${AMREX_SOURCE_DIR}" diff --check
           git -C "${WARPX_SOURCE_DIR}" diff --check

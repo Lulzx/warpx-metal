@@ -69,7 +69,7 @@ Detailed reports describe the failure mechanism, correction, validation scope,
 and remaining limitations for the keeper fixes:
 
 - [AddPlasma parser-momentum out-of-bounds access](reports/addplasma-parser-momentum-oob.md)
-- [AdaptiveCpp Metal device-to-host completion race](reports/adaptivecpp-d2h-shared-event-completion.md)
+- [AdaptiveCpp Metal device-to-host completion hardening](reports/adaptivecpp-d2h-shared-event-completion.md)
 - [macOS system-memory crashguard accounting](reports/macos-memory-crashguard.md)
 
 ## Requirements

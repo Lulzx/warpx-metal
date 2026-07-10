@@ -1,68 +1,65 @@
-# AdaptiveCpp Metal device-to-host completion race
+# AdaptiveCpp Metal device-to-host completion hardening
 
 ## Summary
 
-The Metal device-to-host staging path could commit a command buffer before its
-shared-event listener was registered. A fast command buffer could signal the
-intermediate event during that interval. The listener would then miss the
-notification, the final completion value would never be published, and a
-dependent wait could hang indefinitely.
+The Metal device-to-host staging path now establishes both completion callbacks
+before commit, serializes them through an atomic once-gate, and makes queue waits
+fail closed when Metal reports a command-buffer error. This is defensive
+completion hardening, not an established root-cause fix for the observed long-run
+stall.
 
-The keeper patch registers completion paths before commit and funnels them
-through an atomic once-gate.
+The causal run produced no missed shared-event notification. The change did not
+recover that run because the command buffer itself never completed. Metal shared
+event notifications are threshold-based: a listener is notified when the event
+value reaches or exceeds its requested value, so the previous commit-before-
+listener ordering did not by itself demonstrate an edge-triggered notification
+loss.
 
 Patch: [`patches/adaptivecpp/0018-metal-d2h-shared-event-completion.patch`](../patches/adaptivecpp/0018-metal-d2h-shared-event-completion.patch)
 
-## Defect mechanism
+## Completion model
 
 The transfer uses two shared-event values:
 
 - `val_blit` indicates that the GPU blit into the staging allocation completed.
 - `val_done` indicates that the host copy from staging into the destination is
-  complete.
+  complete, or that the transfer failed and the failure was recorded.
 
-Previously, the queue encoded `val_blit`, committed the command buffer, and
-only then registered the listener that performs the host copy and publishes
-`val_done`. Completion before listener registration created a missed-completion
-hang class: the blit was finished, but no callback advanced the event to
-`val_done`.
+The shared-event listener and command-buffer completion handler are both
+registered before `commit()`. They are equivalent success contenders: either can
+win the compare-and-swap gate. If the listener wins, it first waits for the
+command buffer to reach an authoritative terminal status. The winning callback
+then checks the command-buffer error before exposing staging bytes.
 
-## Correction
+On success, the winner copies all requested staging ranges to host memory and
+publishes `val_done`. The once-gate prevents a second callback from repeating
+the copy or signal. A zero-sized transfer naturally skips the copy loops and
+still publishes completion.
 
-The patch introduces a shared `std::atomic<bool>` and a `finish_d2h_once`
-closure. The closure uses `compare_exchange_strong` to claim completion once.
-The winning successful path copies all requested staging ranges to host memory
-and then publishes `val_done`; a later callback returns without repeating the
-copy or signal.
+## Fail-closed error semantics
 
-Both callback paths are established before `commit()`:
+On command-buffer error, the winner does not copy from the staging buffer. It
+stores the first failure in queue-owned shared state, registers the asynchronous
+error, and still publishes `val_done` so dependants and queue drains cannot hang
+behind an unreachable event value.
 
-1. The shared-event listener remains the preferred path after `val_blit`.
-2. The command-buffer completion handler is a fallback when listener delivery
-   is missed.
+`metal_inorder_queue::wait()` snapshots the recorded failure before waiting and
+checks again after the completion event is reached. It returns that failure to
+the SYCL queue wait path. AMReX synchronizes its SYCL streams with
+`wait_and_throw()`, so the registered failure is thrown before reduction code can
+consume unchanged or stale destination bytes.
 
-Either successful callback performs the same copy-then-publish sequence. The
-once-gate prevents double completion if both callbacks run. A zero-sized
-transfer naturally skips the copy loops and still publishes completion.
-
-## Error-path semantics
-
-If Metal reports a command-buffer error, the completion handler registers that
-error and claims the once-gate without copying the staging buffer. It then
-publishes `val_done` so queue progress cannot remain blocked forever.
-
-This is an explicit error-versus-hang trade-off. Host destination bytes are not
-valid on that path and may remain unchanged or stale. Correct consumers must
-observe the registered asynchronous error rather than treat event completion as
-proof that data is valid.
+Completion publication therefore means progress, not data validity. Data is
+valid only when the queue wait also reports success.
 
 ## Scope and validation boundary
 
-The change is confined to AdaptiveCpp's Metal queue implementation. Other
-AdaptiveCpp backends are not modified.
+The change is confined to AdaptiveCpp's Metal queue header and implementation.
+Other AdaptiveCpp backends are not modified.
 
-The patch applies cleanly to the pinned AdaptiveCpp source used by this package,
-and the patched `acpp-rt` target builds successfully. The ordering proof closes
-the commit-before-listener race and the completion-handler fallback closes the
-missed-listener hang class. It does not claim to correct unrelated cases where a
-Metal command buffer itself never reaches completion.
+The patch applies cleanly to the preserved AdaptiveCpp source revision used by
+this package. Both `acpp-rt` and the `rt-backend-metal` target that directly
+compiles `metal_queue.cpp` compile and link successfully. This proves the code
+path is syntactically and link-time compatible with that revision. It does not
+reproduce a Metal command-buffer failure, establish a missed-listener root
+cause, or correct a command buffer that never reaches completion.

@@ -1,8 +1,46 @@
+diff --git a/include/hipSYCL/runtime/metal/metal_queue.hpp b/include/hipSYCL/runtime/metal/metal_queue.hpp
+--- a/include/hipSYCL/runtime/metal/metal_queue.hpp
++++ b/include/hipSYCL/runtime/metal/metal_queue.hpp
+@@ -24,6 +24,9 @@
+
+ #include <mach/mach_time.h>
+
++#include <memory>
++#include <mutex>
++
+ namespace MTL {
+
+ class Device;
+@@ -155,6 +158,11 @@ public:
+   virtual ~metal_inorder_queue();
+
+ private:
++  struct async_error_state {
++    std::mutex mutex;
++    result error;
++  };
++
+   MTL::CommandBuffer* new_command_buffer();
+   void profiling_setup(operation& op, const dag_node_ptr& node);
+
+@@ -171,6 +179,12 @@ private:
+   uint64_t _pending_cpu_event{0};
+   uint64_t _pending_gpu_event{0};
+
++  // Command-buffer callbacks outlive individual submissions. Keep their first
++  // asynchronous failure available to queue waits so a published completion
++  // value cannot make invalid device-to-host data look usable.
++  std::shared_ptr<async_error_state> _async_error_state =
++    std::make_shared<async_error_state>();
++
+   metal_allocator* _allocator = nullptr;
+   device_id _device_id;
+
 diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
 --- a/src/runtime/metal/metal_queue.cpp
 +++ b/src/runtime/metal/metal_queue.cpp
 @@ -20,9 +20,11 @@
- 
+
  #include <Metal/Metal.hpp>
  #include <algorithm>
 +#include <atomic>
@@ -13,65 +51,108 @@ diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.c
  #include <mutex>
  #include <sstream>
  #include <unordered_map>
-@@ -877,20 +879,15 @@
-     auto val = _event_counter.fetch_add(2);
+@@ -872,33 +874,65 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
      auto val_blit = val + 1;
      auto val_done = val + 2;
--
+
 -    command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
--      if (NS::Error* err = cb->error()) {
--        std::string msg = "metal_queue: Memcpy (device→host) failed: ";
--        if (err->localizedDescription()) msg += err->localizedDescription()->utf8String();
--        register_error(make_error(__acpp_here(), error_info{msg}));
--      }
--    });
- 
--    command_buffer->encodeSignalEvent(_shared_event, val_blit);
--    command_buffer->commit();
 +    auto d2h_completion_published = std::make_shared<std::atomic<bool>>(false);
-+    auto finish_d2h_once = [=](MTL::SharedEvent* evt, bool copy_staging_buffer) {
++    auto async_error_state = _async_error_state;
++    auto finish_d2h_once = [=](MTL::SharedEvent* evt,
++                               MTL::CommandBuffer* cb,
++                               bool wait_for_command_buffer) {
 +      bool expected = false;
 +      if (!d2h_completion_published->compare_exchange_strong(expected, true)) {
 +        return;
 +      }
- 
--    _shared_event->notifyListener(_event_listener, val_blit,
--      ^(MTL::SharedEvent* evt, uint64_t) {
-+      if (copy_staging_buffer) {
-         for (std::size_t surface = 0; surface < transferred_range[0]; ++surface) {
-           for (std::size_t row = 0; row < transferred_range[1]; ++row) {
-             id<3> src = dst_staging_offset; src[0] += surface; src[1] += row;
-@@ -903,8 +900,32 @@
-             memcpy(dst_byte_ptr, src_byte_ptr, transferred_range[2] * dest_element_size);
-           }
-         }
--        evt->setSignaledValue(val_done);
++
++      // A shared-event notification can race the command-buffer completion
++      // callback. Do not expose staging bytes until the command buffer has an
++      // authoritative success status.
++      if (wait_for_command_buffer) {
++        cb->waitUntilCompleted();
 +      }
++
+       if (NS::Error* err = cb->error()) {
+         std::string msg = "metal_queue: Memcpy (device→host) failed: ";
+         if (err->localizedDescription()) msg += err->localizedDescription()->utf8String();
+-        register_error(make_error(__acpp_here(), error_info{msg}));
++        auto failure = make_error(__acpp_here(), error_info{msg});
++        {
++          std::lock_guard<std::mutex> lock{async_error_state->mutex};
++          if (async_error_state->error.is_success()) {
++            async_error_state->error = failure;
++          }
++        }
++        register_error(failure);
++        evt->setSignaledValue(val_done);
++        return;
++      }
++
++      for (std::size_t surface = 0; surface < transferred_range[0]; ++surface) {
++        for (std::size_t row = 0; row < transferred_range[1]; ++row) {
++          id<3> src = dst_staging_offset; src[0] += surface; src[1] += row;
++          id<3> dst = dest_offset; dst[0] += surface; dst[1] += row;
++
++          const char* src_byte_ptr = (const char*)temp_buffer->contents() +
++            linear_index(src, dst_staging_shape) * dest_element_size;
++          char* dst_byte_ptr = (char*)dst_ptr +
++            linear_index(dst, dest_allocation_shape) * dest_element_size;
++          memcpy(dst_byte_ptr, src_byte_ptr, transferred_range[2] * dest_element_size);
++        }
+       }
 +
 +      evt->setSignaledValue(val_done);
 +    };
 +
 +    command_buffer->addCompletedHandler([=](MTL::CommandBuffer* cb) {
-+      if (NS::Error* err = cb->error()) {
-+        std::string msg = "metal_queue: Memcpy (device→host) failed: ";
-+        if (err->localizedDescription()) msg += err->localizedDescription()->utf8String();
-+        register_error(make_error(__acpp_here(), error_info{msg}));
-+        finish_d2h_once(_shared_event, false);
-+        return;
-+      }
-+
-+      // Listener delivery is the preferred path. This fallback closes a
-+      // missed-listener race: completion proves the staging blit is done, so the
-+      // host copy and val_done publication must still happen.
-+      finish_d2h_once(_shared_event, true);
-+    });
-+
-+    command_buffer->encodeSignalEvent(_shared_event, val_blit);
-+    _shared_event->notifyListener(_event_listener, val_blit,
-+      ^(MTL::SharedEvent* evt, uint64_t) {
-+        finish_d2h_once(evt, true);
++      finish_d2h_once(_shared_event, cb, false);
+     });
+
+     command_buffer->encodeSignalEvent(_shared_event, val_blit);
+-    command_buffer->commit();
+-
++    auto listener_command_buffer = NS::RetainPtr(command_buffer);
+     _shared_event->notifyListener(_event_listener, val_blit,
+       ^(MTL::SharedEvent* evt, uint64_t) {
+-        for (std::size_t surface = 0; surface < transferred_range[0]; ++surface) {
+-          for (std::size_t row = 0; row < transferred_range[1]; ++row) {
+-            id<3> src = dst_staging_offset; src[0] += surface; src[1] += row;
+-            id<3> dst = dest_offset; dst[0] += surface; dst[1] += row;
+-
+-            const char* src_byte_ptr = (const char*)temp_buffer->contents() +
+-              linear_index(src, dst_staging_shape) * dest_element_size;
+-            char* dst_byte_ptr = (char*)dst_ptr +
+-              linear_index(dst, dest_allocation_shape) * dest_element_size;
+-            memcpy(dst_byte_ptr, src_byte_ptr, transferred_range[2] * dest_element_size);
+-          }
+-        }
+-        evt->setSignaledValue(val_done);
++        finish_d2h_once(evt, listener_command_buffer.get(), true);
        });
 +    command_buffer->commit();
- 
+
      _pending_gpu_event = val_done;
      _pending_cpu_event = val_done;
+@@ -998,8 +1032,20 @@ result metal_inorder_queue::submit_external_wait_for(const dag_node_ptr& node) {
+
+ result metal_inorder_queue::wait() {
+   HIPSYCL_DEBUG_INFO << "metal_queue: Waiting for queue completion..." << std::endl;
++
++  auto get_async_error = [this]() {
++    std::lock_guard<std::mutex> lock{_async_error_state->mutex};
++    return _async_error_state->error;
++  };
++
++  auto error_before_wait = get_async_error();
+   insert_event()->wait();
+-  return make_success();
++
++  if (!error_before_wait.is_success()) {
++    return error_before_wait;
++  }
++
++  return get_async_error();
+ }
+
+ device_id metal_inorder_queue::get_device() const {
