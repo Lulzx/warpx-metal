@@ -63,6 +63,15 @@ short runs and Metal validation-layer runs complete.
 - On the single-precision path, parser execution uses host-side momentum
   evaluation for particle injection so GPU and CPU setup match exactly.
 
+## Bugfix Reports
+
+Detailed reports describe the failure mechanism, correction, validation scope,
+and remaining limitations for the keeper fixes:
+
+- [AddPlasma parser-momentum out-of-bounds access](reports/addplasma-parser-momentum-oob.md)
+- [AdaptiveCpp Metal device-to-host completion race](reports/adaptivecpp-d2h-shared-event-completion.md)
+- [macOS system-memory crashguard accounting](reports/macos-memory-crashguard.md)
+
 ## Requirements
 
 - Apple Silicon Mac
@@ -97,5 +106,6 @@ AdaptiveCpp JIT artifacts are cached by the runtime.
 - `patches/amrex/` - AMReX source patch and replacement files used by the build
   scripts.
 - `patches/warpx/` - WarpX source patch.
+- `reports/` - technical bugfix reports and validation boundaries.
 - `scripts/` - dependency, build, and validation helpers.
 - `tests/` and `benchmarks/` - small validation inputs and benchmark fixtures.

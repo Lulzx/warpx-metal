@@ -2,7 +2,7 @@ name: Portability
 
 on:
   push:
-    branches: [ci/portability]
+    branches: [ci/portability, ci/portability-r2-scratch]
   pull_request:
     branches: [main]
   workflow_dispatch: {}
