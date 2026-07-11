@@ -83,6 +83,19 @@ and remaining limitations for the keeper fixes:
 The scripts use Homebrew packages including `llvm@20`, `llvm@18`, `boost`,
 `cmake`, `ninja`, and `libomp`.
 
+## Local CI
+
+Run the pinned host-platform CPU build from the repository root:
+
+```bash
+nice -n 15 ./ci/run-local-ci.sh
+```
+
+The script explicitly applies the packaged AMReX and WarpX portability patches,
+then configures, compiles, and link-checks a non-Metal CPU build. See
+[`ci/README.md`](ci/README.md) for dependencies and the precise host-platform
+and Linux-coverage boundaries.
+
 ## Build Flow
 
 From the repository root:
