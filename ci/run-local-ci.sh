@@ -195,7 +195,9 @@ for source in sources:
         if argument in {"-o", "-MF", "-MT", "-MQ"}:
             skip_next = True
             continue
-        if argument in {"-c", "-MD", "-MMD"} or os.path.realpath(argument) == source:
+        argument_path = argument if os.path.isabs(argument) \
+            else os.path.join(entry["directory"], argument)
+        if argument in {"-c", "-MD", "-MMD"} or os.path.realpath(argument_path) == source:
             continue
         filtered.append(argument)
 
@@ -217,8 +219,8 @@ cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}"
 
 binaries=()
 while IFS= read -r binary; do
-    binaries+=("${binary}")
-done < <(find "${BUILD_DIR}/bin" -maxdepth 1 -type f -perm -111 -name 'warpx.*' -print | sort)
+    [[ -x "${binary}" ]] && binaries+=("${binary}")
+done < <(find "${BUILD_DIR}/bin" -maxdepth 1 -type f -name 'warpx.*' -print | sort)
 
 BINARY_COUNT="${#binaries[@]}"
 (( BINARY_COUNT > 0 )) || fail "no linked WarpX executable found"
