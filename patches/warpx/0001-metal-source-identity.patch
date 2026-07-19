@@ -1,5 +1,5 @@
 diff --git a/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp b/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp
-index 6f3744676..f4dbc3b52 100644
+index 6f374467..f4dbc3b5 100644
 --- a/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp
 +++ b/Source/Diagnostics/FlushFormats/FlushFormatPlotfile.cpp
 @@ -438,6 +438,24 @@ FlushFormatPlotfile::WriteParticles(const std::string& dir,
@@ -64,13 +64,13 @@ index 6f3744676..f4dbc3b52 100644
 +#endif
              particlesConvertUnits(ConvertDirection::SI_to_WarpX, pinned_pc, mass);
          }
-
+ 
 diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
-index 21af87bd1..75f582a14 100644
+index 889894e7..b2cf3b29 100644
 --- a/Source/Evolve/WarpXEvolve.cpp
 +++ b/Source/Evolve/WarpXEvolve.cpp
 @@ -54,10 +54,20 @@
-
+ 
  #include <algorithm>
  #include <array>
 +#include <cerrno>
@@ -81,7 +81,7 @@ index 21af87bd1..75f582a14 100644
  #include <ostream>
 +#include <sstream>
  #include <vector>
-
+ 
 +#ifdef __APPLE__
 +#include <mach/mach.h>
 +#include <sys/sysctl.h>
@@ -89,7 +89,7 @@ index 21af87bd1..75f582a14 100644
 +
  using namespace amrex;
  using ablastr::utils::SignalHandling;
-
+ 
 @@ -107,6 +117,91 @@ namespace
              }
          }
@@ -180,30 +180,30 @@ index 21af87bd1..75f582a14 100644
 +        amrex::Abort(msg.str());
 +    }
  }
-
+ 
  void
 @@ -152,6 +247,7 @@ WarpX::Evolve (int numsteps)
      using ablastr::fields::Direction;
-
+ 
      Real cur_time = t_new[0];
 +    ::CheckSystemMemoryPressure();
-
+ 
      // Note that the default argument is numsteps = -1
      const int numsteps_max = (numsteps < 0)?(max_step):(istep[0] + numsteps);
 @@ -169,6 +265,7 @@ WarpX::Evolve (int numsteps)
-
+ 
          // Check and clear signal flags and asynchronously broadcast them from process 0
          SignalHandling::CheckSignals();
 +        ::CheckSystemMemoryPressure();
-
+ 
          multi_diags->NewIteration();
-
+ 
 diff --git a/Source/Initialization/PlasmaInjector.cpp b/Source/Initialization/PlasmaInjector.cpp
-index 97c66605e..a95d5b95d 100644
+index 97c66605..a95d5b95 100644
 --- a/Source/Initialization/PlasmaInjector.cpp
 +++ b/Source/Initialization/PlasmaInjector.cpp
 @@ -41,6 +41,7 @@
-
+ 
  #include <algorithm>
  #include <cctype>
 +#include <cstring>
@@ -211,7 +211,7 @@ index 97c66605e..a95d5b95d 100644
  #include <memory>
  #include <set>
 diff --git a/Source/Particles/ParticleCreation/AddParticles.cpp b/Source/Particles/ParticleCreation/AddParticles.cpp
-index 93b25f6a4..539bd5275 100644
+index c0a1c4ef..aa63b50f 100644
 --- a/Source/Particles/ParticleCreation/AddParticles.cpp
 +++ b/Source/Particles/ParticleCreation/AddParticles.cpp
 @@ -777,6 +777,10 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
@@ -226,9 +226,9 @@ index 93b25f6a4..539bd5275 100644
      const amrex::Real beta_boost = WarpX::beta_boost;
      const amrex::Real t = WarpX::GetInstance().gett_new(lev);
 @@ -1204,6 +1208,64 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
-
+ 
          amrex::Gpu::synchronize();
-
+ 
 +#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) && defined(WARPX_DIM_XZ)
 +        if (sycl_parser_momentum && max_new_particles > 0) {
 +            const auto np = static_cast<std::size_t>(max_new_particles);
@@ -291,11 +291,11 @@ index 93b25f6a4..539bd5275 100644
          {
              wt = static_cast<amrex::Real>(amrex::second()) - wt;
 diff --git a/Source/WarpX.cpp b/Source/WarpX.cpp
-index 1b0396033..b78e389de 100644
+index 0a6adbb5..e73dda29 100644
 --- a/Source/WarpX.cpp
 +++ b/Source/WarpX.cpp
-@@ -1464,7 +1464,11 @@ WarpX::ReadParameters ()
-
+@@ -1475,7 +1475,11 @@ WarpX::ReadParameters ()
+ 
              // default sort interval for particles if species or lasers vector is not empty
  #ifdef AMREX_USE_GPU
 +#  if defined(AMREX_USE_SYCL) && (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__ADAPTIVECPP__) || defined(__HIPSYCL__))
@@ -306,19 +306,3 @@ index 1b0396033..b78e389de 100644
  #else
              sort_intervals_string_vec = {"-1"};
  #endif
-@@ -1472,6 +1476,15 @@ WarpX::ReadParameters ()
-
-         const amrex::ParmParse pp_warpx("warpx");
-         pp_warpx.queryarr("sort_intervals", sort_intervals_string_vec);
-+#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) &&     (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) ||      defined(__ADAPTIVECPP__) || defined(__HIPSYCL__))
-+        if (!(sort_intervals_string_vec.size() == 1 && sort_intervals_string_vec[0] == "-1")) {
-+            ablastr::warn_manager::WMRecordWarning(
-+                "Particles",
-+                "Disabling warpx.sort_intervals on AdaptiveCpp/HipSYCL SYCL because the Metal GPU sort path corrupts particle attributes on this backend.",
-+                ablastr::warn_manager::WarnPriority::high);
-+            sort_intervals_string_vec = {"-1"};
-+        }
-+#endif
-         sort_intervals = utils::parser::IntervalsParser(sort_intervals_string_vec);
-
-         Vector<int> vect_sort_bin_size(AMREX_SPACEDIM,1);

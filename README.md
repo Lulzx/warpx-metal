@@ -81,8 +81,11 @@ for recovery semantics and tuning.
 - GPU atomic deposition is not expected to be run-to-run bitwise deterministic;
   this is standard for GPU PIC. Validated comparisons use physics observables
   and CPU agreement.
-- Particle sorting is disabled on the Metal backend pending an upstream sort
-  fix.
+- Particle sorting is enabled (default `sort_intervals = 4`). The earlier
+  sort corruption traced to the decoupled-lookback scan's 64-bit atomics,
+  which Metal lacks; the Metal path now uses the multipass scan and sorting
+  validates cleanly (exact particle counts, energies within atomic-deposition
+  tolerance).
 - On the single-precision path, parser execution uses host-side momentum
   evaluation for particle injection so GPU and CPU setup match exactly.
 

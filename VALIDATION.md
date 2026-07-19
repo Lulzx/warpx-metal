@@ -51,6 +51,10 @@ guard). Results on Apple M4 Pro (12 CPU cores, 16 GPU cores, 24 GB):
 - AMReX HeatEquation on Metal GPU (`04-validate-amrex.sh`): PASS.
 - **WarpX Langmuir 2D: 40/40 steps complete on Metal GPU.**
 - **WarpX Langmuir 3D: 20/20 steps complete on Metal GPU.**
+- **Particle sorting re-enabled and validated**: Langmuir 2D with
+  `sort_intervals = 4` matches the sorting-off run exactly on particle count
+  (131,072 over 40 steps) and within `1.6e-7` on particle energy; the former
+  sort-disable override has been removed from the WarpX patch set.
 
 Two silent-corruption classes were found and eliminated during this
 revalidation:
