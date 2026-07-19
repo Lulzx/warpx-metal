@@ -50,8 +50,11 @@ if [ "${PATCH_COUNT}" -gt 0 ]; then
             echo "  [..] Applying ${PATCH_NAME}..."
             git apply "${patch}"
             echo "  [OK] Applied ${PATCH_NAME}"
+        elif git apply --reverse --check "${patch}" 2>/dev/null; then
+            echo "  [OK] ${PATCH_NAME} already applied"
         else
-            echo "  [SKIP] ${PATCH_NAME} (already applied or conflicts)"
+            echo "  [FAIL] ${PATCH_NAME} does not apply cleanly" >&2
+            exit 1
         fi
     done
 fi
@@ -174,8 +177,11 @@ if [ -d "${AMREX_POST_PATCH_DIR}" ]; then
                 echo "  [..] Applying ${PATCH_NAME}..."
                 git apply "${patch}"
                 echo "  [OK] Applied ${PATCH_NAME}"
+            elif git apply --reverse --check "${patch}" 2>/dev/null; then
+                echo "  [OK] ${PATCH_NAME} already applied"
             else
-                echo "  [SKIP] ${PATCH_NAME} (already applied or conflicts)"
+                echo "  [FAIL] ${PATCH_NAME} does not apply cleanly" >&2
+                exit 1
             fi
         done
     else
