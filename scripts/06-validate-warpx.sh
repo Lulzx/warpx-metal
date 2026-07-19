@@ -68,7 +68,9 @@ run_test() {
     local EXIT_CODE=0
     "${EXECUTABLE}" "${INPUT_FILE}" \
         max_step="${MAX_STEP}" \
+        diagnostics.diags_names=diag1 \
         diag1.intervals=99999 \
+        diag1.format=plotfile \
         > "${LOG}" 2>&1 || EXIT_CODE=$?
 
     if [ ${EXIT_CODE} -ne 0 ]; then
