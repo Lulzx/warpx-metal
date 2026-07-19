@@ -94,6 +94,6 @@ were also checked directly against the packaged patch.
 
 This is a coarse host-memory safety guard, not a predictor for all Metal driver
 or compiler behavior. Fixed thresholds can miss shorter pressure bursts, and
-Darwin's page categories do not provide perfect ownership information. The
-guard also does not resolve the separately documented long-run shared-event
-stall.
+Darwin's page categories do not provide perfect ownership information. This
+guard is independent of the later
+[Metal in-order readback correction](adaptivecpp-metal-inorder-readback.md).

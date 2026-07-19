@@ -66,8 +66,9 @@ completed with:
 - out-of-bounds buffer reports: 0
 
 This establishes removal of the reported memory-safety defect in the validated
-configuration. It does not establish that this defect caused every separate
-Metal runtime stall.
+configuration. The separate runtime stall is contained—but an underlying driver
+completion loss is not repaired—by the
+[Metal in-order readback correction](adaptivecpp-metal-inorder-readback.md).
 
 ## Residual limitation
 

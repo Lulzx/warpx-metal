@@ -1,5 +1,11 @@
 # AdaptiveCpp Metal device-to-host completion hardening
 
+> Historical note: this defensive change did not fix the hang. The later
+> [in-order readback correction](adaptivecpp-metal-inorder-readback.md)
+> fixes a separate cross-lane ordering defect, removes this shared-event
+> callback path, and bounds the wait. Evidence on macOS 26.5.x/M3 Ultra still
+> points to an underlying Metal completion-loss issue.
+
 ## Summary
 
 The Metal device-to-host staging path now establishes both completion callbacks

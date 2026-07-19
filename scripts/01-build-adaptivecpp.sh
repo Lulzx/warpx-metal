@@ -123,11 +123,12 @@ echo "=== Step 6: Verify installation ==="
 if [ -x "${ACPP_INSTALL_PREFIX}/bin/acpp-info" ]; then
     echo ""
     echo "--- acpp-info output ---"
-    "${ACPP_INSTALL_PREFIX}/bin/acpp-info" || true
+    ACPP_INFO_OUTPUT="$("${ACPP_INSTALL_PREFIX}/bin/acpp-info" 2>&1 || true)"
+    echo "${ACPP_INFO_OUTPUT}"
     echo "------------------------"
     echo ""
 
-    if "${ACPP_INSTALL_PREFIX}/bin/acpp-info" 2>&1 | grep -qi "metal\|apple\|gpu"; then
+    if grep -Eqi "metal|apple|gpu" <<< "${ACPP_INFO_OUTPUT}"; then
         echo "  [OK] Metal device detected by acpp-info"
     else
         echo "  [WARN] acpp-info ran but no Metal device detected."

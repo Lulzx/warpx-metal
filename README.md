@@ -42,16 +42,22 @@ standard PIC benchmark suite used during validation.
 
 The backend includes reliability controls for heavy runs:
 
-- Runtime Metal JIT compilation is serialized to bound system compiler-service
-  memory and process pressure.
+- Runtime Metal JIT compilation and queue submission are serialized to preserve
+  SYCL in-order semantics and bound system compiler-service pressure.
 - The system-memory guard uses reclaimable file-cache aware macOS memory
   accounting, so cached file data no longer causes a false abort at the default
   guard threshold.
+- Device-to-host readback no longer depends on the completion shared-event
+  callback cycle. Producer and blit completion are explicit and bounded; a
+  Metal command buffer that does not reach a terminal state returns a timeout
+  error instead of hanging indefinitely.
+- Any remaining host-side shared-event wait is bounded by the same deadline and
+  reports the requested and last observed event values when it expires.
 
-Known limitation: sustained Metal particle-redistribution runs can still stall
-stochastically when a command buffer is committed and scheduled but its
-completion shared event never signals. Long production runs are not yet reliable;
-short runs and Metal validation-layer runs complete.
+This is containment, not a Metal driver repair. On affected macOS/M3 Ultra
+systems, a driver-lost command-buffer completion can still make the run fail
+after the timeout. Sustained particle-redistribution runs must be qualified on
+the target OS and hardware before being treated as production-reliable.
 
 ## Remaining Notes
 
@@ -70,6 +76,7 @@ and remaining limitations for the keeper fixes:
 
 - [AddPlasma parser-momentum out-of-bounds access](reports/addplasma-parser-momentum-oob.md)
 - [AdaptiveCpp Metal device-to-host completion hardening](reports/adaptivecpp-d2h-shared-event-completion.md)
+- [AdaptiveCpp Metal in-order readback and bounded completion](reports/adaptivecpp-metal-inorder-readback.md)
 - [macOS system-memory crashguard accounting](reports/macos-memory-crashguard.md)
 
 ## Requirements

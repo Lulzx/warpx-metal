@@ -32,6 +32,7 @@ tests/sycl/device_query
 tests/sycl/vector_add
 tests/sycl/usm_test
 tests/sycl/reduction_test
+tests/sycl/d2h_stress_test
 tests/amrex/heat_equation/build/
 
 # WarpX test output files (runtime artifacts)

@@ -1,0 +1,448 @@
+diff --git a/include/hipSYCL/runtime/metal/metal_backend.hpp b/include/hipSYCL/runtime/metal/metal_backend.hpp
+index e06d701f..04262e8b 100644
+--- a/include/hipSYCL/runtime/metal/metal_backend.hpp
++++ b/include/hipSYCL/runtime/metal/metal_backend.hpp
+@@ -12,6 +12,7 @@
+ #define HIPSYCL_METAL_BACKEND_HPP
+
+ #include "../backend.hpp"
++#include "../inorder_executor.hpp"
+ #include "../multi_queue_executor.hpp"
+ #include "hipSYCL/runtime/metal/metal_hardware_manager.hpp"
+
+@@ -40,7 +41,7 @@ public:
+   create_inorder_executor(device_id dev, int priority) override;
+ private:
+   mutable metal_hardware_manager _hw;
+-  mutable lazily_constructed_executor<multi_queue_executor> _executor;
++  mutable lazily_constructed_executor<inorder_executor> _executor;
+ };
+
+ } // namespace rt
+diff --git a/include/hipSYCL/runtime/metal/metal_queue.hpp b/include/hipSYCL/runtime/metal/metal_queue.hpp
+index 46c77b64..a82832b5 100644
+--- a/include/hipSYCL/runtime/metal/metal_queue.hpp
++++ b/include/hipSYCL/runtime/metal/metal_queue.hpp
+@@ -164,6 +164,8 @@ private:
+   };
+
+   MTL::CommandBuffer* new_command_buffer();
++  void remember_submitted_command_buffer(MTL::CommandBuffer* command_buffer);
++  result wait_for_last_submitted_command_buffer(const char* operation);
+   void profiling_setup(operation& op, const dag_node_ptr& node);
+
+   MTL::Device* _device = nullptr;
+@@ -179,6 +181,12 @@ private:
+   uint64_t _pending_cpu_event{0};
+   uint64_t _pending_gpu_event{0};
+
++  // Metal may overlap command buffers from the same command queue. Retain the
++  // most recently submitted producer so host readback can establish an
++  // explicit completion boundary before encoding its blit.
++  MTL::CommandBuffer* _last_submitted_command_buffer = nullptr;
++  std::mutex _last_submitted_command_buffer_mutex;
++
+   // Command-buffer callbacks outlive individual submissions. Keep their first
+   // asynchronous failure available to queue waits so a published completion
+   // value cannot make invalid device-to-host data look usable.
+diff --git a/src/runtime/metal/metal_backend.cpp b/src/runtime/metal/metal_backend.cpp
+index 61f3c68e..70fad454 100644
+--- a/src/runtime/metal/metal_backend.cpp
++++ b/src/runtime/metal/metal_backend.cpp
+@@ -29,9 +29,8 @@ namespace rt {
+
+ metal_backend::metal_backend()
+   : _executor([this](){
+-    return std::make_unique<multi_queue_executor>(*this, [this](device_id dev) {
+-      return std::unique_ptr<metal_inorder_queue>(_hw.make_queue(dev.get_id()));
+-    });
++    std::unique_ptr<inorder_queue> queue{_hw.make_queue(0)};
++    return std::make_unique<inorder_executor>(std::move(queue));
+   })
+ {
+ }
+diff --git a/src/runtime/metal/metal_event.cpp b/src/runtime/metal/metal_event.cpp
+index 5c9a6cb5..baf667b2 100644
+--- a/src/runtime/metal/metal_event.cpp
++++ b/src/runtime/metal/metal_event.cpp
+@@ -12,6 +12,9 @@
+
+ #include <Metal/Metal.hpp>
+
++#include <chrono>
++#include <cstdlib>
++#include <sstream>
+ #include <thread>
+
+ namespace hipsycl {
+@@ -31,7 +34,27 @@ bool metal_node_event::is_complete() const {
+ }
+
+ void metal_node_event::wait() {
++  constexpr unsigned long long default_timeout_ms = 120'000;
++  unsigned long long timeout_ms = default_timeout_ms;
++  if (const char* env = std::getenv("ACPP_METAL_COMMAND_TIMEOUT_MS")) {
++    char* end = nullptr;
++    const auto requested = std::strtoull(env, &end, 10);
++    if (end != env && *end == '\0' && requested > 0) {
++      timeout_ms = requested;
++    }
++  }
++
++  const auto deadline =
++      std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
+   while (!_handle.event->waitUntilSignaledValue(_handle.value, 1000)) {
++    if (std::chrono::steady_clock::now() >= deadline) {
++      std::ostringstream message;
++      message << "metal_node_event: timed out after " << timeout_ms
++              << " ms waiting for shared-event value " << _handle.value
++              << "; current value is " << _handle.event->signaledValue();
++      register_error(make_error(__acpp_here(), error_info{message.str()}));
++      return;
++    }
+     std::this_thread::yield();
+   }
+ }
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index fa99aed2..3e23bc3d 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -21,12 +21,14 @@
+ #include <Metal/Metal.hpp>
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cstdlib>
+ #include <cstdint>
+ #include <iostream>
+ #include <memory>
+ #include <mutex>
+ #include <sstream>
++#include <thread>
+ #include <unordered_map>
+ #include <utility>
+
+@@ -52,6 +54,66 @@ static constexpr NS::UInteger metal_pointer_translation_table_buffer_index = 1;
+ static constexpr NS::UInteger metal_user_arg_buffer_offset = 2;
+ static constexpr NS::UInteger metal_pointer_translation_miss_buffer_index = 30;
+
++std::chrono::milliseconds metal_command_buffer_timeout() {
++  constexpr unsigned long long default_timeout_ms = 120'000;
++  unsigned long long timeout_ms = default_timeout_ms;
++  if (const char* env = std::getenv("ACPP_METAL_COMMAND_TIMEOUT_MS")) {
++    char* end = nullptr;
++    const auto requested = std::strtoull(env, &end, 10);
++    if (end != env && *end == '\0' && requested > 0) {
++      timeout_ms = requested;
++    }
++  }
++  return std::chrono::milliseconds{timeout_ms};
++}
++
++const char* metal_command_buffer_status_name(MTL::CommandBufferStatus status) {
++  switch (status) {
++  case MTL::CommandBufferStatusNotEnqueued: return "not-enqueued";
++  case MTL::CommandBufferStatusEnqueued: return "enqueued";
++  case MTL::CommandBufferStatusCommitted: return "committed";
++  case MTL::CommandBufferStatusScheduled: return "scheduled";
++  case MTL::CommandBufferStatusCompleted: return "completed";
++  case MTL::CommandBufferStatusError: return "error";
++  }
++  return "unknown";
++}
++
++result wait_for_metal_command_buffer(MTL::CommandBuffer* command_buffer,
++                                     const char* operation) {
++  const auto deadline =
++      std::chrono::steady_clock::now() + metal_command_buffer_timeout();
++  auto status = command_buffer->status();
++  while (status != MTL::CommandBufferStatusCompleted &&
++         status != MTL::CommandBufferStatusError) {
++    if (std::chrono::steady_clock::now() >= deadline) {
++      std::ostringstream message;
++      message << "metal_queue: " << operation << " timed out after "
++              << metal_command_buffer_timeout().count()
++              << " ms; command buffer remained "
++              << metal_command_buffer_status_name(status);
++      return make_error(__acpp_here(), error_info{message.str()});
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds{1});
++    status = command_buffer->status();
++  }
++
++  if (status == MTL::CommandBufferStatusError) {
++    std::string message = "metal_queue: ";
++    message += operation;
++    message += " failed";
++    if (NS::Error* error = command_buffer->error()) {
++      if (error->localizedDescription()) {
++        message += ": ";
++        message += error->localizedDescription()->utf8String();
++      }
++    }
++    return make_error(__acpp_here(), error_info{message});
++  }
++
++  return make_success();
++}
++
+ inline unsigned align_up(unsigned x, unsigned a) {
+   return (x + (a - 1)) & ~(a - 1);
+ }
+@@ -637,6 +699,32 @@ MTL::CommandBuffer* metal_inorder_queue::new_command_buffer() {
+   return cmd_buf;
+ }
+
++void metal_inorder_queue::remember_submitted_command_buffer(
++    MTL::CommandBuffer* command_buffer) {
++  command_buffer->retain();
++  std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
++  if (_last_submitted_command_buffer) {
++    _last_submitted_command_buffer->release();
++  }
++  _last_submitted_command_buffer = command_buffer;
++}
++
++result metal_inorder_queue::wait_for_last_submitted_command_buffer(
++    const char* operation) {
++  MTL::CommandBuffer* command_buffer = nullptr;
++  {
++    std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
++    command_buffer = std::exchange(_last_submitted_command_buffer, nullptr);
++  }
++  if (!command_buffer) {
++    return make_success();
++  }
++
++  auto completion = wait_for_metal_command_buffer(command_buffer, operation);
++  command_buffer->release();
++  return completion;
++}
++
+ void metal_inorder_queue::profiling_setup(operation& op, const dag_node_ptr& node) {
+   if (!node) {
+     return;
+@@ -671,6 +759,7 @@ std::shared_ptr<dag_node_event> metal_inorder_queue::insert_event() {
+   auto* cmd_buf = new_command_buffer();
+   cmd_buf->encodeSignalEvent(_shared_event, val);
+   cmd_buf->commit();
++  remember_submitted_command_buffer(cmd_buf);
+
+   return std::make_shared<metal_node_event>(metal_event_handle{_shared_event, val});
+ }
+@@ -748,6 +837,14 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+     return make_success();
+   }
+
++  if (src_is_device && !dst_is_device) {
++    auto producer_completion = wait_for_last_submitted_command_buffer(
++        "producer before device-to-host memcpy");
++    if (!producer_completion.is_success()) {
++      return producer_completion;
++    }
++  }
++
+   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+
+   profiling_setup(op, node);
+@@ -866,76 +963,32 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+   blit_encoder->endEncoding();
+
+   if (!dst_is_device) {
+-    // Device->host memcpy uses two event values on the shared event:
+-    // val_blit: GPU signals after blit; val_done: CPU signals after memcpy to host
+-    // The next command buffer waits on val_done so GPU cannot race ahead of the CPU copy
+-    // See: https://developer.apple.com/documentation/metal/synchronizing-events-between-a-gpu-and-the-cpu
+-    auto val = _event_counter.fetch_add(2);
+-    auto val_blit = val + 1;
+-    auto val_done = val + 2;
+-
+-    auto d2h_completion_published = std::make_shared<std::atomic<bool>>(false);
+-    auto async_error_state = _async_error_state;
+-    auto finish_d2h_once = [=](MTL::SharedEvent* evt,
+-                               MTL::CommandBuffer* cb,
+-                               bool wait_for_command_buffer) {
+-      bool expected = false;
+-      if (!d2h_completion_published->compare_exchange_strong(expected, true)) {
+-        return;
+-      }
+-
+-      // A shared-event notification can race the command-buffer completion
+-      // callback. Do not expose staging bytes until the command buffer has an
+-      // authoritative success status.
+-      if (wait_for_command_buffer) {
+-        cb->waitUntilCompleted();
+-      }
+-
+-      if (NS::Error* err = cb->error()) {
+-        std::string msg = "metal_queue: Memcpy (device→host) failed: ";
+-        if (err->localizedDescription()) msg += err->localizedDescription()->utf8String();
+-        auto failure = make_error(__acpp_here(), error_info{msg});
+-        {
+-          std::lock_guard<std::mutex> lock{async_error_state->mutex};
+-          if (async_error_state->error.is_success()) {
+-            async_error_state->error = failure;
+-          }
+-        }
+-        register_error(failure);
+-        evt->setSignaledValue(val_done);
+-        return;
+-      }
++    // A device-to-host copy is a synchronization point for its caller. Keep it
++    // on the in-order command queue, wait for the blit itself to reach a
++    // terminal state, and only then expose the staging bytes. This avoids a
++    // GPU-signal -> CPU-listener -> GPU-wait shared-event cycle that could
++    // remain scheduled forever without reporting a Metal error.
++    command_buffer->commit();
+
+-      for (std::size_t surface = 0; surface < transferred_range[0]; ++surface) {
+-        for (std::size_t row = 0; row < transferred_range[1]; ++row) {
+-          id<3> src = dst_staging_offset; src[0] += surface; src[1] += row;
+-          id<3> dst = dest_offset; dst[0] += surface; dst[1] += row;
++    auto completion =
++        wait_for_metal_command_buffer(command_buffer, "device-to-host memcpy");
++    if (!completion.is_success()) {
++      return completion;
++    }
+
+-          const char* src_byte_ptr = (const char*)temp_buffer->contents() +
+-            linear_index(src, dst_staging_shape) * dest_element_size;
+-          char* dst_byte_ptr = (char*)dst_ptr +
+-            linear_index(dst, dest_allocation_shape) * dest_element_size;
+-          memcpy(dst_byte_ptr, src_byte_ptr, transferred_range[2] * dest_element_size);
+-        }
++    for (std::size_t surface = 0; surface < transferred_range[0]; ++surface) {
++      for (std::size_t row = 0; row < transferred_range[1]; ++row) {
++        id<3> src = dst_staging_offset; src[0] += surface; src[1] += row;
++        id<3> dst = dest_offset; dst[0] += surface; dst[1] += row;
++
++        const char* src_byte_ptr = (const char*)temp_buffer->contents() +
++          linear_index(src, dst_staging_shape) * dest_element_size;
++        char* dst_byte_ptr = (char*)dst_ptr +
++          linear_index(dst, dest_allocation_shape) * dest_element_size;
++        memcpy(dst_byte_ptr, src_byte_ptr,
++               transferred_range[2] * dest_element_size);
+       }
+-
+-      evt->setSignaledValue(val_done);
+-    };
+-
+-    command_buffer->addCompletedHandler([=](MTL::CommandBuffer* cb) {
+-      finish_d2h_once(_shared_event, cb, false);
+-    });
+-
+-    command_buffer->encodeSignalEvent(_shared_event, val_blit);
+-    auto listener_command_buffer = NS::RetainPtr(command_buffer);
+-    _shared_event->notifyListener(_event_listener, val_blit,
+-      ^(MTL::SharedEvent* evt, uint64_t) {
+-        finish_d2h_once(evt, listener_command_buffer.get(), true);
+-      });
+-    command_buffer->commit();
+-
+-    _pending_gpu_event = val_done;
+-    _pending_cpu_event = val_done;
++    }
+   } else {
+     if (deferred_h2d_done_event != 0) {
+       command_buffer->encodeSignalEvent(_shared_event, deferred_h2d_done_event);
+@@ -949,6 +1002,7 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+       }
+     });
+     command_buffer->commit();
++    remember_submitted_command_buffer(command_buffer);
+   }
+
+   return make_success();
+@@ -1001,7 +1055,12 @@ result metal_inorder_queue::submit_memset(memset_operation& op, const dag_node_p
+       error_info{"metal_queue: Failed to create command buffer for memset"});
+   }
+
+-  return memset_device(command_buffer, _allocator, ptr, pattern, num_bytes);
++  auto submission = memset_device(command_buffer, _allocator, ptr, pattern,
++                                  num_bytes);
++  if (submission.is_success()) {
++    remember_submitted_command_buffer(command_buffer);
++  }
++  return submission;
+ }
+
+ result metal_inorder_queue::submit_queue_wait_for(const dag_node_ptr& node) {
+@@ -1016,6 +1075,7 @@ result metal_inorder_queue::submit_queue_wait_for(const dag_node_ptr& node) {
+   auto* cmd_buf = new_command_buffer();
+   cmd_buf->encodeWait(handle.event, handle.value);
+   cmd_buf->commit();
++  remember_submitted_command_buffer(cmd_buf);
+
+   return make_success();
+ }
+@@ -1038,11 +1098,10 @@ result metal_inorder_queue::wait() {
+     return _async_error_state->error;
+   };
+
+-  auto error_before_wait = get_async_error();
+-  insert_event()->wait();
+-
+-  if (!error_before_wait.is_success()) {
+-    return error_before_wait;
++  auto producer_completion =
++      wait_for_last_submitted_command_buffer("queue completion");
++  if (!producer_completion.is_success()) {
++    return producer_completion;
+   }
+
+   return get_async_error();
+@@ -1056,8 +1115,16 @@ void* metal_inorder_queue::get_native_type() const {
+ }
+
+ result metal_inorder_queue::query_status(inorder_queue_status& status) {
+-  auto current = _event_counter.load();
+-  status = inorder_queue_status{_shared_event->signaledValue() >= current};
++  std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
++  if (!_last_submitted_command_buffer) {
++    status = inorder_queue_status{true};
++    return make_success();
++  }
++
++  const auto command_status = _last_submitted_command_buffer->status();
++  status = inorder_queue_status{
++      command_status == MTL::CommandBufferStatusCompleted ||
++      command_status == MTL::CommandBufferStatusError};
+   return make_success();
+ }
+
+@@ -1230,8 +1297,9 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+       error_info{"metal_queue: Metal library is null"});
+   }
+
+-  return launch_kernel_from_library(
+-    library, _device, nullptr, std::string{}, new_command_buffer(), _allocator,
++  auto* command_buffer = new_command_buffer();
++  auto submission = launch_kernel_from_library(
++    library, _device, nullptr, std::string{}, command_buffer, _allocator,
+     kernel_name,
+     num_groups, group_size, local_mem_size,
+     _arg_mapper.get_mapped_args(),
+@@ -1239,6 +1307,10 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+     _arg_mapper.get_mapped_num_args(),
+     kernel_info,
+     retained_indices);
++  if (submission.is_success()) {
++    remember_submitted_command_buffer(command_buffer);
++  }
++  return submission;
+
+ #else
+   return make_error(__acpp_here(),
+@@ -1251,6 +1323,12 @@ metal_inorder_queue::~metal_inorder_queue() {
+   // Drain pending work before releasing queue-owned Metal objects that may be
+   // referenced by completion handlers.
+   wait();
++  {
++    std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
++    if (_last_submitted_command_buffer) {
++      _last_submitted_command_buffer->release();
++    }
++  }
+   _event_listener->release();
+   _shared_event->release();
+   _command_queue->release();
