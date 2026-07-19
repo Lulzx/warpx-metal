@@ -55,7 +55,9 @@ The fraction gate remains configurable with `WARPX_MAX_MEM_FRACTION` and uses
 the corrected available-memory estimate. Two additional signals catch cases
 where a single reclaimable-memory snapshot is insufficient:
 
-- A Darwin memory-pressure level greater than 1 is treated as abnormal.
+- A Darwin memory-pressure level of critical (4) or above is treated as
+  abnormal. Warning level (2) is routine on macOS and does not abort on its
+  own.
 - Compressor growth of at least 512 MiB together with swapout growth of at
   least 128 MiB must occur for two consecutive sampling intervals.
 
