@@ -109,6 +109,12 @@ ninja -j"${NPROC}"
 echo ""
 echo "=== Step 5: Install ==="
 
+# Remove the previous install first: upstream moved libraries between
+# directories (e.g. lib/libllvm-to-metal.dylib -> lib/hipSYCL/llvm-to-backend/),
+# and a stale copy at the old path gets loaded in preference to the new one,
+# silently pairing an old JIT emitter with a new runtime.
+rm -rf "${ACPP_INSTALL_PREFIX}"
+
 ninja install
 
 echo ""
