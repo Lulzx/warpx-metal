@@ -37,7 +37,14 @@ if (_amrex_sycl_adaptivecpp)
     # Disable __int128 support: the Metal emitter cannot translate i128
     # (maps to uint4 in MSL, casts unsupported). All i128 codepaths
     # (umulhi, FastDivmodU64) have safe non-128 fallbacks.
-    target_compile_definitions(SYCL INTERFACE AMREX_NO_INT128 AMREX_SYCL_NO_MULTIPASS_SCAN)
+    #
+    # Do NOT define AMREX_SYCL_NO_MULTIPASS_SCAN here: that forces the
+    # single-pass decoupled-lookback scan, whose BlockStatus packs
+    # {status, value} into a uint64_t and requires true 64-bit atomic
+    # exchange/load. Metal has no general 64-bit atomics, so the lookback
+    # scan cannot be made correct on this backend; the multipass scan is
+    # the only sound option.
+    target_compile_definitions(SYCL INTERFACE AMREX_NO_INT128)
 
 else()
     # ==============================================================
