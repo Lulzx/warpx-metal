@@ -37,6 +37,34 @@ systems.
 - x/y momentum: exact over 100 steps.
 - On-chip GPU-to-CPU equivalence: validated on all three systems.
 
+## Post-Merge Revalidation (Apple M4 Pro, 2026-07-19)
+
+The full stack was rebuilt from a clean state after merging PR #1 with the
+review follow-up fixes (AdaptiveCpp pinned to develop@`3733a56`, AMReX/WarpX
+pinned to their 26.06 revisions, MSL 3.2 fallback restored, install prefix
+wiped before reinstall, corrected 64-bit atomic emulation, multipass SYCL
+scan with the two-word `BlockStatus` on Metal, and the reworked memory
+guard). Results on Apple M4 Pro (12 CPU cores, 16 GPU cores, 24 GB):
+
+- SYCL smoke tests (`02-validate-metal.sh`): 4/4 pass
+  (device query, vector add, USM, reduction).
+- AMReX HeatEquation on Metal GPU (`04-validate-amrex.sh`): PASS.
+- **WarpX Langmuir 2D: 40/40 steps complete on Metal GPU.**
+- **WarpX Langmuir 3D: 20/20 steps complete on Metal GPU.**
+
+Two silent-corruption classes were found and eliminated during this
+revalidation:
+
+1. A stale `libllvm-to-metal.dylib` from an older install layout paired an
+   old JIT emitter with the new runtime, making every kernel a silent no-op.
+   The build scripts now wipe the install prefix before reinstalling.
+2. `AMREX_SYCL_NO_MULTIPASS_SCAN` forced AMReX's decoupled-lookback scan,
+   whose packed `BlockStatus` requires true 64-bit atomic exchange/load that
+   Metal does not provide; the previous emulation touched only the low 32
+   bits, silently corrupting prefix sums used by particle redistribution and
+   sorting. The Metal path now uses the multipass scan, and the lookback
+   kernel (single-block only) uses the fence-based two-word `BlockStatus`.
+
 ## Nondeterminism Note
 
 GPU charge/current deposition uses atomic adds. That means bitwise-identical
