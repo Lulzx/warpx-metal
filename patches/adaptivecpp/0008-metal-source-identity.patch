@@ -1946,7 +1946,7 @@ index 672578a6..643f7046 100644
  } // namespace rt
  } // namespace hipsycl
 diff --git a/src/runtime/metal/metal_code_object.cpp b/src/runtime/metal/metal_code_object.cpp
-index b9f76f1c..686cc475 100644
+index b9f76f1c..d4054442 100644
 --- a/src/runtime/metal/metal_code_object.cpp
 +++ b/src/runtime/metal/metal_code_object.cpp
 @@ -9,18 +9,143 @@
@@ -2093,7 +2093,7 @@ index b9f76f1c..686cc475 100644
  result build_metal_library_from_source(MTL::Library*& library,
                                         MTL::Device* device,
                                         const std::string& source) {
-@@ -30,6 +155,13 @@ result build_metal_library_from_source(MTL::Library*& library,
+@@ -30,9 +155,22 @@ result build_metal_library_from_source(MTL::Library*& library,
    }
  
    NS::Error* error = nullptr;
@@ -2106,8 +2106,17 @@ index b9f76f1c..686cc475 100644
 +  }
  
    NS::SharedPtr<MTL::CompileOptions> options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
++  // Use the highest MSL version available in our metal-cpp headers.
++  // LanguageVersion4_0 requires macOS 26+ metal-cpp; fall back to 3_2.
++#if defined(MTL_LANGUAGEVERSION_4_0) || __METAL_VERSION__ >= 400
    options->setLanguageVersion(MTL::LanguageVersion4_0);
-@@ -40,6 +172,15 @@ result build_metal_library_from_source(MTL::Library*& library,
++#else
++  options->setLanguageVersion(MTL::LanguageVersion3_2);
++#endif
+   options->setOptimizationLevel(MTL::LibraryOptimizationLevel::LibraryOptimizationLevelSize);
+ 
+   NS::String* sourceString = NS::String::string(source.c_str(),
+@@ -40,6 +178,15 @@ result build_metal_library_from_source(MTL::Library*& library,
  
    library = device->newLibrary(sourceString, options.get(), &error);
  
@@ -2123,7 +2132,7 @@ index b9f76f1c..686cc475 100644
    if (error) {
      std::string error_msg = "metal_code_object: Shader compilation failed";
      if (error->localizedDescription()) {
-@@ -61,19 +202,106 @@ result build_metal_library_from_source(MTL::Library*& library,
+@@ -61,19 +208,106 @@ result build_metal_library_from_source(MTL::Library*& library,
    return make_success();
  }
  
@@ -2234,7 +2243,7 @@ index b9f76f1c..686cc475 100644
    if (_library) {
      _library->release();
    }
-@@ -117,15 +345,29 @@ MTL::Library* metal_sscp_executable_object::get_library() const {
+@@ -117,15 +351,29 @@ MTL::Library* metal_sscp_executable_object::get_library() const {
    return _library;
  }
  
