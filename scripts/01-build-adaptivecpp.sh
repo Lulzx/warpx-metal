@@ -24,6 +24,9 @@ if [ -d "${ACPP_SOURCE_DIR}/.git" ]; then
     cd "${ACPP_SOURCE_DIR}"
     git fetch origin
     git reset --hard
+    # Remove files created by previously applied patches (reset --hard does
+    # not delete untracked files); keep the build tree for incrementality.
+    git clean -fd -e build -e install
     git checkout "${ACPP_REV}"
 else
     echo "  [..] Cloning AdaptiveCpp at pinned revision..."
