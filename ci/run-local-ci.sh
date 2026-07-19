@@ -45,6 +45,8 @@ for tool in git cmake ninja python3; do
     command -v "${tool}" >/dev/null 2>&1 || fail "required tool not found: ${tool}"
 done
 
+python3 -m unittest discover -s "${ROOT_DIR}/tests/supervisor" -v
+
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/warpx-metal-local-ci.XXXXXX")"
 AMREX_SOURCE_DIR="${WORK_DIR}/amrex"
 WARPX_SOURCE_DIR="${WORK_DIR}/warpx"

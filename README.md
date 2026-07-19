@@ -53,11 +53,28 @@ The backend includes reliability controls for heavy runs:
   error instead of hanging indefinitely.
 - Any remaining host-side shared-event wait is bounded by the same deadline and
   reports the requested and last observed event values when it expires.
+- Long jobs can run as checkpointed process generations with
+  `scripts/10-run-warpx-resilient.py`. Each generation creates fresh Metal
+  device/queue state, and a completion timeout automatically retries from the
+  last checkpoint that was verified after a clean child-process exit.
 
-This is containment, not a Metal driver repair. On affected macOS/M3 Ultra
-systems, a driver-lost command-buffer completion can still make the run fail
-after the timeout. Sustained particle-redistribution runs must be qualified on
-the target OS and hardware before being treated as production-reliable.
+The supervisor is the production-safe client workaround for the macOS driver
+defect: it never replays uncertain GPU state inside the affected process.
+Checkpoint frequency controls the recovery window and I/O overhead.
+
+Example for a 10,000-step 2D run, using 100-step process generations:
+
+```bash
+./scripts/10-run-warpx-resilient.py \
+  --max-step 10000 \
+  --chunk-steps 100 \
+  --work-dir /path/to/run \
+  extern/warpx/build-acpp/bin/warpx.2d.NOMPI.SYCL.SP.PSP.EB \
+  /path/to/inputs
+```
+
+See [Metal process-isolated recovery](reports/metal-process-isolated-recovery.md)
+for recovery semantics and tuning.
 
 ## Remaining Notes
 
@@ -77,6 +94,7 @@ and remaining limitations for the keeper fixes:
 - [AddPlasma parser-momentum out-of-bounds access](reports/addplasma-parser-momentum-oob.md)
 - [AdaptiveCpp Metal device-to-host completion hardening](reports/adaptivecpp-d2h-shared-event-completion.md)
 - [AdaptiveCpp Metal in-order readback and bounded completion](reports/adaptivecpp-metal-inorder-readback.md)
+- [Metal process-isolated checkpoint recovery](reports/metal-process-isolated-recovery.md)
 - [macOS system-memory crashguard accounting](reports/macos-memory-crashguard.md)
 
 ## Requirements

@@ -6,12 +6,14 @@ Run the repository's portability build from the repository root:
 nice -n 15 ./ci/run-local-ci.sh
 ```
 
-The script clones pinned AMReX and WarpX revisions into a temporary directory,
-verifies each pin is reachable from its upstream `26.06` tag, installs the
-packaged AMReX replacement files, explicitly applies the AMReX and WarpX patch
-files used by this repository, and builds linked 2D and 3D CPU WarpX
-executables. Any clone, pin, patch-application, configuration, compilation, or
-link failure exits nonzero. The last output line is machine-readable:
+The script first runs the process-isolated Metal supervisor's timeout/restart
+and checkpoint-commit unit tests. It then clones pinned AMReX and WarpX
+revisions into a temporary directory, verifies each pin is reachable from its
+upstream `26.06` tag, installs the packaged AMReX replacement files, explicitly
+applies the AMReX and WarpX patch files used by this repository, and builds
+linked 2D and 3D CPU WarpX executables. Any test, clone, pin, patch-application,
+configuration, compilation, or link failure exits nonzero. The last output line
+is machine-readable:
 
 ```text
 LOCAL_CI_RESULT outcome=PASS|FAIL host=... patches=... binaries=...

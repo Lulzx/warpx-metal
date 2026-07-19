@@ -26,6 +26,8 @@ opt/metal-cpp/
 *~
 .vscode/
 .idea/
+__pycache__/
+*.pyc
 
 # Compiled test binaries
 tests/sycl/device_query
@@ -45,6 +47,8 @@ tests/warpx/plt*/
 /Backtrace.*
 /diags/
 /warpx_used_inputs
+/.warpx-metal-checkpoints/
+/.warpx-metal-supervisor/
 
 # Compiled SYCL test binaries (no extension)
 tests/sycl/test_as5_escape
