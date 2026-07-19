@@ -313,7 +313,7 @@ index 5c8d9cda..33e3ba4c 100644
          metal/Emitter.cpp
        TOOL metal/LLVMToMetalTool.cpp)
 diff --git a/src/compiler/llvm-to-backend/metal/Emitter.cpp b/src/compiler/llvm-to-backend/metal/Emitter.cpp
-index 8cb4afdf..0453d0dd 100644
+index 8cb4afdf..4ccc547f 100644
 --- a/src/compiler/llvm-to-backend/metal/Emitter.cpp
 +++ b/src/compiler/llvm-to-backend/metal/Emitter.cpp
 @@ -13,6 +13,7 @@
@@ -777,7 +777,7 @@ index 8cb4afdf..0453d0dd 100644
  
    for (const BasicBlock& BB : F) {
      for (const Instruction& I : BB) {
-@@ -1762,6 +2061,149 @@ bool MetalEmitter::emitMetalInlineCall(const llvm::CallInst* CI, const std::stri
+@@ -1762,6 +2061,167 @@ bool MetalEmitter::emitMetalInlineCall(const llvm::CallInst* CI, const std::stri
      return true;
    }
  
@@ -785,57 +785,84 @@ index 8cb4afdf..0453d0dd 100644
 +    return emitExpr(CI->getArgOperand(i));
 +  };
 +
++  // Metal exposes no general-purpose 64-bit atomics (only min/max on ulong,
++  // Apple9+), so 64-bit RMW is emulated with 32-bit atomics:
++  //  - add/sub: split add with carry propagated into the high word. The final
++  //    memory value is exact once all pending ops complete; the returned old
++  //    value is exact only while the high word is stable (e.g. counters that
++  //    stay below 2^32).
++  //  - and/or/xor: applied per 32-bit word. Bitwise ops act on each word
++  //    independently, so the final memory value is exact; the returned pair
++  //    of old words may be torn under contention.
++  //  - min/max/exchange/cmpxchg: not decomposable into 32-bit atomics. Emit a
++  //    call to an intentionally undeclared function so MSL compilation fails
++  //    loudly for any kernel that reaches one, instead of silently computing
++  //    wrong results.
 +  auto emitFetch64 = [&](const std::string& type) -> bool {
 +    if (CI->arg_size() < 3 || CI->getType()->isVoidTy()) {
 +      return false;
 +    }
 +
-+    auto emitLowWordFetch64 = [&](const std::string& op) -> bool {
-+      const bool isSigned = type == "long";
++    auto emitCarryFetchAdd64 = [&](bool negate) -> bool {
 +      os << indent(level) << "{\n";
-+      os << indent(level + 1) << "auto ptr = " << emitExprArg(1) << ";\n";
-+      os << indent(level + 1) << type << " val = " << emitExprArg(2) << ";\n";
-+      if (isSigned) {
-+        os << indent(level + 1) << "uint old_lo = (uint)atomic_fetch_" << op
-+           << "_explicit(__atomic_pointer_cast<int>(ptr), (int)val, memory_order_relaxed);\n";
-+      } else {
-+        os << indent(level + 1) << "uint old_lo = atomic_fetch_" << op
-+           << "_explicit(__atomic_pointer_cast<uint>(ptr), (uint)val, memory_order_relaxed);\n";
++      os << indent(level + 1) << "auto lo_ptr = __atomic_pointer_cast<uint>("
++         << emitExprArg(1) << ");\n";
++      os << indent(level + 1) << "ulong uval = (ulong)(" << emitExprArg(2) << ");\n";
++      if (negate) {
++        os << indent(level + 1) << "uval = (ulong)(-(long)uval);\n";
 +      }
-+      os << indent(level + 1) << name << " = (" << type << ")old_lo;\n";
++      os << indent(level + 1) << "uint lo = (uint)uval;\n";
++      os << indent(level + 1)
++         << "uint old_lo = atomic_fetch_add_explicit(lo_ptr, lo, memory_order_relaxed);\n";
++      os << indent(level + 1) << "uint carry = (old_lo + lo < old_lo) ? 1u : 0u;\n";
++      os << indent(level + 1)
++         << "uint old_hi = atomic_fetch_add_explicit(lo_ptr + 1, "
++            "(uint)(uval >> 32) + carry, memory_order_relaxed);\n";
++      os << indent(level + 1) << name << " = (" << type
++         << ")((((ulong)old_hi) << 32) | (ulong)old_lo);\n";
 +      os << indent(level) << "}\n";
 +      return true;
 +    };
 +
 +    if (funcName->find("atomic_fetch_add_explicit") != std::string::npos) {
-+      return emitLowWordFetch64("add");
++      return emitCarryFetchAdd64(false);
 +    } else if (funcName->find("atomic_fetch_sub_explicit") != std::string::npos) {
-+      return emitLowWordFetch64("sub");
++      return emitCarryFetchAdd64(true);
 +    }
 +
-+    std::string expr;
++    std::string wordOp;
 +    if (funcName->find("atomic_fetch_and_explicit") != std::string::npos) {
-+      expr = "old & val";
++      wordOp = "and";
 +    } else if (funcName->find("atomic_fetch_or_explicit") != std::string::npos) {
-+      expr = "old | val";
++      wordOp = "or";
 +    } else if (funcName->find("atomic_fetch_xor_explicit") != std::string::npos) {
-+      expr = "old ^ val";
-+    } else if (funcName->find("atomic_fetch_min_explicit") != std::string::npos) {
-+      expr = "(old < val) ? old : val";
++      wordOp = "xor";
++    }
++    if (!wordOp.empty()) {
++      os << indent(level) << "{\n";
++      os << indent(level + 1) << "auto lo_ptr = __atomic_pointer_cast<uint>("
++         << emitExprArg(1) << ");\n";
++      os << indent(level + 1) << "ulong uval = (ulong)(" << emitExprArg(2) << ");\n";
++      os << indent(level + 1) << "uint old_lo = atomic_fetch_" << wordOp
++         << "_explicit(lo_ptr, (uint)uval, memory_order_relaxed);\n";
++      os << indent(level + 1) << "uint old_hi = atomic_fetch_" << wordOp
++         << "_explicit(lo_ptr + 1, (uint)(uval >> 32), memory_order_relaxed);\n";
++      os << indent(level + 1) << name << " = (" << type
++         << ")((((ulong)old_hi) << 32) | (ulong)old_lo);\n";
++      os << indent(level) << "}\n";
++      return true;
++    }
++
++    std::string unsupported;
++    if (funcName->find("atomic_fetch_min_explicit") != std::string::npos) {
++      unsupported = "min";
 +    } else if (funcName->find("atomic_fetch_max_explicit") != std::string::npos) {
-+      expr = "(old > val) ? old : val";
++      unsupported = "max";
 +    } else {
 +      return false;
 +    }
-+
-+    os << indent(level) << "{\n";
-+    os << indent(level + 1) << "auto ptr = __pointer_cast<" << type
-+       << ">(" << emitExprArg(1) << ");\n";
-+    os << indent(level + 1) << type << " old = *ptr;\n";
-+    os << indent(level + 1) << type << " val = " << emitExprArg(2) << ";\n";
-+    os << indent(level + 1) << "*ptr = " << expr << ";\n";
-+    os << indent(level + 1) << name << " = old;\n";
-+    os << indent(level) << "}\n";
++    os << indent(level) << name << " = __acpp_metal_missing_64bit_atomic_"
++       << unsupported << "(" << emitExprArg(1) << ", " << emitExprArg(2) << ");\n";
 +    return true;
 +  };
 +
@@ -882,17 +909,15 @@ index 8cb4afdf..0453d0dd 100644
 +      return true;
 +    }
 +
++    // 64-bit exchange and cmpxchg cannot be emulated with 32-bit atomics.
++    // Emit calls to intentionally undeclared functions so MSL compilation
++    // fails loudly for any kernel that reaches them.
 +    if (ctx->name.find("__acpp_sscp_metal_atomic_exchange" + suffix) == 0) {
 +      if (CI->arg_size() < 3 || CI->getType()->isVoidTy()) {
 +        return false;
 +      }
-+      os << indent(level) << "{\n";
-+      os << indent(level + 1) << "auto ptr = __pointer_cast<" << type
-+         << ">(" << emitExprArg(1) << ");\n";
-+      os << indent(level + 1) << type << " old = *ptr;\n";
-+      os << indent(level + 1) << "*ptr = " << emitExprArg(2) << ";\n";
-+      os << indent(level + 1) << name << " = old;\n";
-+      os << indent(level) << "}\n";
++      os << indent(level) << name << " = __acpp_metal_missing_64bit_atomic_exchange("
++         << emitExprArg(1) << ", " << emitExprArg(2) << ");\n";
 +      return true;
 +    }
 +
@@ -900,16 +925,9 @@ index 8cb4afdf..0453d0dd 100644
 +      if (CI->arg_size() < 4 || CI->getType()->isVoidTy()) {
 +        return false;
 +      }
-+      os << indent(level) << "{\n";
-+      os << indent(level + 1) << "auto ptr = __pointer_cast<" << type
-+         << ">(" << emitExprArg(1) << ");\n";
-+      os << indent(level + 1) << "auto expected = __pointer_cast<" << type
-+         << ">(" << emitExprArg(2) << ");\n";
-+      os << indent(level + 1) << type << " old = *ptr;\n";
-+      os << indent(level + 1) << "if (old == *expected) { *ptr = "
-+         << emitExprArg(3) << "; " << name << " = true; } else { *expected = old; "
-+         << name << " = false; }\n";
-+      os << indent(level) << "}\n";
++      os << indent(level) << name << " = __acpp_metal_missing_64bit_atomic_cmpxchg("
++         << emitExprArg(1) << ", " << emitExprArg(2) << ", " << emitExprArg(3)
++         << ");\n";
 +      return true;
 +    }
 +
