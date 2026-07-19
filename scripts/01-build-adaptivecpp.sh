@@ -13,16 +13,23 @@ source "${SCRIPT_DIR}/env.sh"
 echo ""
 echo "=== Step 1: Clone AdaptiveCpp ==="
 
+# Pinned develop revision the patches in patches/adaptivecpp/ are generated
+# against. Newer develop commits have upstreamed parts of this work (e.g. the
+# PointerTranslation passes), so the patches no longer apply at tip.
+ACPP_REV="3733a5655103a75c09d81e2ba6b519d15896551f"
+
 if [ -d "${ACPP_SOURCE_DIR}/.git" ]; then
     echo "  [OK] AdaptiveCpp already cloned at ${ACPP_SOURCE_DIR}"
-    echo "  Updating to latest develop..."
+    echo "  Checking out pinned revision ${ACPP_REV}..."
     cd "${ACPP_SOURCE_DIR}"
     git fetch origin
-    git checkout develop
-    git pull origin develop
+    git reset --hard
+    git checkout "${ACPP_REV}"
 else
-    echo "  [..] Cloning AdaptiveCpp develop branch..."
-    git clone --branch develop https://github.com/AdaptiveCpp/AdaptiveCpp.git "${ACPP_SOURCE_DIR}"
+    echo "  [..] Cloning AdaptiveCpp at pinned revision..."
+    git clone https://github.com/AdaptiveCpp/AdaptiveCpp.git "${ACPP_SOURCE_DIR}"
+    cd "${ACPP_SOURCE_DIR}"
+    git checkout "${ACPP_REV}"
 fi
 
 echo ""
@@ -38,8 +45,11 @@ if [ "${PATCH_COUNT}" -gt 0 ]; then
             echo "  [..] Applying ${PATCH_NAME}..."
             git apply "${patch}"
             echo "  [OK] Applied ${PATCH_NAME}"
+        elif git apply --reverse --check "${patch}" 2>/dev/null; then
+            echo "  [OK] ${PATCH_NAME} already applied"
         else
-            echo "  [SKIP] ${PATCH_NAME} (already applied or conflicts)"
+            echo "  [FAIL] ${PATCH_NAME} does not apply cleanly" >&2
+            exit 1
         fi
     done
 else
