@@ -34,14 +34,22 @@ fi
 echo ""
 echo "=== Step 1: Clone WarpX ==="
 
+# Pinned 26.06 revision the patches in patches/warpx/ are generated against
+# (same pin as ci/run-local-ci.sh).
+WARPX_REV="f7db079f9a8ca96d179e02709a29fe6c027ed8ed"
+
 if [ -d "${WARPX_SOURCE_DIR}/.git" ]; then
     echo "  [OK] WarpX already cloned at ${WARPX_SOURCE_DIR}"
     cd "${WARPX_SOURCE_DIR}"
     git checkout -- .
     git clean -fd
+    git fetch origin
+    git checkout "${WARPX_REV}"
 else
     echo "  [..] Cloning WarpX..."
     git clone https://github.com/ECP-WarpX/WarpX.git "${WARPX_SOURCE_DIR}"
+    cd "${WARPX_SOURCE_DIR}"
+    git checkout "${WARPX_REV}"
 fi
 
 echo ""

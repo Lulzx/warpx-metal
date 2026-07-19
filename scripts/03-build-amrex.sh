@@ -24,15 +24,23 @@ fi
 echo ""
 echo "=== Step 1: Clone AMReX ==="
 
+# Pinned 26.06 revision the patches in patches/amrex*/ are generated against
+# (same pin as ci/run-local-ci.sh).
+AMREX_REV="fa795322b44fff24fef3a795c3b00d24e015ee42"
+
 if [ -d "${AMREX_SOURCE_DIR}/.git" ]; then
     echo "  [OK] AMReX already cloned at ${AMREX_SOURCE_DIR}"
     cd "${AMREX_SOURCE_DIR}"
     # Reset any previously applied patches before re-applying
     git checkout -- .
     git clean -fd
+    git fetch origin
+    git checkout "${AMREX_REV}"
 else
     echo "  [..] Cloning AMReX..."
     git clone https://github.com/AMReX-Codes/amrex.git "${AMREX_SOURCE_DIR}"
+    cd "${AMREX_SOURCE_DIR}"
+    git checkout "${AMREX_REV}"
 fi
 
 echo ""
