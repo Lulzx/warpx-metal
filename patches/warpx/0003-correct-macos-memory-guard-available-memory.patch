@@ -1,4 +1,5 @@
 diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
+index b2cf3b29..f47788cb 100644
 --- a/Source/Evolve/WarpXEvolve.cpp
 +++ b/Source/Evolve/WarpXEvolve.cpp
 @@ -55,6 +55,7 @@
@@ -9,7 +10,7 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
  #include <cstdint>
  #include <cstdlib>
  #include <iomanip>
-@@ -130,19 +131,44 @@
+@@ -130,19 +131,44 @@ namespace
          errno = 0;
          char* end = nullptr;
          double parsed = std::strtod(value, &end);
@@ -24,11 +25,6 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
  
  #ifdef __APPLE__
 -    bool sampleSystemMemoryBytes (std::uint64_t& used_bytes, std::uint64_t& physical_bytes)
--    {
--        physical_bytes = 0;
--        std::size_t physical_size = sizeof(physical_bytes);
--        if (sysctlbyname("hw.memsize", &physical_bytes, &physical_size, nullptr, 0) != 0 ||
--            physical_bytes == 0)
 +    struct SystemMemorySample
 +    {
 +        std::uint64_t used_bytes = 0;
@@ -46,7 +42,11 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
 +    constexpr int compressor_swap_pressure_required_samples = 2;
 +
 +    bool sampleMemoryPressureLevel (int& pressure_level)
-+    {
+     {
+-        physical_bytes = 0;
+-        std::size_t physical_size = sizeof(physical_bytes);
+-        if (sysctlbyname("hw.memsize", &physical_bytes, &physical_size, nullptr, 0) != 0 ||
+-            physical_bytes == 0)
 +        std::size_t pressure_size = sizeof(pressure_level);
 +        return sysctlbyname("kern.memorystatus_vm_pressure_level",
 +                            &pressure_level, &pressure_size, nullptr, 0) == 0;
@@ -61,7 +61,7 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
          {
              return false;
          }
-@@ -160,47 +186,163 @@
+@@ -160,48 +186,165 @@ namespace
              return false;
          }
  
@@ -92,15 +92,27 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
 +        sample.swapouts = static_cast<std::uint64_t>(stats.swapouts);
          return true;
      }
+-#else
+-    bool sampleSystemMemoryBytes (std::uint64_t& used_bytes, std::uint64_t& physical_bytes)
 +
 +    bool hasAbnormalMemoryPressure (SystemMemorySample const& sample)
-+    {
-+        // Observed Darwin values: 1 normal, higher values warning/critical.
-+        return sample.has_pressure_level && sample.pressure_level > 1;
-+    }
-+
+     {
+-        used_bytes = 0;
+-        physical_bytes = 0;
+-        return false;
++        // Darwin values: 1 normal, 2 warning, 4 critical. WARN is routine on
++        // macOS (file-cache churn), so only CRITICAL is treated as fatal.
++        return sample.has_pressure_level && sample.pressure_level >= 4;
+     }
+-#endif
+ 
+-    void CheckSystemMemoryPressure ()
 +    bool hasCompressorSwapPressure (SystemMemorySample const& sample)
-+    {
+     {
+-        std::uint64_t used_bytes = 0;
+-        std::uint64_t physical_bytes = 0;
+-        if (!sampleSystemMemoryBytes(used_bytes, physical_bytes)) {
+-            return;
 +        static bool have_previous_sample = false;
 +        static std::uint64_t previous_compressor_page_count = 0;
 +        static std::uint64_t previous_swapouts = 0;
@@ -114,8 +126,13 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
 +                sample.compressor_page_count - previous_compressor_page_count : 0;
 +            swapout_delta_pages = sample.swapouts > previous_swapouts ?
 +                sample.swapouts - previous_swapouts : 0;
-+        }
-+
+         }
+ 
+-        const double max_fraction = readMaxMemFraction();
+-        const long double threshold_bytes =
+-            static_cast<long double>(physical_bytes) * max_fraction;
+-        if (static_cast<long double>(used_bytes) < threshold_bytes) {
+-            return;
 +        const auto compressor_delta_bytes =
 +            compressor_delta_pages * sample.page_size_bytes;
 +        const auto swapout_delta_bytes =
@@ -128,8 +145,8 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
 +            ++consecutive_pressure_samples;
 +        } else {
 +            consecutive_pressure_samples = 0;
-+        }
-+
+         }
+ 
 +        have_previous_sample = true;
 +        previous_compressor_page_count = sample.compressor_page_count;
 +        previous_swapouts = sample.swapouts;
@@ -142,31 +159,11 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
 +            "WarpX: macOS system memory pressure guard could not sample VM "
 +            "statistics; refusing to run without the crashguard on Apple hosts.");
 +    }
- #else
--    bool sampleSystemMemoryBytes (std::uint64_t& used_bytes, std::uint64_t& physical_bytes)
--    {
--        used_bytes = 0;
--        physical_bytes = 0;
--        return false;
--    }
--#endif
--
--    void CheckSystemMemoryPressure ()
++#else
 +    struct SystemMemorySample
-     {
-         std::uint64_t used_bytes = 0;
-         std::uint64_t physical_bytes = 0;
--        if (!sampleSystemMemoryBytes(used_bytes, physical_bytes)) {
--            return;
--        }
--
--        const double max_fraction = readMaxMemFraction();
--        const long double threshold_bytes =
--            static_cast<long double>(physical_bytes) * max_fraction;
--        if (static_cast<long double>(used_bytes) < threshold_bytes) {
--            return;
--        }
--
++    {
++        std::uint64_t used_bytes = 0;
++        std::uint64_t physical_bytes = 0;
 +        std::uint64_t available_bytes = 0;
 +        std::uint64_t page_size_bytes = 0;
 +        std::uint64_t compressor_page_count = 0;
@@ -223,7 +220,7 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
 +            << ") - deck too large for this machine; reduce resolution/particles "
                 "or raise WARPX_MAX_MEM_FRACTION at your own risk.";
          amrex::Abort(msg.str());
-+    }
+     }
 +
 +    void CheckSystemMemoryPressure ()
 +    {
@@ -249,19 +246,21 @@ diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
 +        }
 +        AbortForSystemMemoryPressure(
 +            sample, max_fraction, "reclaimable memory below guard threshold");
-     }
++    }
  }
  
+ void
 diff --git a/Source/main.cpp b/Source/main.cpp
+index 0d9cbf8f..67bd9382 100644
 --- a/Source/main.cpp
 +++ b/Source/main.cpp
-@@ -13,7 +13,129 @@
+@@ -13,8 +13,132 @@
  #include <ablastr/profiler/ProfilerWrapper.H>
  #include <ablastr/utils/timer/Timer.H>
  
 +#include <AMReX.H>
  #include <AMReX_Print.H>
-+
+ 
 +#include <algorithm>
 +#include <cerrno>
 +#include <cmath>
@@ -354,7 +353,9 @@ diff --git a/Source/main.cpp b/Source/main.cpp
 +        const auto over_fraction =
 +            static_cast<long double>(used_bytes) >=
 +            static_cast<long double>(physical_bytes) * max_fraction;
-+        const auto abnormal_pressure = has_pressure_level && pressure_level > 1;
++        // Darwin values: 1 normal, 2 warning, 4 critical. Abort only on
++        // CRITICAL; WARN is routine on macOS.
++        const auto abnormal_pressure = has_pressure_level && pressure_level >= 4;
 +        if (!over_fraction && !abnormal_pressure) {
 +            return;
 +        }
@@ -382,10 +383,11 @@ diff --git a/Source/main.cpp b/Source/main.cpp
 +    void CheckStartupSystemMemoryPressure () {}
 +#endif
 +}
- 
++
  int
  main (int argc, char* argv[]) {
-@@ -25,6 +147,7 @@
+     warpx::initialization::initialize_external_libraries(argc, argv);
+@@ -25,6 +149,7 @@ main (int argc, char* argv[]) {
          timer.record_start_time();
  
          auto& warpx = WarpX::GetInstance();
