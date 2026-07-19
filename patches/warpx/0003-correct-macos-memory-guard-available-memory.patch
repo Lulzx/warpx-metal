@@ -1,5 +1,5 @@
 diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
-index b2cf3b29..1691b98e 100644
+index b2cf3b29..384fa349 100644
 --- a/Source/Evolve/WarpXEvolve.cpp
 +++ b/Source/Evolve/WarpXEvolve.cpp
 @@ -55,6 +55,7 @@
@@ -42,18 +42,18 @@ index b2cf3b29..1691b98e 100644
 +    constexpr int compressor_swap_pressure_required_samples = 2;
 +
 +    bool sampleMemoryPressureLevel (int& pressure_level)
-     {
--        physical_bytes = 0;
--        std::size_t physical_size = sizeof(physical_bytes);
--        if (sysctlbyname("hw.memsize", &physical_bytes, &physical_size, nullptr, 0) != 0 ||
--            physical_bytes == 0)
++    {
 +        std::size_t pressure_size = sizeof(pressure_level);
 +        return sysctlbyname("kern.memorystatus_vm_pressure_level",
 +                            &pressure_level, &pressure_size, nullptr, 0) == 0;
 +    }
 +
 +    bool sampleSystemMemory (SystemMemorySample& sample)
-+    {
+     {
+-        physical_bytes = 0;
+-        std::size_t physical_size = sizeof(physical_bytes);
+-        if (sysctlbyname("hw.memsize", &physical_bytes, &physical_size, nullptr, 0) != 0 ||
+-            physical_bytes == 0)
 +        sample = {};
 +        std::size_t physical_size = sizeof(sample.physical_bytes);
 +        if (sysctlbyname("hw.memsize", &sample.physical_bytes, &physical_size, nullptr, 0) != 0 ||
@@ -61,7 +61,7 @@ index b2cf3b29..1691b98e 100644
          {
              return false;
          }
-@@ -160,48 +186,175 @@ namespace
+@@ -160,48 +186,166 @@ namespace
              return false;
          }
  
@@ -239,32 +239,23 @@ index b2cf3b29..1691b98e 100644
 +                sample, max_fraction, "sustained compressor and swap pressure rising");
 +        }
 +
-+        // Metal JIT compilation transiently inflates system memory use by
-+        // several GiB; require consecutive over-threshold samples (matching
-+        // the compressor/swap gate) so a short spike does not abort the run.
-+        constexpr int fraction_pressure_required_samples = 3;
-+        static int consecutive_over_fraction_samples = 0;
-+        const long double threshold_bytes =
-+            static_cast<long double>(sample.physical_bytes) * max_fraction;
-+        if (static_cast<long double>(sample.used_bytes) < threshold_bytes) {
-+            consecutive_over_fraction_samples = 0;
-+            return;
-+        }
-+        if (++consecutive_over_fraction_samples < fraction_pressure_required_samples) {
-+            return;
-+        }
-+        AbortForSystemMemoryPressure(
-+            sample, max_fraction,
-+            "reclaimable memory below guard threshold for consecutive samples");
++        // No raw used-fraction abort here: on unified memory the process's
++        // own GPU arena reservation legitimately holds most of physical RAM,
++        // so system-wide "used" cannot distinguish a too-large deck from a
++        // healthy run. Genuine overcommit is caught by the critical
++        // memory-pressure gate and the sustained compressor/swap growth gate
++        // above; the raw fraction check remains in the pre-init startup guard,
++        // where it still measures the machine rather than this process.
++        amrex::ignore_unused(max_fraction);
 +    }
  }
  
  void
 diff --git a/Source/main.cpp b/Source/main.cpp
-index 0d9cbf8f..255891a4 100644
+index 0d9cbf8f..b97059ea 100644
 --- a/Source/main.cpp
 +++ b/Source/main.cpp
-@@ -13,8 +13,151 @@
+@@ -13,10 +13,165 @@
  #include <ablastr/profiler/ProfilerWrapper.H>
  #include <ablastr/utils/timer/Timer.H>
  
@@ -276,6 +267,7 @@ index 0d9cbf8f..255891a4 100644
 +#include <cmath>
 +#include <chrono>
 +#include <cstdint>
++#include <cstdio>
 +#include <cstdlib>
 +#include <iomanip>
 +#include <sstream>
@@ -310,9 +302,16 @@ index 0d9cbf8f..255891a4 100644
 +    }
 +
 +#ifdef __APPLE__
++    // Runs before amrex::Initialize, so amrex::Abort is unavailable.
++    [[noreturn]] void StartupGuardAbort (std::string const& message)
++    {
++        std::fprintf(stderr, "%s\n", message.c_str());
++        std::exit(EXIT_FAILURE);
++    }
++
 +    void AbortStartupMemorySamplingFailure ()
 +    {
-+        amrex::Abort(
++        StartupGuardAbort(
 +            "WarpX: startup macOS system memory pressure guard could not "
 +            "sample VM statistics; refusing to run without the crashguard on "
 +            "Apple hosts.");
@@ -406,7 +405,7 @@ index 0d9cbf8f..255891a4 100644
 +                   "your own risk.";
 +            last_message = msg.str();
 +        }
-+        amrex::Abort(last_message);
++        StartupGuardAbort(last_message);
 +    }
 +#else
 +    void CheckStartupSystemMemoryPressure () {}
@@ -415,12 +414,10 @@ index 0d9cbf8f..255891a4 100644
 +
  int
  main (int argc, char* argv[]) {
++    // Run the guard before AMReX/Metal initialization: AMReX's arena
++    // reservation and the Metal JIT would otherwise be counted against the
++    // machine and trip the guard on any deck.
++    CheckStartupSystemMemoryPressure();
      warpx::initialization::initialize_external_libraries(argc, argv);
-@@ -25,6 +168,7 @@ main (int argc, char* argv[]) {
-         timer.record_start_time();
- 
-         auto& warpx = WarpX::GetInstance();
-+        CheckStartupSystemMemoryPressure();
-         warpx.InitData();
-         warpx.Evolve();
-         const auto is_warpx_verbose = warpx.Verbose();
+     {
+         ABLASTR_PROFILE_VAR("main()", pmain);
