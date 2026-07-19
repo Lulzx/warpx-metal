@@ -252,6 +252,28 @@ index 45970f293..d243dac44 100644
          mkl::rng::device::uniform<unsigned int> distr(0,n);
          return mkl::rng::device::generate(distr, *random_engine.engine);
  #else
+diff --git a/Src/Base/AMReX_Scan.H b/Src/Base/AMReX_Scan.H
+index 1f38993d6..4430a0324 100644
+--- a/Src/Base/AMReX_Scan.H
++++ b/Src/Base/AMReX_Scan.H
+@@ -417,8 +417,17 @@ T PrefixSum (N n, FIN && fin, FOUT && fout, TYPE type, RetSum a_ret_sum = retSum
+     std::size_t sm = sizeof(T) * (Gpu::Device::warp_size + nwarps_per_block) + sizeof(int);
+     auto stream = Gpu::gpuStream();
+ 
++#if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__) || defined(__ADAPTIVECPP__)
++    // Metal has no 64-bit atomics: the packed single-word BlockStatus needs
++    // atomic 64-bit exchange/load. Use the two-word variant, which relies on
++    // device memory fences and <=32-bit atomic loads instead. With the
++    // multipass scan handling nblocks > 1, this path only runs single-block,
++    // so there is no cross-block lookback spin.
++    using BlockStatusT = detail::BlockStatus<T,false>;
++#else
+     using BlockStatusT = std::conditional_t<sizeof(detail::STVA<T>) <= 8,
+         detail::BlockStatus<T,true>, detail::BlockStatus<T,false> >;
++#endif
+ 
+     std::size_t nbytes_blockstatus = Arena::align(sizeof(BlockStatusT)*nblocks);
+     std::size_t nbytes_blockid = Arena::align(sizeof(unsigned int));
 diff --git a/Src/Base/Parser/AMReX_Parser.H b/Src/Base/Parser/AMReX_Parser.H
 index 7c9c2b1c3..22ac08a92 100644
 --- a/Src/Base/Parser/AMReX_Parser.H
