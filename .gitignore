@@ -60,3 +60,4 @@ tests/metal_direct/*.air
 tests/metal_direct/*.metallib
 benchmarks/results/
 tests/warpx/results/
+benchmarks/profiles/
