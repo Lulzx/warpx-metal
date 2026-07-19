@@ -30,6 +30,7 @@ RESERVED_ARGUMENTS = (
     "amr.restart",
     "diagnostics.diags_names",
 )
+RECOVERABLE_RETURN_CODES = (-signal.SIGTERM, -signal.SIGKILL)
 
 
 @dataclass(frozen=True)
@@ -491,12 +492,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[committed] verified checkpoint: {previous}")
                 break
 
-            recoverable = result.watchdog_fired or result.metal_timeout
+            recoverable_signal = result.returncode in RECOVERABLE_RETURN_CODES
+            recoverable = (
+                result.watchdog_fired
+                or result.metal_timeout
+                or recoverable_signal
+            )
             reason = (
                 "no-log-progress watchdog"
                 if result.watchdog_fired
                 else "Metal completion timeout"
                 if result.metal_timeout
+                else f"child terminated by signal {-result.returncode}"
+                if recoverable_signal
                 else f"child exit {result.returncode}"
             )
             print(f"[failed] {reason}", file=sys.stderr)

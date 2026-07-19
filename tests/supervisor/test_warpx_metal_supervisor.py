@@ -59,7 +59,9 @@ class WarpXMetalSupervisorTest(unittest.TestCase):
                 textwrap.dedent(
                     """\
                     #!/usr/bin/env python3
+                    import os
                     import pathlib
+                    import signal
                     import sys
 
                     assignments = {
@@ -85,6 +87,9 @@ class WarpXMetalSupervisorTest(unittest.TestCase):
                             "command buffer remained scheduled"
                         )
                         raise SystemExit(70)
+                    if target == 4 and not attempt.exists():
+                        attempt.write_text("terminated once")
+                        os.kill(os.getpid(), signal.SIGTERM)
 
                     checkpoint.mkdir(parents=True)
                     (checkpoint / "WarpXHeader").write_text("header")
@@ -142,7 +147,7 @@ class WarpXMetalSupervisorTest(unittest.TestCase):
             )
             self.assertEqual(
                 len(list((root / ".warpx-metal-supervisor").glob("*.log"))),
-                3,
+                4,
             )
             self.assertEqual(
                 len(

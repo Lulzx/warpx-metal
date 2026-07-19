@@ -30,15 +30,16 @@ Directories left by a failed or killed child are never promoted. Before retrying
 the same generation, they are moved under the supervisor's `quarantine/`
 directory for postmortem inspection.
 
-On an AdaptiveCpp Metal completion timeout, or when the child stops producing
-log progress past the watchdog deadline, the supervisor terminates the entire
-child process group. The retry starts from the last marked checkpoint in a new
-process, recreating the Metal device, command queues, shared events, allocations,
-and AdaptiveCpp runtime state.
+On an AdaptiveCpp Metal completion timeout, when the child stops producing log
+progress past the watchdog deadline, or when the child is externally terminated
+by `SIGTERM`/`SIGKILL`, the retry starts from the last marked checkpoint in a
+new process. This recreates the Metal device, command queues, shared events,
+allocations, and AdaptiveCpp runtime state.
 
-Failures that do not look like a Metal timeout are not retried. This prevents an
-invalid input deck or deterministic physics failure from becoming a restart
-loop.
+Ordinary nonzero exits that do not look like a Metal timeout are not retried.
+This prevents an invalid input deck or deterministic physics failure from
+becoming a restart loop; externally terminated children remain recoverable
+within the configured retry bound.
 
 ## Usage
 
@@ -99,6 +100,11 @@ An end-to-end Metal run using the real 2D WarpX executable completed in
 two-step process generations, produced verified checkpoints at steps 2 and 4,
 then a second supervisor invocation discovered step 4 and restarted through
 step 6.
+
+An additional two-species Metal PIC run completed through two process
+generations, committing a particle checkpoint at step 5, recreating the process
+and Metal runtime, restarting both species from that checkpoint, and committing
+step 10.
 
 This architecture does not repair Apple's driver. It converts the driver defect
 into bounded lost work with a correctness-preserving restart, which is the
