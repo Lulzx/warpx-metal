@@ -49,10 +49,21 @@ compile_and_run() {
         return
     fi
 
-    # Run
+    # Run. A freshly compiled executable can legitimately populate AdaptiveCpp's
+    # persistent JIT cache. If it does, rerun that same binary so the reported
+    # validation result represents the warmed steady-state path.
     echo "    [..] Running..."
     local output
-    if output=$("${bin}" 2>&1); then
+    local run_status=0
+    output=$("${bin}" 2>&1) || run_status=$?
+    if [ "${run_status}" -eq 0 ] &&
+       grep -Fq "kernel_cache: This application run has resulted in new binaries being JIT-compiled" <<< "${output}"; then
+        echo "    [..] JIT cache populated; rerunning warmed binary..."
+        run_status=0
+        output=$("${bin}" 2>&1) || run_status=$?
+    fi
+
+    if [ "${run_status}" -eq 0 ]; then
         echo "${output}" | sed 's/^/    /'
         if echo "${output}" | grep -q "PASS"; then
             echo "    [PASS]"
@@ -65,7 +76,7 @@ compile_and_run() {
         fi
     else
         echo "${output}" | sed 's/^/    /'
-        echo "    [FAIL] Runtime error (exit code $?)"
+        echo "    [FAIL] Runtime error (exit code ${run_status})"
         FAIL=$((FAIL + 1))
         RESULTS+=("FAIL  ${name}: runtime error")
     fi
@@ -80,7 +91,7 @@ echo "Compiler: ${ACPP}"
 
 # Run tests in order of increasing complexity
 compile_and_run "device_query"    "Enumerate SYCL devices, confirm Metal GPU"
-compile_and_run "vector_add"      "Basic parallel_for with buffer/accessor model"
+compile_and_run "vector_add"      "Basic parallel_for with device USM"
 compile_and_run "usm_test"        "sycl::malloc_shared — critical for AMReX"
 compile_and_run "reduction_test"  "Atomic float add — critical for deposition"
 compile_and_run "d2h_stress_test" "Repeated private-device to host copies"

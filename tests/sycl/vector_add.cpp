@@ -1,12 +1,12 @@
-// vector_add.cpp — Basic parallel_for with buffer/accessor model (no USM)
+// vector_add.cpp — Basic parallel_for with device USM
 //
-// Validates: kernel dispatch, buffer creation, host-device data transfer
-// Uses buffers deliberately — Metal backend may not fully support USM.
+// Validates: kernel dispatch, device USM, and host-device data transfer
 
 #include <sycl/sycl.hpp>
+
+#include <cmath>
 #include <iostream>
 #include <vector>
-#include <cmath>
 
 int main() {
     constexpr size_t N = 1024 * 1024;  // 1M elements
@@ -21,32 +21,42 @@ int main() {
     }
 
     try {
-        // Select GPU device, fall back to default
-        sycl::queue q{sycl::gpu_selector_v};
+        sycl::queue q{
+            sycl::gpu_selector_v,
+            sycl::property_list{sycl::property::queue::in_order{}}};
 
         std::string dev_name = q.get_device().get_info<sycl::info::device::name>();
         std::cout << "=== Vector Add ===" << std::endl;
         std::cout << "Device: " << dev_name << std::endl;
         std::cout << "N = " << N << std::endl;
 
-        {
-            sycl::buffer<float> buf_a(a.data(), sycl::range<1>(N));
-            sycl::buffer<float> buf_b(b.data(), sycl::range<1>(N));
-            sycl::buffer<float> buf_c(c.data(), sycl::range<1>(N));
+        float* device_a = sycl::malloc_device<float>(N, q);
+        float* device_b = sycl::malloc_device<float>(N, q);
+        float* device_c = sycl::malloc_device<float>(N, q);
+        auto free_device_allocations = [&]() {
+            if (device_a) sycl::free(device_a, q);
+            if (device_b) sycl::free(device_b, q);
+            if (device_c) sycl::free(device_c, q);
+        };
 
-            q.submit([&](sycl::handler& h) {
-                auto acc_a = buf_a.get_access<sycl::access::mode::read>(h);
-                auto acc_b = buf_b.get_access<sycl::access::mode::read>(h);
-                auto acc_c = buf_c.get_access<sycl::access::mode::write>(h);
-
-                h.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
-                    acc_c[idx] = acc_a[idx] + acc_b[idx];
-                });
-            });
-
-            q.wait();
+        if (!device_a || !device_b || !device_c) {
+            free_device_allocations();
+            std::cerr << "FAIL — device USM allocation failed" << std::endl;
+            return 1;
         }
-        // Buffers go out of scope — data copied back to host vectors
+
+        try {
+            q.memcpy(device_a, a.data(), N * sizeof(float));
+            q.memcpy(device_b, b.data(), N * sizeof(float));
+            q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
+                device_c[idx] = device_a[idx] + device_b[idx];
+            });
+            q.memcpy(c.data(), device_c, N * sizeof(float)).wait();
+        } catch (...) {
+            free_device_allocations();
+            throw;
+        }
+        free_device_allocations();
 
         // Verify results
         size_t errors = 0;
