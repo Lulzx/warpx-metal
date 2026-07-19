@@ -20,7 +20,7 @@ namespace amrex {
 #if defined(AMREX_USE_SYCL) && !defined(SYCL_IMPLEMENTATION_ACPP) && !defined(SYCL_IMPLEMENTATION_HIPSYCL)
     sycl_rng_descr* rand_engine_descr = nullptr;
 #elif defined(AMREX_USE_SYCL)
-    // AdaptiveCpp: no MKL RNG — GPU RNG stub
+    sycl_rng_descr* rand_engine_descr = nullptr;
 #else
     amrex::randState_t* gpu_rand_state = nullptr;
 #endif
@@ -30,7 +30,7 @@ namespace {
 #if defined(AMREX_USE_SYCL) && !defined(SYCL_IMPLEMENTATION_ACPP) && !defined(SYCL_IMPLEMENTATION_HIPSYCL)
     oneapi::mkl::rng::philox4x32x10* gpu_rand_generator = nullptr;
 #elif defined(AMREX_USE_SYCL)
-    // AdaptiveCpp: no MKL RNG generator
+    amrex::sycl_rng_engine* gpu_rand_state = nullptr;
 #else
     amrex::randGenerator_t gpu_rand_generator = nullptr;
 #endif
@@ -58,8 +58,13 @@ void ResizeRandomSeed (amrex::ULong gpu_seed)
         (Gpu::Device::streamQueue(), gpu_seed+1234ULL);
 
 #elif defined(AMREX_USE_SYCL)
-    // AdaptiveCpp: GPU RNG not yet supported — skip initialization.
-    amrex::ignore_unused(N, gpu_seed);
+    gpu_rand_state = static_cast<sycl_rng_engine*>(The_Arena()->alloc(N*sizeof(sycl_rng_engine)));
+    rand_engine_descr = new sycl_rng_descr(gpu_rand_state, static_cast<std::size_t>(N));
+    sycl_rng_engine* gpu_rand_state_local = gpu_rand_state;
+    amrex::ParallelFor(N, [=] AMREX_GPU_DEVICE (int idx) noexcept
+    {
+        gpu_rand_state_local[idx] = sycl_rng_engine(gpu_seed, static_cast<ULong>(idx));
+    });
 
 #elif defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
 
@@ -151,6 +156,7 @@ Real RandomGamma (Real alpha, Real beta)
 
 unsigned int Random_int (unsigned int n)
 {
+    if (n == 0) {return 0;}
     std::uniform_int_distribution<unsigned int> distribution(0, n-1);
     int tid = OpenMP::get_thread_num();
     return distribution(generators[tid]);
@@ -158,6 +164,7 @@ unsigned int Random_int (unsigned int n)
 
 ULong Random_long (ULong n)
 {
+    if (n == 0) {return 0;}
     std::uniform_int_distribution<ULong> distribution(0, n-1);
     int tid = OpenMP::get_thread_num();
     return distribution(generators[tid]);
@@ -238,7 +245,16 @@ DeallocateRandomSeedDevArray ()
         gpu_rand_generator = nullptr;
     }
 #elif defined(AMREX_USE_SYCL)
-    // AdaptiveCpp: no MKL RNG to deallocate
+    if (rand_engine_descr) {
+        delete rand_engine_descr;
+        Gpu::streamSynchronize();
+        rand_engine_descr = nullptr;
+    }
+    if (gpu_rand_state != nullptr)
+    {
+        The_Arena()->free(gpu_rand_state);
+        gpu_rand_state = nullptr;
+    }
 #else
     if (gpu_rand_state != nullptr)
     {
@@ -283,6 +299,14 @@ void FillRandom (Real* p, Long N)
     oneapi::mkl::rng::uniform<Real> distr;
     auto event = oneapi::mkl::rng::generate(distr, *gpu_rand_generator, N, p);
     event.wait();
+
+#elif defined(AMREX_USE_SYCL)
+
+    amrex::ParallelForRNG(N, [=] AMREX_GPU_DEVICE (Long i, RandomEngine const& engine) noexcept
+    {
+        p[i] = amrex::Random(engine);
+    });
+    Gpu::synchronize();
 
 #else
     std::uniform_real_distribution<Real> distribution(Real(0.0), Real(1.0));
@@ -329,6 +353,14 @@ void FillRandomNormal (Real* p, Long N, Real mean, Real stddev)
     oneapi::mkl::rng::gaussian<Real> distr(mean, stddev);
     auto event = oneapi::mkl::rng::generate(distr, *gpu_rand_generator, N, p);
     event.wait();
+
+#elif defined(AMREX_USE_SYCL)
+
+    amrex::ParallelForRNG(N, [=] AMREX_GPU_DEVICE (Long i, RandomEngine const& engine) noexcept
+    {
+        p[i] = amrex::RandomNormal(mean, stddev, engine);
+    });
+    Gpu::synchronize();
 
 #else
 

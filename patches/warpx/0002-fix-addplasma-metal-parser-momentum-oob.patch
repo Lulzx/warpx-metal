@@ -1,0 +1,46 @@
+diff --git a/Source/Particles/ParticleCreation/AddParticles.cpp b/Source/Particles/ParticleCreation/AddParticles.cpp
+--- a/Source/Particles/ParticleCreation/AddParticles.cpp
++++ b/Source/Particles/ParticleCreation/AddParticles.cpp
+@@ -112,6 +112,10 @@
+     amrex::Real applyBallisticCorrection(const XDim3& pos, const InjectorMomentum* inj_mom,
+                                   amrex::Real gamma_boost, amrex::Real beta_boost, amrex::Real t) noexcept
+     {
++        if (gamma_boost == 1._rt && beta_boost == 0._rt) {
++            return pos.z;
++        }
++
+         const XDim3 u_bulk = inj_mom->getBulkMomentum(pos.x, pos.y, pos.z);
+         const amrex::Real gamma_bulk = std::sqrt(1._rt +
+                              (u_bulk.x*u_bulk.x+u_bulk.y*u_bulk.y+u_bulk.z*u_bulk.z));
+@@ -1081,7 +1085,14 @@
+                         continue;
+                     }
+ 
+-                    u = inj_mom->getMomentum(pos.x, pos.y, z0, engine);
++#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) && defined(WARPX_DIM_XZ)
++                    if (sycl_parser_momentum) {
++                        u = XDim3{0._rt, 0._rt, 0._rt};
++                    } else
++#endif
++                    {
++                        u = inj_mom->getMomentum(pos.x, pos.y, z0, engine);
++                    }
+                     dens = inj_rho->getDensity(pos.x, pos.y, z0);
+ 
+                     // Remove particle if density below threshold
+@@ -1125,7 +1136,14 @@
+                     dens = amrex::min(dens, density_max);
+ 
+                     // get the full momentum, including thermal motion
+-                    u = inj_mom->getMomentum(pos.x, pos.y, 0._rt, engine);
++#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) && defined(WARPX_DIM_XZ)
++                    if (sycl_parser_momentum) {
++                        u = XDim3{0._rt, 0._rt, 0._rt};
++                    } else
++#endif
++                    {
++                        u = inj_mom->getMomentum(pos.x, pos.y, 0._rt, engine);
++                    }
+                     const amrex::Real gamma_lab = std::sqrt( 1._rt+(u.x*u.x+u.y*u.y+u.z*u.z) );
+                     const amrex::Real betaz_lab = u.z/(gamma_lab);
+ 

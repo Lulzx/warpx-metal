@@ -1,0 +1,1147 @@
+diff --git a/Src/Base/AMReX_GpuAtomic.H b/Src/Base/AMReX_GpuAtomic.H
+index ae6490936..b181d3cff 100644
+--- a/Src/Base/AMReX_GpuAtomic.H
++++ b/Src/Base/AMReX_GpuAtomic.H
+@@ -7,6 +7,7 @@
+ #include <AMReX_INT.H>
+ 
+ #include <utility>
++#include <type_traits>
+ 
+ namespace amrex {
+ 
+@@ -30,7 +31,7 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     R atomic_op (R* const address, R const val, F const f) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -54,7 +55,7 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     bool atomic_op_if (R* const address, R const val, Op&& op, Cond&& cond) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -136,11 +137,19 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     T Add_device (T* const sum, T const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
+-        constexpr auto mo = sycl::memory_order::relaxed;
+-        constexpr auto ms = sycl::memory_scope::device;
+-        sycl::atomic_ref<T,mo,ms,AS> a{*sum};
+-        return a.fetch_add(value);
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
++        if constexpr (std::is_same_v<T,float>) {
++            return detail::atomic_op<float, unsigned int>(
++                sum, value, amrex::Plus<float>());
++        } else if constexpr (std::is_same_v<T,double>) {
++            return detail::atomic_op<double, unsigned long long>(
++                sum, value, amrex::Plus<double>());
++        } else {
++            constexpr auto mo = sycl::memory_order::relaxed;
++            constexpr auto ms = sycl::memory_scope::device;
++            sycl::atomic_ref<T,mo,ms,AS> a{*sum};
++            return a.fetch_add(value);
++        }
+ #else
+         AMREX_IF_ON_DEVICE(( return atomicAdd(sum, value); ))
+         AMREX_IF_ON_HOST((
+@@ -200,15 +209,24 @@ namespace detail {
+     T Add (T* sum, T value) noexcept
+     {
+ #ifdef AMREX_USE_SYCL
++#if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
++        return Add_device<T,AS>(sum, value);
++#else
+         AMREX_IF_ON_DEVICE((return Add_device<T,AS>(sum, value);))
++        AMREX_IF_ON_HOST((
++            auto old = *sum;
++            *sum += value;
++            return old;
++        ))
++#endif
+ #else
+         AMREX_IF_ON_DEVICE((return Add_device(sum, value);))
+-#endif
+         AMREX_IF_ON_HOST((
+             auto old = *sum;
+             *sum += value;
+             return old;
+         ))
++#endif
+     }
+ 
+ ////////////////////////////////////////////////////////////////////////
+@@ -282,7 +300,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     void AddNoRet (T* sum, T value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
+         Add_device<T,AS>(sum, value);
+ #else
+         AMREX_IF_ON_DEVICE((Add_device(sum, value);))
+@@ -312,7 +330,7 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     T Min_device (T* const m, T const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -375,7 +393,7 @@ namespace detail {
+     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+     T Max_device (T* const m, T const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -435,7 +453,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     int LogicalOr (int* const m, int const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -460,7 +478,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     int LogicalAnd (int* const m, int const value) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -486,7 +504,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T Exch (T* address, T val) noexcept
+     {
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -512,7 +530,7 @@ namespace detail {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T CAS (T* const address, T compare, T const val) noexcept
+     {           // cannot be T const compare because of compare_exchange_strong
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(__SYCL_DEVICE_ONLY__) || defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
+         constexpr auto mo = sycl::memory_order::relaxed;
+         constexpr auto ms = sycl::memory_scope::device;
+         constexpr auto as = sycl::access::address_space::global_space;
+@@ -635,16 +653,24 @@ namespace HostDevice::Atomic {
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     void Add (T* const sum, T const value) noexcept
+     {
++#if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
++        Gpu::Atomic::AddNoRet(sum,value);
++#else
+         AMREX_IF_ON_DEVICE((Gpu::Atomic::AddNoRet(sum,value);))
+         AMREX_IF_ON_HOST((Add_Host(sum,value);))
++#endif
+     }
+ 
+     template <class T>
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     T FetchAdd (T* const sum, T const value) noexcept
+     {
++#if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__)
++        return Gpu::Atomic::Add(sum,value);
++#else
+         AMREX_IF_ON_DEVICE((return Gpu::Atomic::Add(sum,value);))
+         AMREX_IF_ON_HOST((return FetchAdd_Host(sum,value);))
++#endif
+     }
+ 
+ }
+diff --git a/Src/Base/AMReX_GpuDevice.cpp b/Src/Base/AMReX_GpuDevice.cpp
+index 24f3f1291..fcf922490 100644
+--- a/Src/Base/AMReX_GpuDevice.cpp
++++ b/Src/Base/AMReX_GpuDevice.cpp
+@@ -1400,8 +1400,12 @@ bool isStreamActive (gpuStream_t s)
+ #elif defined(AMREX_USE_HIP)
+     return hipStreamQuery(s) != hipSuccess;
+ #elif defined(AMREX_USE_SYCL)
++#if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || defined(__HIPSYCL__) || defined(__ACPP__) || defined(__ADAPTIVECPP__)
++    return true;
++#else
+     return ! s.queue->ext_oneapi_empty();
+ #endif
++#endif
+ }
+ #endif
+ 
+diff --git a/Src/Base/AMReX_GpuLaunchFunctsG.H b/Src/Base/AMReX_GpuLaunchFunctsG.H
+index e4d377fda..5ef801bcd 100644
+--- a/Src/Base/AMReX_GpuLaunchFunctsG.H
++++ b/Src/Base/AMReX_GpuLaunchFunctsG.H
+@@ -541,7 +541,14 @@ void ParallelForRNG (T n, L const& f)
+     const auto nthreads_per_block = ec.numThreads.x;
+     const auto nthreads_total = std::size_t(nthreads_per_block) * amrex::min(ec.numBlocks.x,Gpu::Device::maxBlocksPerLaunch());
+     auto& q = Gpu::Device::streamQueue();
+-    auto& engdescr = *(getRandEngineDescriptor());
++    auto* engdescr_ptr = getRandEngineDescriptor();
++    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(engdescr_ptr != nullptr,
++                                     "ACPP RNG descriptor is not initialized before ParallelForRNG");
++    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(engdescr_ptr->engines != nullptr,
++                                     "ACPP RNG engine storage is not initialized before ParallelForRNG");
++    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(engdescr_ptr->size >= nthreads_total,
++                                     "ACPP RNG engine storage is smaller than the ParallelForRNG launch width");
++    auto& engdescr = *engdescr_ptr;
+     try {
+         q.submit([&] (sycl::handler& h) {
+             auto engine_acc = engdescr.get_access(h);
+diff --git a/Src/Base/AMReX_Random.H b/Src/Base/AMReX_Random.H
+index 45970f293..d243dac44 100644
+--- a/Src/Base/AMReX_Random.H
++++ b/Src/Base/AMReX_Random.H
+@@ -26,7 +26,9 @@ namespace amrex
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     Real Random (RandomEngine const& random_engine)
+     {
+-#if defined (__SYCL_DEVICE_ONLY__)
++#if defined(AMREX_USE_SYCL) && (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL))
++        return random_engine.engine->template uniform<Real>();
++#elif defined (__SYCL_DEVICE_ONLY__)
+         mkl::rng::device::uniform<Real> distr;
+         return mkl::rng::device::generate(distr, *random_engine.engine);
+ #else
+@@ -66,7 +68,9 @@ namespace amrex
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     Real RandomNormal (Real mean, Real stddev, RandomEngine const& random_engine)
+     {
+-#if defined (__SYCL_DEVICE_ONLY__)
++#if defined(AMREX_USE_SYCL) && (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL))
++        return stddev * random_engine.engine->template normal<Real>() + mean;
++#elif defined (__SYCL_DEVICE_ONLY__)
+         mkl::rng::device::gaussian<Real> distr(mean, stddev);
+         return mkl::rng::device::generate(distr, *random_engine.engine);
+ #else
+@@ -108,7 +112,9 @@ namespace amrex
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     unsigned int RandomPoisson (Real lambda, RandomEngine const& random_engine)
+     {
+-#if defined (__SYCL_DEVICE_ONLY__)
++#if defined(AMREX_USE_SYCL) && (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL))
++        return random_engine.engine->template poisson<Real>(lambda);
++#elif defined (__SYCL_DEVICE_ONLY__)
+         mkl::rng::device::poisson<unsigned int> distr(lambda);
+         return mkl::rng::device::generate(distr, *random_engine.engine);
+ #else
+@@ -213,7 +219,9 @@ namespace amrex
+     unsigned int Random_int (unsigned int n, RandomEngine const& random_engine)
+     {
+     if (n == 0) { return 0;}
+-#if defined(__SYCL_DEVICE_ONLY__)
++#if defined(AMREX_USE_SYCL) && (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL))
++        return random_engine.engine->uniform_uint(n);
++#elif defined(__SYCL_DEVICE_ONLY__)
+         mkl::rng::device::uniform<unsigned int> distr(0,n);
+         return mkl::rng::device::generate(distr, *random_engine.engine);
+ #else
+diff --git a/Src/Base/Parser/AMReX_Parser.H b/Src/Base/Parser/AMReX_Parser.H
+index 7c9c2b1c3..22ac08a92 100644
+--- a/Src/Base/Parser/AMReX_Parser.H
++++ b/Src/Base/Parser/AMReX_Parser.H
+@@ -43,7 +43,7 @@ struct ParserExecutor
+      */
+     template <int M=N, std::enable_if_t<M==0,int> = 0>
+     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+-    double operator() () const noexcept
++    ParserExeReal operator() () const noexcept
+     {
+         AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, nullptr);))
+         AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, nullptr);))
+@@ -57,10 +57,10 @@ struct ParserExecutor
+      */
+     template <typename... Ts>
+     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+-    std::enable_if_t<sizeof...(Ts) == N && !amrex::Same<float,Ts...>::value, double>
++    std::enable_if_t<sizeof...(Ts) == N && !amrex::Same<float,Ts...>::value, ParserExeReal>
+     operator() (Ts... var) const noexcept
+     {
+-        amrex::GpuArray<double,N> l_var{var...};
++        amrex::GpuArray<ParserExeReal,N> l_var{static_cast<ParserExeReal>(var)...};
+         AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, l_var.data());))
+         AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, l_var.data());))
+     }
+@@ -77,7 +77,7 @@ struct ParserExecutor
+     std::enable_if_t<sizeof...(Ts) == N &&  amrex::Same<float,Ts...>::value, float>
+     operator() (Ts... var) const noexcept
+     {
+-        amrex::GpuArray<double,N> l_var{var...};
++        amrex::GpuArray<ParserExeReal,N> l_var{static_cast<ParserExeReal>(var)...};
+         AMREX_IF_ON_DEVICE((return static_cast<float>(parser_exe_eval(m_device_executor, l_var.data()));))
+         AMREX_IF_ON_HOST((return static_cast<float>(parser_exe_eval(m_host_executor, l_var.data()));))
+     }
+@@ -88,10 +88,12 @@ struct ParserExecutor
+      * \return Expression value promoted to double precision.
+      */
+     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+-    double operator() (GpuArray<double,N> const& var) const noexcept
++    ParserExeReal operator() (GpuArray<double,N> const& var) const noexcept
+     {
+-        AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, var.data());))
+-        AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, var.data());))
++        GpuArray<ParserExeReal,N> l_var{};
++        for (int i = 0; i < N; ++i) { l_var[i] = static_cast<ParserExeReal>(var[i]); }
++        AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, l_var.data());))
++        AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, l_var.data());))
+     }
+ 
+     /**
+diff --git a/Src/Base/Parser/AMReX_Parser_Exe.H b/Src/Base/Parser/AMReX_Parser_Exe.H
+index 0a62f2ed6..89e4275df 100644
+--- a/Src/Base/Parser/AMReX_Parser_Exe.H
++++ b/Src/Base/Parser/AMReX_Parser_Exe.H
+@@ -23,6 +23,14 @@
+ 
+ namespace amrex {
+ 
++#if defined(AMREX_USE_SYCL) && defined(AMREX_USE_FLOAT) && \
++    (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || \
++     defined(__ADAPTIVECPP__) || defined(__HIPSYCL__))
++using ParserExeReal = float;
++#else
++using ParserExeReal = double;
++#endif
++
+ // N: node
+ // P: pointer offset
+ // V: value (i.e., double literal)
+@@ -70,7 +78,7 @@ struct alignas(8) ParserExeNull {
+ 
+ struct alignas(8) ParserExeNumber {
+     enum parser_exe_t type = PARSER_EXE_NUMBER;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeSymbol {
+@@ -120,25 +128,25 @@ struct alignas(8) ParserExeF2_B {
+ struct alignas(8) ParserExeADD_VP {
+     enum parser_exe_t type = PARSER_EXE_ADD_VP;
+     int i;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeSUB_VP {
+     enum parser_exe_t type = PARSER_EXE_SUB_VP;
+     int i;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeMUL_VP {
+     enum parser_exe_t type = PARSER_EXE_MUL_VP;
+     int i;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeDIV_VP {
+     enum parser_exe_t type = PARSER_EXE_DIV_VP;
+     int i;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeADD_PP {
+@@ -167,22 +175,22 @@ struct alignas(8) ParserExeDIV_PP {
+ 
+ struct alignas(8) ParserExeADD_VN {
+     enum parser_exe_t type = PARSER_EXE_ADD_VN;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeSUB_VN {
+     enum parser_exe_t type = PARSER_EXE_SUB_VN;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeMUL_VN {
+     enum parser_exe_t type = PARSER_EXE_MUL_VN;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeDIV_VN {
+     enum parser_exe_t type = PARSER_EXE_DIV_VN;
+-    double v;
++    ParserExeReal v;
+ };
+ 
+ struct alignas(8) ParserExeADD_PN {
+@@ -193,7 +201,7 @@ struct alignas(8) ParserExeADD_PN {
+ struct alignas(8) ParserExeSUB_PN {
+     enum parser_exe_t type = PARSER_EXE_SUB_PN;
+     int i;
+-    double sign;
++    ParserExeReal sign;
+ };
+ 
+ struct alignas(8) ParserExeMUL_PN {
+@@ -219,8 +227,8 @@ struct alignas(8) ParserExePOWI {
+ struct alignas(8) ParserExeFMA_VPV {
+     enum parser_exe_t type = PARSER_EXE_FMA_VPV;
+     int i;       // variable index
+-    double a;    // multiplier
+-    double b;    // addend
++    ParserExeReal a;    // multiplier
++    ParserExeReal b;    // addend
+ };
+ 
+ struct alignas(8) ParserExeIF {
+@@ -246,6 +254,9 @@ namespace parser_detail
+     AMREX_GPU_HOST_DEVICE AMREX_NO_INLINE
+     void call_user_fn (ParserExeUserFn* p, Stack<T,N>& pstack)
+     {
++#if defined(AMREX_USE_SYCL) && (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL))
++        amrex::ignore_unused(p, pstack);
++#else
+         short argc = p->argc;
+         if (argc == 1) {
+             AMREX_IF_ON_HOST  (( pstack.top() = ParserUserFn1(p->fh)(pstack.top()); ))
+@@ -286,15 +297,16 @@ namespace parser_detail
+             AMREX_IF_ON_DEVICE(( pstack.top() = ParserUserFn4(p->fd)(pstack.top(),a1,a2,a3); ))
+ #endif
+         }
++#endif
+     }
+ }
+ 
+ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+-double parser_exe_eval (const char* p, double const* x)
++ParserExeReal parser_exe_eval (const char* p, ParserExeReal const* x)
+ {
+-    if (p == nullptr) { return std::numeric_limits<double>::max(); }
++    if (p == nullptr) { return std::numeric_limits<ParserExeReal>::max(); }
+ 
+-    Stack<double, AMREX_PARSER_STACK_SIZE> pstack;
++    Stack<ParserExeReal, AMREX_PARSER_STACK_SIZE> pstack;
+     while (*((parser_exe_t*)p) != PARSER_EXE_NULL) { // NOLINT
+         switch (*((parser_exe_t*)p))
+         {
+@@ -307,14 +319,14 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_SYMBOL:
+         {
+             int i = ((ParserExeSymbol*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d);
+             p     += sizeof(ParserExeSymbol);
+             break;
+         }
+         case PARSER_EXE_ADD:
+         {
+-            double b = pstack.top(); // NOLINT
++            ParserExeReal b = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() += b; // NOLINT
+             p += sizeof(ParserExeADD);
+@@ -322,7 +334,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_SUB_F:
+         {
+-            double b = pstack.top(); // NOLINT
++            ParserExeReal b = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() -= b; // NOLINT
+             p += sizeof(ParserExeSUB_F);
+@@ -330,7 +342,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_SUB_B:
+         {
+-            double b = pstack.top(); // NOLINT
++            ParserExeReal b = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() = b - pstack.top(); // NOLINT
+             p += sizeof(ParserExeSUB_B);
+@@ -338,7 +350,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_MUL:
+         {
+-            double b = pstack.top(); // NOLINT
++            ParserExeReal b = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() *= b; // NOLINT
+             p += sizeof(ParserExeMUL);
+@@ -346,7 +358,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_DIV_F:
+         {
+-            double v = pstack.top(); // NOLINT
++            ParserExeReal v = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() /= v; // NOLINT
+             p += sizeof(ParserExeDIV_F);
+@@ -354,7 +366,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_DIV_B:
+         {
+-            double v = pstack.top(); // NOLINT
++            ParserExeReal v = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() = v / pstack.top(); // NOLINT
+             p += sizeof(ParserExeDIV_B);
+@@ -368,7 +380,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_F2_F:
+         {
+-            double v = pstack.top(); // NOLINT
++            ParserExeReal v = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() = parser_call_f2(((ParserExeF2_F*)p)->ftype, pstack.top(), v); // NOLINT
+             p += sizeof(ParserExeF2_F);
+@@ -376,7 +388,7 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_F2_B:
+         {
+-            double v = pstack.top(); // NOLINT
++            ParserExeReal v = pstack.top(); // NOLINT
+             pstack.pop();
+             pstack.top() = parser_call_f2(((ParserExeF2_B*)p)->ftype, v, pstack.top()); // NOLINT
+             p += sizeof(ParserExeF2_B);
+@@ -385,7 +397,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_ADD_VP:
+         {
+             int i = ((ParserExeADD_VP*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeADD_VP*)p)->v + d);
+             p     += sizeof(ParserExeADD_VP);
+             break;
+@@ -393,7 +405,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_SUB_VP:
+         {
+             int i = ((ParserExeSUB_VP*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeSUB_VP*)p)->v - d);
+             p     += sizeof(ParserExeSUB_VP);
+             break;
+@@ -401,7 +413,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_MUL_VP:
+         {
+             int i = ((ParserExeMUL_VP*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeMUL_VP*)p)->v * d);
+             p     += sizeof(ParserExeMUL_VP);
+             break;
+@@ -409,7 +421,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_DIV_VP:
+         {
+             int i = ((ParserExeDIV_VP*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeDIV_VP*)p)->v / d);
+             p     += sizeof(ParserExeDIV_VP);
+             break;
+@@ -417,9 +429,9 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_ADD_PP:
+         {
+             int i = ((ParserExeADD_PP*)p)->i1;
+-            double d1 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d1 = AMREX_PARSER_GET_DATA(i);
+             i     = ((ParserExeADD_PP*)p)->i2;
+-            double d2 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d2 = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d1+d2);
+             p     += sizeof(ParserExeADD_PP);
+             break;
+@@ -427,9 +439,9 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_SUB_PP:
+         {
+             int i = ((ParserExeSUB_PP*)p)->i1;
+-            double d1 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d1 = AMREX_PARSER_GET_DATA(i);
+             i     = ((ParserExeSUB_PP*)p)->i2;
+-            double d2 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d2 = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d1-d2);
+             p     += sizeof(ParserExeSUB_PP);
+             break;
+@@ -437,9 +449,9 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_MUL_PP:
+         {
+             int i = ((ParserExeMUL_PP*)p)->i1;
+-            double d1 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d1 = AMREX_PARSER_GET_DATA(i);
+             i     = ((ParserExeMUL_PP*)p)->i2;
+-            double d2 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d2 = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d1*d2);
+             p     += sizeof(ParserExeMUL_PP);
+             break;
+@@ -447,9 +459,9 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_DIV_PP:
+         {
+             int i = ((ParserExeDIV_PP*)p)->i1;
+-            double d1 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d1 = AMREX_PARSER_GET_DATA(i);
+             i     = ((ParserExeDIV_PP*)p)->i2;
+-            double d2 = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d2 = AMREX_PARSER_GET_DATA(i);
+             pstack.push(d1/d2);
+             p      += sizeof(ParserExeDIV_PP);
+             break;
+@@ -481,7 +493,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_ADD_PN:
+         {
+             int i = ((ParserExeADD_PN*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.top() += d; // NOLINT
+             p         += sizeof(ParserExeADD_PN);
+             break;
+@@ -489,7 +501,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_SUB_PN:
+         {
+             int i = ((ParserExeSUB_PN*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.top() = (d - pstack.top()) * (((ParserExeSUB_PN*)p)->sign); // NOLINT
+             p         += sizeof(ParserExeSUB_PN);
+             break;
+@@ -497,7 +509,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_MUL_PN:
+         {
+             int i = ((ParserExeMUL_PN*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.top() *= d; // NOLINT
+             p         += sizeof(ParserExeMUL_PN);
+             break;
+@@ -505,7 +517,7 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_DIV_PN:
+         {
+             int i = ((ParserExeDIV_PN*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             if (((ParserExeDIV_PN*)p)->reverse) {
+                 pstack.top() /= d; // NOLINT
+             } else {
+@@ -516,21 +528,21 @@ double parser_exe_eval (const char* p, double const* x)
+         }
+         case PARSER_EXE_SQUARE:
+         {
+-            double& d = pstack.top();
++            ParserExeReal& d = pstack.top();
+             d *= d;
+             p += sizeof(ParserExeSquare);
+             break;
+         }
+         case PARSER_EXE_POWI:
+         {
+-            double& d = pstack.top();
++            ParserExeReal& d = pstack.top();
+             int n = ((ParserExePOWI*)p)->i;
+             if (n != 0) {
+                 if (n < 0) {
+                     d = 1.0/d;
+                     n = -n;
+                 }
+-                double y = 1.0;
++                ParserExeReal y = 1.0;
+                 while (n > 1) {
+                     if (n % 2 == 0) {
+                         d *= d;
+@@ -551,14 +563,14 @@ double parser_exe_eval (const char* p, double const* x)
+         case PARSER_EXE_FMA_VPV:
+         {
+             int i = ((ParserExeFMA_VPV*)p)->i;
+-            double d = AMREX_PARSER_GET_DATA(i);
++            ParserExeReal d = AMREX_PARSER_GET_DATA(i);
+             pstack.push(((ParserExeFMA_VPV*)p)->a * d + ((ParserExeFMA_VPV*)p)->b);
+             p += sizeof(ParserExeFMA_VPV);
+             break;
+         }
+         case PARSER_EXE_IF:
+         {
+-            double cond = pstack.top(); // NOLINT
++            ParserExeReal cond = pstack.top(); // NOLINT
+             pstack.pop();
+             if (cond == 0.0) { // false branch
+                 p += ((ParserExeIF*)p)->offset;
+diff --git a/Src/Base/Parser/AMReX_Parser_Y.H b/Src/Base/Parser/AMReX_Parser_Y.H
+index d5771581e..8ce5cdce3 100644
+--- a/Src/Base/Parser/AMReX_Parser_Y.H
++++ b/Src/Base/Parser/AMReX_Parser_Y.H
+@@ -476,63 +476,65 @@ T parser_math_yn (int a, T b)
+ #endif
+ }
+ 
+-AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE double
+-parser_call_f1 (enum parser_f1_t type, double a)
++template <typename T>
++AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE T
++parser_call_f1 (enum parser_f1_t type, T a)
+ {
+     switch (type) {
+     case PARSER_SQRT:        return std::sqrt(a);
+-    case PARSER_EXP:         return parser_math_exp<double>(a);
+-    case PARSER_LOG:         return parser_math_log<double>(a);
+-    case PARSER_LOG10:       return parser_math_log10<double>(a);
+-    case PARSER_SIN:         return parser_math_sin<double>(a);
+-    case PARSER_COS:         return parser_math_cos<double>(a);
+-    case PARSER_TAN:         return parser_math_tan<double>(a);
+-    case PARSER_ASIN:        return parser_math_asin<double>(a);
+-    case PARSER_ACOS:        return parser_math_acos<double>(a);
+-    case PARSER_ATAN:        return parser_math_atan<double>(a);
+-    case PARSER_SINH:        return parser_math_sinh<double>(a);
+-    case PARSER_COSH:        return parser_math_cosh<double>(a);
+-    case PARSER_TANH:        return parser_math_tanh<double>(a);
++    case PARSER_EXP:         return parser_math_exp<T>(a);
++    case PARSER_LOG:         return parser_math_log<T>(a);
++    case PARSER_LOG10:       return parser_math_log10<T>(a);
++    case PARSER_SIN:         return parser_math_sin<T>(a);
++    case PARSER_COS:         return parser_math_cos<T>(a);
++    case PARSER_TAN:         return parser_math_tan<T>(a);
++    case PARSER_ASIN:        return parser_math_asin<T>(a);
++    case PARSER_ACOS:        return parser_math_acos<T>(a);
++    case PARSER_ATAN:        return parser_math_atan<T>(a);
++    case PARSER_SINH:        return parser_math_sinh<T>(a);
++    case PARSER_COSH:        return parser_math_cosh<T>(a);
++    case PARSER_TANH:        return parser_math_tanh<T>(a);
+     case PARSER_ASINH:       return parser_math_asinh<double>(a);
+     case PARSER_ACOSH:       return parser_math_acosh<double>(a);
+     case PARSER_ATANH:       return parser_math_atanh<double>(a);
+     case PARSER_ABS:         return std::abs(a);
+     case PARSER_FLOOR:       return std::floor(a);
+     case PARSER_CEIL:        return std::ceil(a);
+-    case PARSER_COMP_ELLINT_1: return parser_math_comp_ellint_1<double>(a);
+-    case PARSER_COMP_ELLINT_2: return parser_math_comp_ellint_2<double>(a);
+-    case PARSER_ERF:         return parser_math_erf<double>(a);
++    case PARSER_COMP_ELLINT_1: return parser_math_comp_ellint_1<T>(a);
++    case PARSER_COMP_ELLINT_2: return parser_math_comp_ellint_2<T>(a);
++    case PARSER_ERF:         return static_cast<T>(parser_math_erf<double>(static_cast<double>(a)));
+     default:
+         amrex::Abort("parser_call_f1: Unknown function ");
+-        return 0.0;
++        return T(0.0);
+     }
+ }
+ 
+-AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE double
+-parser_call_f2 (enum parser_f2_t type, double a, double b)
++template <typename T>
++AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE T
++parser_call_f2 (enum parser_f2_t type, T a, T b)
+ {
+     switch (type) {
+     case PARSER_POW:
+-        return parser_math_pow<double>(a,b);
++        return parser_math_pow<T>(a,b);
+     case PARSER_ATAN2:
+-        return parser_math_atan2<double>(a,b);
++        return parser_math_atan2<T>(a,b);
+     case PARSER_GT:
+-        return (a > b) ? 1.0 : 0.0;
++        return (a > b) ? T(1.0) : T(0.0);
+     case PARSER_LT:
+-        return (a < b) ? 1.0 : 0.0;
++        return (a < b) ? T(1.0) : T(0.0);
+     case PARSER_GEQ:
+-        return (a >= b) ? 1.0 : 0.0;
++        return (a >= b) ? T(1.0) : T(0.0);
+     case PARSER_LEQ:
+-        return (a <= b) ? 1.0 : 0.0;
++        return (a <= b) ? T(1.0) : T(0.0);
+     case PARSER_EQ:
+-        return (a == b) ? 1.0 : 0.0;
++        return (a == b) ? T(1.0) : T(0.0);
+     case PARSER_NEQ:
+-        return (a != b) ? 1.0 : 0.0;
++        return (a != b) ? T(1.0) : T(0.0);
+     case PARSER_CMP_CHAIN:
+     case PARSER_AND:
+-        return ((a != 0.0) && (b != 0.0)) ? 1.0 : 0.0;
++        return ((a != 0.0) && (b != 0.0)) ? T(1.0) : T(0.0);
+     case PARSER_OR:
+-        return ((a != 0.0) || (b != 0.0)) ? 1.0 : 0.0;
++        return ((a != 0.0) || (b != 0.0)) ? T(1.0) : T(0.0);
+     case PARSER_HEAVISIDE:
+         if (a < 0.0) {
+             return 0.0;
+@@ -542,9 +544,9 @@ parser_call_f2 (enum parser_f2_t type, double a, double b)
+             return b;
+         }
+     case PARSER_JN:
+-        return parser_math_jn<double>(int(a),b);
++        return parser_math_jn<T>(int(a),b);
+     case PARSER_YN:
+-        return parser_math_yn<double>(int(a),b);
++        return parser_math_yn<T>(int(a),b);
+     case PARSER_MIN:
+         return (a < b) ? a : b;
+     case PARSER_MAX:
+@@ -553,7 +555,7 @@ parser_call_f2 (enum parser_f2_t type, double a, double b)
+         return std::fmod(a,b);
+     default:
+         amrex::Abort("parser_call_f2: Unknown function");
+-        return 0.0;
++        return T(0.0);
+     }
+ }
+ 
+diff --git a/Src/Particle/AMReX_DenseBins.H b/Src/Particle/AMReX_DenseBins.H
+index 743673b8b..ac0ae5bb4 100644
+--- a/Src/Particle/AMReX_DenseBins.H
++++ b/Src/Particle/AMReX_DenseBins.H
+@@ -37,6 +37,31 @@ struct DenseBinIteratorFactory
+         const T*
+     >;
+ 
++#ifdef AMREX_METAL_PORT
++    AMREX_GPU_HOST_DEVICE
++    DenseBinIteratorFactory () = default;
++
++    template <typename OffsetVector, typename PermutationVector>
++    DenseBinIteratorFactory (const OffsetVector& offsets,
++                             const PermutationVector& permutation,
++                             const T* items)
++        : m_offsets_ptr(offsets.dataPtr()),
++          m_permutation_ptr(permutation.dataPtr()),
++          m_items(items),
++          m_num_items(static_cast<int>(permutation.size()))
++    {}
++
++    AMREX_GPU_HOST_DEVICE
++    DenseBinIteratorFactory (const index_type* offsets,
++                             const index_type* permutation,
++                             const_pointer_type items,
++                             int num_items) noexcept
++        : m_offsets_ptr(offsets),
++          m_permutation_ptr(permutation),
++          m_items(items),
++          m_num_items(num_items)
++    {}
++#else
+     DenseBinIteratorFactory (const Gpu::DeviceVector<index_type>& offsets,
+                              const Gpu::DeviceVector<index_type>& permutation,
+                              const T* items)
+@@ -44,6 +69,7 @@ struct DenseBinIteratorFactory
+           m_permutation_ptr(permutation.dataPtr()),
+           m_items(items)
+     {}
++#endif
+ 
+     [[nodiscard]] AMREX_GPU_HOST_DEVICE
+     BinIterator<T> getBinIterator(const int bin_number) const noexcept
+@@ -51,9 +77,16 @@ struct DenseBinIteratorFactory
+         return BinIterator<T>(bin_number, m_offsets_ptr, m_permutation_ptr, m_items);
+     }
+ 
++#ifdef AMREX_METAL_PORT
++    const index_type* m_offsets_ptr = nullptr;
++    const index_type* m_permutation_ptr = nullptr;
++    const_pointer_type m_items = nullptr;
++    int m_num_items = 0;
++#else
+     const index_type* m_offsets_ptr;
+     const index_type* m_permutation_ptr;
+     const_pointer_type m_items;
++#endif
+ };
+ 
+ 
+@@ -533,11 +566,19 @@ private:
+ 
+     const_pointer_type m_items;
+ 
++#ifdef AMREX_METAL_PORT
++    Gpu::ManagedVector<index_type> m_bins;
++    Gpu::ManagedVector<index_type> m_counts;
++    Gpu::ManagedVector<index_type> m_local_offsets;
++    Gpu::ManagedVector<index_type> m_offsets;
++    Gpu::ManagedVector<index_type> m_perm;
++#else
+     Gpu::DeviceVector<index_type> m_bins;
+     Gpu::DeviceVector<index_type> m_counts;
+     Gpu::DeviceVector<index_type> m_local_offsets;
+     Gpu::DeviceVector<index_type> m_offsets;
+     Gpu::DeviceVector<index_type> m_perm;
++#endif
+ };
+ 
+ }
+diff --git a/Src/Particle/AMReX_ParticleContainerI.H b/Src/Particle/AMReX_ParticleContainerI.H
+index 67646afba..cbdf8da82 100644
+--- a/Src/Particle/AMReX_ParticleContainerI.H
++++ b/Src/Particle/AMReX_ParticleContainerI.H
+@@ -1144,8 +1144,14 @@ void
+ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssignor>::
+ copyParticles (const PCType& other, bool local)
+ {
++#ifdef AMREX_METAL_PORT
++    BL_PROFILE("ParticleContainer::copyParticles");
++    clearParticles();
++    addParticles(other, local);
++#else
+     using PData = typename ParticleTileType::ConstParticleTileDataType;
+     copyParticles(other, [] AMREX_GPU_HOST_DEVICE (const PData& /*data*/, int /*i*/) { return 1; }, local);
++#endif
+ }
+ 
+ template <typename ParticleType, int NArrayReal, int NArrayInt,
+@@ -1155,8 +1161,49 @@ void
+ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssignor>::
+ addParticles (const PCType& other, bool local)
+ {
++#ifdef AMREX_METAL_PORT
++    BL_PROFILE("ParticleContainer::addParticles");
++
++    for (int lev = 0; lev < other.numLevels(); ++lev)
++    {
++        [[maybe_unused]] Gpu::NoSyncRegion no_sync{};
++        const auto& plevel_other = other.GetParticles(lev);
++        for (MFIter mfi = other.MakeMFIter(lev); mfi.isValid(); ++mfi)
++        {
++            auto index = std::make_pair(mfi.index(), mfi.LocalTileIndex());
++            if (!plevel_other.contains(index)) { continue; }
++            DefineAndReturnParticleTile(lev, mfi.index(), mfi.LocalTileIndex());
++        }
++    }
++
++#ifdef AMREX_USE_OMP
++#pragma omp parallel if (Gpu::notInLaunchRegion())
++#endif
++    for (int lev = 0; lev < other.numLevels(); ++lev)
++    {
++        const auto& plevel_other = other.GetParticles(lev);
++        for (MFIter mfi = other.MakeMFIter(lev); mfi.isValid(); ++mfi)
++        {
++            auto index = std::make_pair(mfi.index(), mfi.LocalTileIndex());
++            if (!plevel_other.contains(index)) { continue; }
++
++            auto& ptile = ParticlesAt(lev, mfi.index(), mfi.LocalTileIndex());
++            const auto& ptile_other = plevel_other.at(index);
++            auto np = ptile_other.numParticles();
++            if (np == 0) { continue; }
++
++            auto dst_index = ptile.numParticles();
++            ptile.resize(dst_index + np);
++            amrex::copyParticles(ptile, ptile_other, 0, dst_index, np);
++        }
++    }
++
++    Gpu::streamSynchronize();
++    if (! local) { Redistribute(); }
++#else
+     using PData = typename ParticleTileType::ConstParticleTileDataType;
+     addParticles(other, [] AMREX_GPU_HOST_DEVICE (const PData& /*data*/, int /*i*/) { return 1; }, local);
++#endif
+ }
+ 
+ template <typename ParticleType, int NArrayReal, int NArrayInt,
+diff --git a/Src/Particle/AMReX_ParticleLocator.H b/Src/Particle/AMReX_ParticleLocator.H
+index 75fa01ae9..3444157d9 100644
+--- a/Src/Particle/AMReX_ParticleLocator.H
++++ b/Src/Particle/AMReX_ParticleLocator.H
+@@ -51,6 +51,29 @@ struct AssignGrid
+             if (m_bin_size.z >= 0) {m_num_bins.z = amrex::max(m_num_bins.z, 1);}
+         }
+ 
++#ifdef AMREX_METAL_PORT
++    AMREX_GPU_HOST_DEVICE
++    AssignGrid (BinIteratorFactory a_bif, Dim3 a_bins_lo, Dim3 a_bins_hi,
++                Dim3 a_bin_size, Dim3 a_num_bins, Box const& a_domain,
++                GpuArray<Real, AMREX_SPACEDIM> const& a_plo,
++                GpuArray<Real, AMREX_SPACEDIM> const& a_dxi,
++                bool a_do_tiling, Dim3 a_tile_size) noexcept
++        : m_bif(a_bif),
++          m_lo(a_bins_lo), m_hi(a_bins_hi), m_bin_size(a_bin_size),
++          m_num_bins(a_num_bins), m_domain(a_domain),
++          m_plo(a_plo), m_dxi(a_dxi),
++          m_tile_size(a_tile_size), m_do_tiling(a_do_tiling)
++        {
++            // clamp bin size and num_bins to 1 for AMREX_SPACEDIM < 3
++            if (m_bin_size.x >= 0) {m_bin_size.x = amrex::max(m_bin_size.x, 1);}
++            if (m_bin_size.y >= 0) {m_bin_size.y = amrex::max(m_bin_size.y, 1);}
++            if (m_bin_size.z >= 0) {m_bin_size.z = amrex::max(m_bin_size.z, 1);}
++
++            if (m_bin_size.x >= 0) {m_num_bins.x = amrex::max(m_num_bins.x, 1);}
++            if (m_bin_size.y >= 0) {m_num_bins.y = amrex::max(m_num_bins.y, 1);}
++            if (m_bin_size.z >= 0) {m_num_bins.z = amrex::max(m_num_bins.z, 1);}
++        }
++#endif
+     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     int getTile (const IntVect& iv, const Box& bx) const noexcept
+     {
+@@ -211,6 +234,62 @@ public:
+                                               m_do_tiling, m_tile_size);
+     }
+ 
++#ifdef AMREX_METAL_PORT
++    void constructGridAssignorOnDevice (AssignGrid<BinIteratorFactory>* dst) const
++    {
++        AMREX_ASSERT(m_defined);
++        auto bif = m_bins.getBinIteratorFactory();
++        auto const* offsets_ptr = bif.m_offsets_ptr;
++        auto const* permutation_ptr = bif.m_permutation_ptr;
++        auto items_ptr = bif.m_items;
++        int num_items = bif.m_num_items;
++        Dim3 bins_lo = m_bins_lo.dim3();
++        Dim3 bins_hi = m_bins_hi.dim3();
++        Dim3 bin_size = m_bin_size.dim3();
++        Dim3 num_bins = m_num_bins.dim3();
++        Box domain = m_geom.Domain();
++        GpuArray<Real, AMREX_SPACEDIM> plo = m_geom.ProbLoArray();
++        GpuArray<Real, AMREX_SPACEDIM> dxi = m_geom.InvCellSizeArray();
++        bool do_tiling = m_do_tiling;
++        Dim3 tile_size = m_tile_size.dim3();
++        amrex::ParallelFor(1, [=] AMREX_GPU_DEVICE (int) noexcept
++        {
++            auto& device_assignor = dst[0];
++            device_assignor.m_bif.m_offsets_ptr = offsets_ptr;
++            device_assignor.m_bif.m_permutation_ptr = permutation_ptr;
++            device_assignor.m_bif.m_items = items_ptr;
++            device_assignor.m_bif.m_num_items = num_items;
++            device_assignor.m_lo = bins_lo;
++            device_assignor.m_hi = bins_hi;
++            device_assignor.m_bin_size = bin_size;
++            device_assignor.m_num_bins = num_bins;
++            device_assignor.m_domain = domain;
++            device_assignor.m_plo = plo;
++            device_assignor.m_dxi = dxi;
++            device_assignor.m_tile_size = tile_size;
++            device_assignor.m_do_tiling = do_tiling;
++
++            if (device_assignor.m_bin_size.x >= 0) {
++                device_assignor.m_bin_size.x = amrex::max(device_assignor.m_bin_size.x, 1);
++            }
++            if (device_assignor.m_bin_size.y >= 0) {
++                device_assignor.m_bin_size.y = amrex::max(device_assignor.m_bin_size.y, 1);
++            }
++            if (device_assignor.m_bin_size.z >= 0) {
++                device_assignor.m_bin_size.z = amrex::max(device_assignor.m_bin_size.z, 1);
++            }
++            if (device_assignor.m_bin_size.x >= 0) {
++                device_assignor.m_num_bins.x = amrex::max(device_assignor.m_num_bins.x, 1);
++            }
++            if (device_assignor.m_bin_size.y >= 0) {
++                device_assignor.m_num_bins.y = amrex::max(device_assignor.m_num_bins.y, 1);
++            }
++            if (device_assignor.m_bin_size.z >= 0) {
++                device_assignor.m_num_bins.z = amrex::max(device_assignor.m_num_bins.z, 1);
++            }
++        });
++    }
++#endif
+     bool isValid (const BoxArray& ba,
+                   bool a_do_tiling = false,
+                   const IntVect& a_tile_size = IntVect(AMREX_D_DECL(1024000, 1024000, 1024000))) const noexcept
+@@ -240,7 +319,11 @@ protected:
+     Bins m_bins;
+ 
+     Gpu::HostVector<Box> m_host_boxes;
++#ifdef AMREX_METAL_PORT
++    Gpu::ManagedVector<Box> m_device_boxes;
++#else
+     Gpu::DeviceVector<Box> m_device_boxes;
++#endif
+ };
+ 
+ template <class BinIteratorFactory>
+@@ -285,7 +368,11 @@ public:
+ 
+ private:
+     Vector<ParticleLocator<Bins> > m_locators;
++#ifdef AMREX_METAL_PORT
++    Gpu::ManagedVector<AssignGrid<BinIteratorFactory> > m_grid_assignors;
++#else
+     Gpu::DeviceVector<AssignGrid<BinIteratorFactory> > m_grid_assignors;
++#endif
+     bool m_defined = false;
+ 
+ public:
+@@ -316,7 +403,14 @@ public:
+         int num_levels = static_cast<int>(a_ba.size());
+         m_locators.resize(num_levels);
+         m_grid_assignors.resize(num_levels);
+-#ifdef AMREX_USE_GPU
++#ifdef AMREX_METAL_PORT
++        for (int lev = 0; lev < num_levels; ++lev)
++        {
++            m_locators[lev].build(a_ba[lev], a_geom[lev], a_do_tiling, a_tile_size);
++            m_locators[lev].constructGridAssignorOnDevice(m_grid_assignors.dataPtr() + lev);
++        }
++        Gpu::streamSynchronize();
++#elif defined(AMREX_USE_GPU)
+         Gpu::HostVector<AssignGrid<BinIteratorFactory> > h_grid_assignors(num_levels);
+         for (int lev = 0; lev < num_levels; ++lev)
+         {
+@@ -379,7 +473,14 @@ public:
+     void setGeometry (const ParGDBBase* a_gdb)
+     {
+         int num_levels = a_gdb->finestLevel()+1;
+-#ifdef AMREX_USE_GPU
++#ifdef AMREX_METAL_PORT
++        for (int lev = 0; lev < num_levels; ++lev)
++        {
++            m_locators[lev].setGeometry(a_gdb->Geom(lev));
++            m_locators[lev].constructGridAssignorOnDevice(m_grid_assignors.dataPtr() + lev);
++        }
++        Gpu::streamSynchronize();
++#elif defined(AMREX_USE_GPU)
+         Gpu::HostVector<AssignGrid<BinIteratorFactory> > h_grid_assignors(num_levels);
+         for (int lev = 0; lev < num_levels; ++lev)
+         {
+diff --git a/Src/Particle/AMReX_ParticleUtil.H b/Src/Particle/AMReX_ParticleUtil.H
+index d0b1f2d23..95c2d0b06 100644
+--- a/Src/Particle/AMReX_ParticleUtil.H
++++ b/Src/Particle/AMReX_ParticleUtil.H
+@@ -658,6 +658,7 @@ partitionParticlesByDest (PTile& ptile, const PLocator& ploc, CellAssignor const
+     auto getPID = pmap.getPIDFunctor();
+     int pid = ParallelContext::MyProcSub();
+ 
++
+     Gpu::DeviceVector<uint8_t> particle_stays(ptile.numParticles());
+     uint8_t * const p_particle_stays = particle_stays.dataPtr();
+     auto ptd = ptile.getParticleTileData();
+@@ -703,10 +704,11 @@ partitionParticlesByDest (PTile& ptile, const PLocator& ploc, CellAssignor const
+                 }
+             }
+ 
+-            p_particle_stays[i] = uint8_t(
++            const uint8_t stays = uint8_t(
+                 ((remove_negative == false) && (!ptd.id(i).is_valid())) ||
+                 ((assigned_grid == gid) && (assigned_tile == tid) &&
+                  (assigned_lev == lev) && (getPID(lev, gid, tid) == pid)));
++            p_particle_stays[i] = stays;
+         });
+ 
+     return partitionParticles(ptile,
+diff --git a/Tools/CMake/AMReX_Config.H.in b/Tools/CMake/AMReX_Config.H.in
+index 4bb574412..b463d82b0 100644
+--- a/Tools/CMake/AMReX_Config.H.in
++++ b/Tools/CMake/AMReX_Config.H.in
+@@ -18,4 +18,11 @@
+ #  error "AMREX_SPACEDIM not 1, 2 or 3"
+ #endif
+ 
++#if defined(AMREX_USE_SYCL) && defined(__APPLE__) && \
++    (defined(__ADAPTIVECPP__) || defined(__ACPP__) || \
++     defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) || \
++     defined(__HIPSYCL__))
++#  define AMREX_METAL_PORT 1
++#endif
++
+ #endif /* AMREX_CONFIG_H_ */

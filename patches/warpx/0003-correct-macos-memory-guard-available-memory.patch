@@ -1,0 +1,397 @@
+diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
+index b2cf3b29..f47788cb 100644
+--- a/Source/Evolve/WarpXEvolve.cpp
++++ b/Source/Evolve/WarpXEvolve.cpp
+@@ -55,6 +55,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cerrno>
++#include <cmath>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <iomanip>
+@@ -130,19 +131,44 @@ namespace
+         errno = 0;
+         char* end = nullptr;
+         double parsed = std::strtod(value, &end);
+-        if (errno != 0 || end == value || parsed <= 0.0 || parsed > 1.0) {
++        if (errno != 0 || end == value || *end != '\0' ||
++            !std::isfinite(parsed) || parsed <= 0.0 || parsed > 1.0)
++        {
+             return default_max_mem_fraction;
+         }
+         return parsed;
+     }
+ 
+ #ifdef __APPLE__
+-    bool sampleSystemMemoryBytes (std::uint64_t& used_bytes, std::uint64_t& physical_bytes)
++    struct SystemMemorySample
++    {
++        std::uint64_t used_bytes = 0;
++        std::uint64_t physical_bytes = 0;
++        std::uint64_t available_bytes = 0;
++        std::uint64_t page_size_bytes = 0;
++        std::uint64_t compressor_page_count = 0;
++        std::uint64_t swapouts = 0;
++        bool has_pressure_level = false;
++        int pressure_level = 0;
++    };
++
++    constexpr std::uint64_t compressor_growth_threshold_bytes = 512ULL * 1024ULL * 1024ULL;
++    constexpr std::uint64_t swapout_growth_threshold_bytes = 128ULL * 1024ULL * 1024ULL;
++    constexpr int compressor_swap_pressure_required_samples = 2;
++
++    bool sampleMemoryPressureLevel (int& pressure_level)
+     {
+-        physical_bytes = 0;
+-        std::size_t physical_size = sizeof(physical_bytes);
+-        if (sysctlbyname("hw.memsize", &physical_bytes, &physical_size, nullptr, 0) != 0 ||
+-            physical_bytes == 0)
++        std::size_t pressure_size = sizeof(pressure_level);
++        return sysctlbyname("kern.memorystatus_vm_pressure_level",
++                            &pressure_level, &pressure_size, nullptr, 0) == 0;
++    }
++
++    bool sampleSystemMemory (SystemMemorySample& sample)
++    {
++        sample = {};
++        std::size_t physical_size = sizeof(sample.physical_bytes);
++        if (sysctlbyname("hw.memsize", &sample.physical_bytes, &physical_size, nullptr, 0) != 0 ||
++            sample.physical_bytes == 0)
+         {
+             return false;
+         }
+@@ -160,48 +186,165 @@ namespace
+             return false;
+         }
+ 
+-        const auto free_bytes = static_cast<std::uint64_t>(stats.free_count) *
+-            static_cast<std::uint64_t>(page_size);
+-        used_bytes = physical_bytes > free_bytes ? physical_bytes - free_bytes : 0;
++        sample.has_pressure_level = sampleMemoryPressureLevel(sample.pressure_level);
++
++        const auto free_pages = static_cast<std::uint64_t>(stats.free_count);
++        const auto file_backed_pages = static_cast<std::uint64_t>(stats.external_page_count);
++        const auto purgeable_pages = static_cast<std::uint64_t>(stats.purgeable_count);
++        const auto extra_purgeable_pages = purgeable_pages > file_backed_pages ?
++            purgeable_pages - file_backed_pages : 0;
++        const auto available_pages = free_pages + file_backed_pages + extra_purgeable_pages;
++
++        // Coarse deck-too-large guard only. It does not protect in-step Metal JIT,
++        // GPU driver, or WindowServer hangs; those need bounded compiler/runtime gates.
++        // Do not count inactive pages: they can include dirty anonymous memory that
++        // needs compression or swap. Count free plus file-backed pages, with only the
++        // purgeable pages not already covered by file-backed pages.
++        sample.available_bytes = std::min(
++            sample.physical_bytes,
++            available_pages * static_cast<std::uint64_t>(page_size));
++        sample.used_bytes = sample.physical_bytes > sample.available_bytes ?
++            sample.physical_bytes - sample.available_bytes : 0;
++        sample.page_size_bytes = static_cast<std::uint64_t>(page_size);
++        sample.compressor_page_count = static_cast<std::uint64_t>(stats.compressor_page_count);
++        sample.swapouts = static_cast<std::uint64_t>(stats.swapouts);
+         return true;
+     }
+-#else
+-    bool sampleSystemMemoryBytes (std::uint64_t& used_bytes, std::uint64_t& physical_bytes)
++
++    bool hasAbnormalMemoryPressure (SystemMemorySample const& sample)
+     {
+-        used_bytes = 0;
+-        physical_bytes = 0;
+-        return false;
++        // Darwin values: 1 normal, 2 warning, 4 critical. WARN is routine on
++        // macOS (file-cache churn), so only CRITICAL is treated as fatal.
++        return sample.has_pressure_level && sample.pressure_level >= 4;
+     }
+-#endif
+ 
+-    void CheckSystemMemoryPressure ()
++    bool hasCompressorSwapPressure (SystemMemorySample const& sample)
+     {
+-        std::uint64_t used_bytes = 0;
+-        std::uint64_t physical_bytes = 0;
+-        if (!sampleSystemMemoryBytes(used_bytes, physical_bytes)) {
+-            return;
++        static bool have_previous_sample = false;
++        static std::uint64_t previous_compressor_page_count = 0;
++        static std::uint64_t previous_swapouts = 0;
++        static int consecutive_pressure_samples = 0;
++
++        std::uint64_t compressor_delta_pages = 0;
++        std::uint64_t swapout_delta_pages = 0;
++        if (have_previous_sample) {
++            compressor_delta_pages =
++                sample.compressor_page_count > previous_compressor_page_count ?
++                sample.compressor_page_count - previous_compressor_page_count : 0;
++            swapout_delta_pages = sample.swapouts > previous_swapouts ?
++                sample.swapouts - previous_swapouts : 0;
+         }
+ 
+-        const double max_fraction = readMaxMemFraction();
+-        const long double threshold_bytes =
+-            static_cast<long double>(physical_bytes) * max_fraction;
+-        if (static_cast<long double>(used_bytes) < threshold_bytes) {
+-            return;
++        const auto compressor_delta_bytes =
++            compressor_delta_pages * sample.page_size_bytes;
++        const auto swapout_delta_bytes =
++            swapout_delta_pages * sample.page_size_bytes;
++        const bool pressure_sample = have_previous_sample &&
++            compressor_delta_bytes >= compressor_growth_threshold_bytes &&
++            swapout_delta_bytes >= swapout_growth_threshold_bytes;
++
++        if (pressure_sample) {
++            ++consecutive_pressure_samples;
++        } else {
++            consecutive_pressure_samples = 0;
+         }
+ 
++        have_previous_sample = true;
++        previous_compressor_page_count = sample.compressor_page_count;
++        previous_swapouts = sample.swapouts;
++        return consecutive_pressure_samples >= compressor_swap_pressure_required_samples;
++    }
++
++    void AbortForSystemMemorySamplingFailure ()
++    {
++        amrex::Abort(
++            "WarpX: macOS system memory pressure guard could not sample VM "
++            "statistics; refusing to run without the crashguard on Apple hosts.");
++    }
++#else
++    struct SystemMemorySample
++    {
++        std::uint64_t used_bytes = 0;
++        std::uint64_t physical_bytes = 0;
++        std::uint64_t available_bytes = 0;
++        std::uint64_t page_size_bytes = 0;
++        std::uint64_t compressor_page_count = 0;
++        std::uint64_t swapouts = 0;
++        bool has_pressure_level = false;
++        int pressure_level = 0;
++    };
++
++    bool sampleSystemMemory (SystemMemorySample& sample)
++    {
++        sample = {};
++        return false;
++    }
++
++    bool hasAbnormalMemoryPressure (SystemMemorySample const&)
++    {
++        return false;
++    }
++
++    bool hasCompressorSwapPressure (SystemMemorySample const&)
++    {
++        return false;
++    }
++
++    void AbortForSystemMemorySamplingFailure () {}
++#endif
++
++    void AbortForSystemMemoryPressure (
++        SystemMemorySample const& sample,
++        double max_fraction,
++        char const* reason)
++    {
+         constexpr long double gib = 1024.0L * 1024.0L * 1024.0L;
+         std::ostringstream msg;
+         msg << std::fixed << std::setprecision(1)
+             << "WarpX: system memory pressure exceeded "
+             << static_cast<int>(max_fraction * 100.0 + 0.5)
+-            << "% of physical RAM (used "
+-            << static_cast<long double>(used_bytes) / gib
++            << "% of physical RAM (" << reason << "; used "
++            << static_cast<long double>(sample.used_bytes) / gib
+             << " GiB / "
+-            << static_cast<long double>(physical_bytes) / gib
+-            << " GiB) \u2014 deck too large for this machine; reduce resolution/particles "
++            << static_cast<long double>(sample.physical_bytes) / gib
++            << " GiB, available "
++            << static_cast<long double>(sample.available_bytes) / gib
++            << " GiB";
++        if (sample.has_pressure_level) {
++            msg << ", pressure level " << sample.pressure_level;
++        }
++        msg << ", compressor pages " << sample.compressor_page_count
++            << ", swapouts " << sample.swapouts
++            << ") - deck too large for this machine; reduce resolution/particles "
+                "or raise WARPX_MAX_MEM_FRACTION at your own risk.";
+         amrex::Abort(msg.str());
+     }
++
++    void CheckSystemMemoryPressure ()
++    {
++        SystemMemorySample sample;
++        if (!sampleSystemMemory(sample)) {
++            AbortForSystemMemorySamplingFailure();
++            return;
++        }
++
++        const double max_fraction = readMaxMemFraction();
++        if (hasAbnormalMemoryPressure(sample)) {
++            AbortForSystemMemoryPressure(sample, max_fraction, "macOS memory pressure warning");
++        }
++        if (hasCompressorSwapPressure(sample)) {
++            AbortForSystemMemoryPressure(
++                sample, max_fraction, "sustained compressor and swap pressure rising");
++        }
++
++        const long double threshold_bytes =
++            static_cast<long double>(sample.physical_bytes) * max_fraction;
++        if (static_cast<long double>(sample.used_bytes) < threshold_bytes) {
++            return;
++        }
++        AbortForSystemMemoryPressure(
++            sample, max_fraction, "reclaimable memory below guard threshold");
++    }
+ }
+ 
+ void
+diff --git a/Source/main.cpp b/Source/main.cpp
+index 0d9cbf8f..67bd9382 100644
+--- a/Source/main.cpp
++++ b/Source/main.cpp
+@@ -13,8 +13,132 @@
+ #include <ablastr/profiler/ProfilerWrapper.H>
+ #include <ablastr/utils/timer/Timer.H>
+ 
++#include <AMReX.H>
+ #include <AMReX_Print.H>
+ 
++#include <algorithm>
++#include <cerrno>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <iomanip>
++#include <sstream>
++
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <sys/sysctl.h>
++#endif
++
++namespace
++{
++    constexpr double default_max_mem_fraction = 0.70;
++
++    double readMaxMemFraction ()
++    {
++        const char* value = std::getenv("WARPX_MAX_MEM_FRACTION");
++        if (value == nullptr || value[0] == '\0') {
++            return default_max_mem_fraction;
++        }
++
++        errno = 0;
++        char* end = nullptr;
++        double parsed = std::strtod(value, &end);
++        if (errno != 0 || end == value || *end != '\0' ||
++            !std::isfinite(parsed) || parsed <= 0.0 || parsed > 1.0)
++        {
++            return default_max_mem_fraction;
++        }
++        return parsed;
++    }
++
++#ifdef __APPLE__
++    void AbortStartupMemorySamplingFailure ()
++    {
++        amrex::Abort(
++            "WarpX: startup macOS system memory pressure guard could not "
++            "sample VM statistics; refusing to run without the crashguard on "
++            "Apple hosts.");
++    }
++
++    void CheckStartupSystemMemoryPressure ()
++    {
++        std::uint64_t physical_bytes = 0;
++        std::size_t physical_size = sizeof(physical_bytes);
++        if (sysctlbyname("hw.memsize", &physical_bytes, &physical_size, nullptr, 0) != 0 ||
++            physical_bytes == 0)
++        {
++            AbortStartupMemorySamplingFailure();
++            return;
++        }
++
++        vm_size_t page_size = 0;
++        if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS || page_size == 0) {
++            AbortStartupMemorySamplingFailure();
++            return;
++        }
++
++        vm_statistics64_data_t stats {};
++        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++        if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
++                              reinterpret_cast<host_info64_t>(&stats), &count) != KERN_SUCCESS)
++        {
++            AbortStartupMemorySamplingFailure();
++            return;
++        }
++
++        int pressure_level = 0;
++        bool has_pressure_level = false;
++        std::size_t pressure_size = sizeof(pressure_level);
++        has_pressure_level = sysctlbyname("kern.memorystatus_vm_pressure_level",
++                                          &pressure_level, &pressure_size, nullptr, 0) == 0;
++
++        const auto free_pages = static_cast<std::uint64_t>(stats.free_count);
++        const auto file_backed_pages = static_cast<std::uint64_t>(stats.external_page_count);
++        const auto purgeable_pages = static_cast<std::uint64_t>(stats.purgeable_count);
++        const auto extra_purgeable_pages = purgeable_pages > file_backed_pages ?
++            purgeable_pages - file_backed_pages : 0;
++        const auto available_pages = free_pages + file_backed_pages + extra_purgeable_pages;
++        const auto available_bytes = std::min(
++            physical_bytes,
++            available_pages * static_cast<std::uint64_t>(page_size));
++        const auto used_bytes = physical_bytes > available_bytes ?
++            physical_bytes - available_bytes : 0;
++
++        const double max_fraction = readMaxMemFraction();
++        const auto over_fraction =
++            static_cast<long double>(used_bytes) >=
++            static_cast<long double>(physical_bytes) * max_fraction;
++        // Darwin values: 1 normal, 2 warning, 4 critical. Abort only on
++        // CRITICAL; WARN is routine on macOS.
++        const auto abnormal_pressure = has_pressure_level && pressure_level >= 4;
++        if (!over_fraction && !abnormal_pressure) {
++            return;
++        }
++
++        constexpr long double gib = 1024.0L * 1024.0L * 1024.0L;
++        std::ostringstream msg;
++        msg << std::fixed << std::setprecision(1)
++            << "WarpX: system memory pressure exceeded "
++            << static_cast<int>(max_fraction * 100.0 + 0.5)
++            << "% of physical RAM (startup guard; used "
++            << static_cast<long double>(used_bytes) / gib
++            << " GiB / "
++            << static_cast<long double>(physical_bytes) / gib
++            << " GiB, available "
++            << static_cast<long double>(available_bytes) / gib
++            << " GiB";
++        if (has_pressure_level) {
++            msg << ", pressure level " << pressure_level;
++        }
++        msg << ") - deck too large for this machine; reduce resolution/particles "
++               "or raise WARPX_MAX_MEM_FRACTION at your own risk.";
++        amrex::Abort(msg.str());
++    }
++#else
++    void CheckStartupSystemMemoryPressure () {}
++#endif
++}
++
+ int
+ main (int argc, char* argv[]) {
+     warpx::initialization::initialize_external_libraries(argc, argv);
+@@ -25,6 +149,7 @@ main (int argc, char* argv[]) {
+         timer.record_start_time();
+ 
+         auto& warpx = WarpX::GetInstance();
++        CheckStartupSystemMemoryPressure();
+         warpx.InitData();
+         warpx.Evolve();
+         const auto is_warpx_verbose = warpx.Verbose();

@@ -37,7 +37,7 @@ if (_amrex_sycl_adaptivecpp)
     # Disable __int128 support: the Metal emitter cannot translate i128
     # (maps to uint4 in MSL, casts unsupported). All i128 codepaths
     # (umulhi, FastDivmodU64) have safe non-128 fallbacks.
-    target_compile_definitions(SYCL INTERFACE AMREX_NO_INT128)
+    target_compile_definitions(SYCL INTERFACE AMREX_NO_INT128 AMREX_SYCL_NO_MULTIPASS_SCAN)
 
 else()
     # ==============================================================
