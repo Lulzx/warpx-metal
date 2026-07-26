@@ -109,3 +109,47 @@ step 10.
 This architecture does not repair Apple's driver. It converts the driver defect
 into bounded lost work with a correctness-preserving restart, which is the
 strongest recovery guarantee available to client code.
+
+## CPU demotion: making the driver defect a performance event
+
+Process-isolated restart assumes a *new* process escapes whatever wedged the
+old one. That holds on M4 Pro (measured: a hung run aborted through the bounded
+wait, and the next fresh process ran clean), but not on M3 Ultra, where fresh
+processes reportedly hang on their first kernel until the machine is rebooted.
+A recovery ladder that ends in "reboot" is not a recovery ladder.
+
+`--cpu-fallback-executable` adds a terminating rung. The CPU build has no Metal
+dependency at all, so it is an *absorbing state*: once the run is there,
+progress can continue regardless of what the driver is doing.
+
+This works because AMReX checkpoints are backend independent. Verified
+directly: `warpx.2d.NOMPI.SYCL` ran 40 steps on Metal and wrote `chk000040`;
+`warpx.2d.NOMPI.OMP` restarted from that checkpoint and ran steps 41-50 with
+exact time continuity (`3.022e-14` = 41 x dt), both species intact, then wrote
+its own checkpoint.
+
+### Policy
+
+1. Run each chunk on the primary binary, up to `--max-retries + 1` attempts.
+2. If those attempts are exhausted *and at least one failed with a GPU wedge
+   signature* (Metal completion timeout, or the no-log-progress watchdog),
+   demote to the CPU binary and retry the same chunk with
+   `--cpu-fallback-retries + 1` attempts.
+3. Demotion is permanent for the remainder of the run.
+
+Only a wedged GPU triggers demotion. An external `SIGTERM`/`SIGKILL` or a
+deterministic WarpX failure would fail identically on the CPU binary, so
+demoting on those would convert a real bug into a silent slowdown. The fallback
+binary is validated at startup, not at demotion time, because discovering a bad
+path only once the GPU has wedged defeats the purpose.
+
+Log names carry the backend (`...-gpu-attempt-1.log`, `...-cpu-attempt-1.log`)
+and the checkpoint marker records the exact command, so which binary produced a
+given checkpoint is recoverable after the fact.
+
+### Consequence
+
+With a fallback configured, a Metal hang no longer threatens completion or
+correctness of a run; it costs the wedged chunk's work and whatever speed the
+GPU was providing. The Apple driver report and any residual-state question stop
+being blockers for shipping long runs.

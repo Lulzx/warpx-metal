@@ -329,6 +329,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="trusted WarpX checkpoint to use before supervisor-owned checkpoints",
     )
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument(
+        "--cpu-fallback-executable",
+        type=Path,
+        help=(
+            "non-Metal WarpX binary to demote to when the GPU binary keeps "
+            "wedging. AMReX checkpoints are backend independent, so the CPU "
+            "build resumes a GPU-written checkpoint directly. Demotion is "
+            "permanent for the remainder of the run."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-fallback-retries",
+        type=nonnegative_int,
+        default=1,
+        help=(
+            "extra attempts granted to the chunk that triggered demotion, "
+            "using the CPU binary (default: 1)"
+        ),
+    )
     parser.add_argument("executable", type=Path)
     parser.add_argument("input_file", type=Path)
     parser.add_argument(
@@ -348,6 +367,20 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"executable is missing or not executable: {executable}")
     if not input_file.is_file():
         raise SystemExit(f"input file does not exist: {input_file}")
+
+    cpu_fallback = args.cpu_fallback_executable
+    if cpu_fallback is not None:
+        cpu_fallback = cpu_fallback.resolve()
+        # Validate now rather than at demotion time: discovering a bad fallback
+        # path only once the GPU has already wedged defeats its purpose.
+        if not cpu_fallback.is_file() or not os.access(cpu_fallback, os.X_OK):
+            raise SystemExit(
+                f"cpu fallback is missing or not executable: {cpu_fallback}"
+            )
+        if cpu_fallback == executable:
+            raise SystemExit(
+                "cpu fallback must differ from the primary executable"
+            )
 
     checkpoint_prefix = args.checkpoint_prefix
     if not checkpoint_prefix.is_absolute():
@@ -416,117 +449,164 @@ def main(argv: list[str] | None = None) -> int:
         args.command_timeout_seconds * 1000
     )
 
+    active_executable = executable
+    demoted = False
+
     while current < args.max_step:
         target = min(current + args.chunk_steps, args.max_step)
         expected_checkpoint = checkpoint_path(
             checkpoint_prefix, target, args.checkpoint_digits
         )
-        attempts = args.max_retries + 1
 
-        for attempt in range(1, attempts + 1):
-            if expected_checkpoint.exists():
-                # This path is dedicated to the supervisor. Without our marker,
-                # it is either stale or was left by an interrupted checkpoint.
-                if (expected_checkpoint / MARKER_NAME).exists():
+        # A chunk gets at most two passes: one on the primary binary and, if
+        # that pass wedged the GPU, one more after demoting to the CPU binary.
+        while True:
+            attempts = (
+                args.cpu_fallback_retries + 1
+                if demoted
+                else args.max_retries + 1
+            )
+            saw_gpu_wedge = False
+            committed = False
+
+            for attempt in range(1, attempts + 1):
+                if expected_checkpoint.exists():
+                    # This path is dedicated to the supervisor. Without our
+                    # marker, it is either stale or was left by an interrupted
+                    # checkpoint.
+                    if (expected_checkpoint / MARKER_NAME).exists():
+                        print(
+                            f"[fatal] verified checkpoint collision at "
+                            f"{expected_checkpoint}; resume it or use a fresh "
+                            f"prefix",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    try:
+                        quarantined = quarantine_checkpoint(
+                            expected_checkpoint, state_dir
+                        )
+                    except RuntimeError as error:
+                        print(f"[fatal] {error}", file=sys.stderr)
+                        return 2
+                    print(f"[quarantined] incomplete checkpoint: {quarantined}")
+
+                command = [
+                    str(active_executable),
+                    str(input_file),
+                    *forwarded_arguments,
+                    f"max_step={target}",
+                    f"diagnostics.diags_names={' '.join(diagnostic_names)}",
+                    f"{args.diagnostic_name}.diag_type=Full",
+                    f"{args.diagnostic_name}.format=checkpoint",
+                    f"{args.diagnostic_name}.intervals={target}",
+                    f"{args.diagnostic_name}.dump_last_timestep=1",
+                    f"{args.diagnostic_name}.file_prefix={checkpoint_prefix}",
+                    f"{args.diagnostic_name}.file_min_digits="
+                    f"{args.checkpoint_digits}",
+                    "warpx.verbose=1",
+                ]
+                if previous:
+                    command.append(f"amr.restart={previous}")
+
+                backend = "cpu" if demoted else "gpu"
+                log_path = state_dir / (
+                    f"step-{current:010d}-to-{target:010d}-"
+                    f"{backend}-attempt-{attempt}.log"
+                )
+                print(
+                    f"[chunk {current}->{target}] {backend} attempt "
+                    f"{attempt}/{attempts}; log: {log_path}"
+                )
+                result = run_attempt(
+                    command,
+                    log_path,
+                    environment,
+                    args.stall_timeout_seconds,
+                    work_dir,
+                )
+
+                if (
+                    result.returncode == 0
+                    and not result.watchdog_fired
+                    and not result.metal_timeout
+                ):
+                    try:
+                        mark_checkpoint(
+                            expected_checkpoint, target, previous, command
+                        )
+                    except RuntimeError as error:
+                        print(f"[fatal] {error}", file=sys.stderr)
+                        return 2
+                    previous = expected_checkpoint.resolve()
+                    current = target
+                    committed = True
+                    print(f"[committed] verified checkpoint: {previous}")
+                    break
+
+                recoverable_signal = (
+                    result.returncode in RECOVERABLE_RETURN_CODES
+                )
+                recoverable = (
+                    result.watchdog_fired
+                    or result.metal_timeout
+                    or recoverable_signal
+                )
+                # Only a wedged GPU justifies demotion. An external kill or a
+                # deterministic WarpX failure would fail identically on the CPU
+                # binary, and demoting on those would hide real bugs behind a
+                # silent slowdown.
+                if result.metal_timeout or result.watchdog_fired:
+                    saw_gpu_wedge = True
+                reason = (
+                    "no-log-progress watchdog"
+                    if result.watchdog_fired
+                    else "Metal completion timeout"
+                    if result.metal_timeout
+                    else f"child terminated by signal {-result.returncode}"
+                    if recoverable_signal
+                    else f"child exit {result.returncode}"
+                )
+                print(f"[failed] {reason}", file=sys.stderr)
+                if not recoverable:
                     print(
-                        f"[fatal] verified checkpoint collision at "
-                        f"{expected_checkpoint}; resume it or use a fresh prefix",
+                        f"[fatal] non-recoverable WarpX failure; inspect "
+                        f"{log_path}",
                         file=sys.stderr,
                     )
-                    return 2
-                try:
-                    quarantined = quarantine_checkpoint(
-                        expected_checkpoint, state_dir
-                    )
-                except RuntimeError as error:
-                    print(f"[fatal] {error}", file=sys.stderr)
-                    return 2
-                print(f"[quarantined] incomplete checkpoint: {quarantined}")
+                    return result.returncode or 2
+                if attempt == attempts:
+                    break
+                if args.retry_backoff_seconds:
+                    time.sleep(args.retry_backoff_seconds)
 
-            command = [
-                str(executable),
-                str(input_file),
-                *forwarded_arguments,
-                f"max_step={target}",
-                f"diagnostics.diags_names={' '.join(diagnostic_names)}",
-                f"{args.diagnostic_name}.diag_type=Full",
-                f"{args.diagnostic_name}.format=checkpoint",
-                f"{args.diagnostic_name}.intervals={target}",
-                f"{args.diagnostic_name}.dump_last_timestep=1",
-                f"{args.diagnostic_name}.file_prefix={checkpoint_prefix}",
-                f"{args.diagnostic_name}.file_min_digits={args.checkpoint_digits}",
-                "warpx.verbose=1",
-            ]
-            if previous:
-                command.append(f"amr.restart={previous}")
-
-            log_path = state_dir / (
-                f"step-{current:010d}-to-{target:010d}-attempt-{attempt}.log"
-            )
-            print(
-                f"[chunk {current}->{target}] attempt {attempt}/{attempts}; "
-                f"log: {log_path}"
-            )
-            result = run_attempt(
-                command,
-                log_path,
-                environment,
-                args.stall_timeout_seconds,
-                work_dir,
-            )
-
-            if (
-                result.returncode == 0
-                and not result.watchdog_fired
-                and not result.metal_timeout
-            ):
-                try:
-                    mark_checkpoint(
-                        expected_checkpoint, target, previous, command
-                    )
-                except RuntimeError as error:
-                    print(f"[fatal] {error}", file=sys.stderr)
-                    return 2
-                previous = expected_checkpoint.resolve()
-                current = target
-                print(f"[committed] verified checkpoint: {previous}")
+            if committed:
                 break
 
-            recoverable_signal = result.returncode in RECOVERABLE_RETURN_CODES
-            recoverable = (
-                result.watchdog_fired
-                or result.metal_timeout
-                or recoverable_signal
-            )
-            reason = (
-                "no-log-progress watchdog"
-                if result.watchdog_fired
-                else "Metal completion timeout"
-                if result.metal_timeout
-                else f"child terminated by signal {-result.returncode}"
-                if recoverable_signal
-                else f"child exit {result.returncode}"
-            )
-            print(f"[failed] {reason}", file=sys.stderr)
-            if not recoverable:
+            if cpu_fallback is not None and not demoted and saw_gpu_wedge:
+                # The GPU wedged repeatedly on this chunk. The CPU build has no
+                # Metal dependency, so it is an absorbing state: progress can
+                # continue from the same verified checkpoint regardless of what
+                # the driver is doing. Demotion is permanent for this run.
+                demoted = True
+                active_executable = cpu_fallback
                 print(
-                    f"[fatal] non-recoverable WarpX failure; inspect {log_path}",
+                    f"[demoted] GPU wedged {attempts}x on chunk "
+                    f"{current}->{target}; continuing on CPU binary "
+                    f"{cpu_fallback}",
                     file=sys.stderr,
                 )
-                return result.returncode or 2
-            if attempt == attempts:
-                print(
-                    f"[fatal] exhausted {args.max_retries} retries for "
-                    f"chunk {current}->{target}",
-                    file=sys.stderr,
-                )
-                return 75
-            if args.retry_backoff_seconds:
-                time.sleep(args.retry_backoff_seconds)
-        else:
+                continue
+
+            print(
+                f"[fatal] exhausted {attempts} attempts for "
+                f"chunk {current}->{target}"
+                + ("" if cpu_fallback is None else " (already on CPU binary)"),
+                file=sys.stderr,
+            )
             return 75
 
-    print(f"[complete] reached step {current}")
+    print(f"[complete] reached step {current}" + (" (demoted to CPU)" if demoted else ""))
     return 0
 
 

@@ -204,5 +204,138 @@ class WarpXMetalSupervisorTest(unittest.TestCase):
             )
 
 
+class CpuDemotionTest(unittest.TestCase):
+    """The CPU build has no Metal dependency, so it is the absorbing state the
+    run falls back to when the GPU keeps wedging."""
+
+    WEDGING_GPU = textwrap.dedent(
+        """\
+        #!/usr/bin/env python3
+        print(
+            "metal_queue: producer before device-to-host memcpy timed out "
+            "after 120000 ms; command buffer remained committed"
+        )
+        raise SystemExit(70)
+        """
+    )
+
+    WORKING_CPU = textwrap.dedent(
+        """\
+        #!/usr/bin/env python3
+        import pathlib
+        import sys
+
+        assignments = {
+            item.split("=", 1)[0]: item.split("=", 1)[1]
+            for item in sys.argv[1:]
+            if "=" in item
+        }
+        target = int(assignments["max_step"])
+        prefix = pathlib.Path(assignments["metal_recovery_chk.file_prefix"])
+        digits = int(assignments["metal_recovery_chk.file_min_digits"])
+        checkpoint = prefix.parent / f"{prefix.name}{target:0{digits}d}"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "WarpXHeader").write_text("header")
+        (checkpoint / "Level_0").mkdir()
+        print(f"STEP {target}")
+        """
+    )
+
+    def _write(self, path: Path, body: str) -> Path:
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def _run(self, root: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        input_file = root / "inputs"
+        input_file.write_text(
+            "diagnostics.diags_names = diag1\n", encoding="utf-8"
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SUPERVISOR_PATH),
+                "--max-step", "2",
+                "--chunk-steps", "2",
+                "--max-retries", "1",
+                "--retry-backoff-seconds", "0",
+                "--stall-timeout-seconds", "10",
+                "--work-dir", str(root),
+                "--checkpoint-prefix", "checkpoints/chk",
+                *extra,
+                str(root / "gpu.py"),
+                str(input_file),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+
+    def test_demotes_to_cpu_after_persistent_metal_wedge(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write(root / "gpu.py", self.WEDGING_GPU)
+            cpu = self._write(root / "cpu.py", self.WORKING_CPU)
+
+            result = self._run(
+                root,
+                "--cpu-fallback-executable", str(cpu),
+                "--cpu-fallback-retries", "0",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("[demoted]", result.stderr)
+
+            checkpoint = root / "checkpoints" / "chk0000000002"
+            marker = json.loads(
+                (checkpoint / SUPERVISOR.MARKER_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(marker["step"], 2)
+            # The committed checkpoint must have been produced by the CPU
+            # binary, not merely attributed to it.
+            self.assertEqual(Path(marker["command"][0]).resolve(), cpu.resolve())
+
+            logs = sorted(
+                p.name
+                for p in (root / ".warpx-metal-supervisor").glob("*.log")
+            )
+            # Two wedged GPU attempts, then one CPU attempt.
+            self.assertEqual(len(logs), 3, logs)
+            self.assertEqual(sum("-gpu-" in name for name in logs), 2, logs)
+            self.assertEqual(sum("-cpu-" in name for name in logs), 1, logs)
+
+    def test_does_not_demote_when_failure_is_not_a_gpu_wedge(self) -> None:
+        """An external SIGTERM is retryable but says nothing about the GPU.
+        Demoting on it would hide real failures behind a silent slowdown."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write(
+                root / "gpu.py",
+                "#!/usr/bin/env python3\n"
+                "import os, signal\n"
+                "os.kill(os.getpid(), signal.SIGTERM)\n",
+            )
+            cpu = self._write(root / "cpu.py", self.WORKING_CPU)
+
+            result = self._run(
+                root, "--cpu-fallback-executable", str(cpu)
+            )
+            self.assertEqual(result.returncode, 75)
+            self.assertNotIn("[demoted]", result.stderr)
+
+    def test_rejects_unusable_cpu_fallback_before_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write(root / "gpu.py", self.WORKING_CPU)
+
+            result = self._run(
+                root,
+                "--cpu-fallback-executable", str(root / "missing.py"),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cpu fallback is missing", result.stderr)
+            # Must fail before any child runs, not at demotion time.
+            self.assertFalse((root / ".warpx-metal-supervisor").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
