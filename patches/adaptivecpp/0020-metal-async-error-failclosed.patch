@@ -1,0 +1,200 @@
+Metal: restore fail-closed async error propagation
+
+0018 added metal_inorder_queue::_async_error_state so that an asynchronous
+command-buffer failure would be visible to a later queue wait. 0019 replaced
+the device-to-host shared-event path with a synchronous drain and, in doing so,
+removed the only writer of that state while leaving the reader in wait().
+
+Net effect at the pinned base: _async_error_state is never written, so
+metal_inorder_queue::wait() returns success unconditionally. Kernel command
+buffer failures and pointer-translation misses (launch_kernel_from_library),
+host-to-device memcpy failures (submit_memcpy) and memset failures
+(memset_device) only reached register_error() and could not fail a queue wait.
+
+This restores the 0018 guarantee for every surviving completion handler:
+
+- Move async_error_state out of metal_inorder_queue's private section to
+  namespace scope as metal_async_error_state, so the submission helpers that
+  install completion handlers can name it.
+- Add record_metal_async_failure(), which latches the first failure and still
+  forwards to register_error().
+- Thread the shared state into launch_kernel_from_library() and
+  memset_device(), and capture it in the submit_memcpy() completion handler.
+
+The state is held by shared_ptr and captured by value because completion
+handlers may outlive the queue that submitted them. The latched error is
+sticky: once a failure is recorded, subsequent waits keep reporting it.
+
+Device-to-host memcpy is unaffected; 0019 made it return errors directly.
+
+diff --git a/include/hipSYCL/runtime/metal/metal_queue.hpp b/include/hipSYCL/runtime/metal/metal_queue.hpp
+index a82832b5..0e952be5 100644
+--- a/include/hipSYCL/runtime/metal/metal_queue.hpp
++++ b/include/hipSYCL/runtime/metal/metal_queue.hpp
+@@ -106,6 +106,20 @@ struct metal_profiling_setup {
+   std::shared_ptr<metal_execution_finish_timestamp> finish_time;
+ };
+ 
++// Command-buffer completion handlers run asynchronously and may outlive the
++// queue that submitted them, so the sink is held by shared_ptr and captured by
++// value. Namespace scope (rather than nested in metal_inorder_queue) so the
++// submission helpers that install those handlers can name it.
++struct metal_async_error_state {
++  std::mutex mutex;
++  result error;
++};
++
++// Records the first asynchronous failure so that a later queue wait can fail
++// closed. Also forwards to register_error() for the global async error list.
++void record_metal_async_failure(
++    const std::shared_ptr<metal_async_error_state>& state, result failure);
++
+ class metal_inorder_queue;
+ class metal_sscp_code_object_invoker : public sscp_code_object_invoker {
+ public:
+@@ -158,11 +172,6 @@ public:
+   virtual ~metal_inorder_queue();
+ 
+ private:
+-  struct async_error_state {
+-    std::mutex mutex;
+-    result error;
+-  };
+-
+   MTL::CommandBuffer* new_command_buffer();
+   void remember_submitted_command_buffer(MTL::CommandBuffer* command_buffer);
+   result wait_for_last_submitted_command_buffer(const char* operation);
+@@ -190,8 +199,8 @@ private:
+   // Command-buffer callbacks outlive individual submissions. Keep their first
+   // asynchronous failure available to queue waits so a published completion
+   // value cannot make invalid device-to-host data look usable.
+-  std::shared_ptr<async_error_state> _async_error_state =
+-    std::make_shared<async_error_state>();
++  std::shared_ptr<metal_async_error_state> _async_error_state =
++    std::make_shared<metal_async_error_state>();
+ 
+   metal_allocator* _allocator = nullptr;
+   device_id _device_id;
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index 3e23bc3d..9ecb7529 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -450,6 +450,21 @@ void encode_arguments_argbuffer(
+   encoder->setBuffer(arg_buffer_out.get(), 0, buf_offset);
+ }
+ 
++} // anonymous namespace
++
++void record_metal_async_failure(
++    const std::shared_ptr<metal_async_error_state>& state, result failure) {
++  if (state) {
++    std::lock_guard<std::mutex> lock{state->mutex};
++    if (state->error.is_success()) {
++      state->error = failure;
++    }
++  }
++  register_error(failure);
++}
++
++namespace {
++
+ result launch_kernel_from_library(
+   MTL::Library* library,
+   MTL::Device* device,
+@@ -465,7 +480,8 @@ result launch_kernel_from_library(
+   std::size_t* arg_sizes,
+   std::size_t num_args,
+   const rt::hcf_kernel_info* kernel_info,
+-  const std::optional<std::vector<int>>& retained_indices)
++  const std::optional<std::vector<int>>& retained_indices,
++  const std::shared_ptr<metal_async_error_state>& async_error_state)
+ {
+   if (!library) {
+     return make_error(__acpp_here(),
+@@ -600,11 +616,12 @@ result launch_kernel_from_library(
+   command_buffer->addCompletedHandler([miss_buffer_for_handler,
+                                        kernel_name_for_handler,
+                                        launch_table_count,
+-                                       launch_table_capacity](MTL::CommandBuffer* command_buffer) {
++                                       launch_table_capacity,
++                                       async_error_state](MTL::CommandBuffer* command_buffer) {
+     auto* flag = reinterpret_cast<const metal_pointer_translation_miss_flag*>(
+         miss_buffer_for_handler->contents());
+     if (flag && flag->code != 0) {
+-      register_error(make_error(
++      record_metal_async_failure(async_error_state, make_error(
+           __acpp_here(),
+           error_info{make_pointer_translation_miss_error(
+               kernel_name_for_handler, *flag, launch_table_count, launch_table_capacity)}));
+@@ -615,7 +632,8 @@ result launch_kernel_from_library(
+       if (err->localizedDescription()) {
+         msg += err->localizedDescription()->utf8String();
+       }
+-      register_error(make_error(__acpp_here(), error_info{msg}));
++      record_metal_async_failure(async_error_state,
++                                 make_error(__acpp_here(), error_info{msg}));
+     }
+ 
+     HIPSYCL_DEBUG_INFO << "metal: Kernel '" << kernel_name_for_handler
+@@ -632,7 +650,8 @@ result memset_device(
+   metal_allocator* allocator,
+   void* ptr,
+   unsigned char pattern,
+-  std::size_t num_bytes)
++  std::size_t num_bytes,
++  const std::shared_ptr<metal_async_error_state>& async_error_state)
+ {
+   auto [buffer, offset, _3] = allocator->get_usm_block(ptr);
+   if (!buffer) {
+@@ -649,13 +668,14 @@ result memset_device(
+   blit_encoder->fillBuffer(buffer, NS::Range::Make(offset, num_bytes), pattern);
+   blit_encoder->endEncoding();
+ 
+-  command_buffer->addCompletedHandler([](MTL::CommandBuffer* command_buffer) {
++  command_buffer->addCompletedHandler([async_error_state](MTL::CommandBuffer* command_buffer) {
+     if (NS::Error* err = command_buffer->error()) {
+       std::string msg = "metal_queue: Memset failed: ";
+       if (err->localizedDescription()) {
+         msg += err->localizedDescription()->utf8String();
+       }
+-      register_error(make_error(__acpp_here(), error_info{msg}));
++      record_metal_async_failure(async_error_state,
++                                 make_error(__acpp_here(), error_info{msg}));
+     }
+   });
+ 
+@@ -994,11 +1014,13 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+       command_buffer->encodeSignalEvent(_shared_event, deferred_h2d_done_event);
+       _pending_cpu_event = deferred_h2d_done_event;
+     }
+-    command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
++    command_buffer->addCompletedHandler(
++        [async_error_state = _async_error_state](MTL::CommandBuffer* cb) {
+       if (NS::Error* err = cb->error()) {
+         std::string msg = "metal_queue: Memcpy failed: ";
+         if (err->localizedDescription()) msg += err->localizedDescription()->utf8String();
+-        register_error(make_error(__acpp_here(), error_info{msg}));
++        record_metal_async_failure(async_error_state,
++                                   make_error(__acpp_here(), error_info{msg}));
+       }
+     });
+     command_buffer->commit();
+@@ -1056,7 +1078,7 @@ result metal_inorder_queue::submit_memset(memset_operation& op, const dag_node_p
+   }
+ 
+   auto submission = memset_device(command_buffer, _allocator, ptr, pattern,
+-                                  num_bytes);
++                                  num_bytes, _async_error_state);
+   if (submission.is_success()) {
+     remember_submitted_command_buffer(command_buffer);
+   }
+@@ -1306,7 +1328,8 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+     const_cast<std::size_t*>(_arg_mapper.get_mapped_arg_sizes()),
+     _arg_mapper.get_mapped_num_args(),
+     kernel_info,
+-    retained_indices);
++    retained_indices,
++    _async_error_state);
+   if (submission.is_success()) {
+     remember_submitted_command_buffer(command_buffer);
+   }

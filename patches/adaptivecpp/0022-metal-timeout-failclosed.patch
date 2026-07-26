@@ -1,0 +1,54 @@
+Metal: keep a timed-out queue failed instead of reporting success
+
+wait_for_last_submitted_command_buffer() forgets the command buffer before it
+waits on it. When the wait ends in a timeout rather than a terminal command
+buffer state, the member has already been cleared, so the *next* wait() finds
+nothing outstanding and returns success -- a queue whose work never completed
+reports healthy, and the run continues on unsynchronized data.
+
+0020 latches failures reported by completion handlers, but a timeout is not a
+completion-handler event and so was not covered.
+
+Latch the timeout into the same async error state, from both wait sites:
+wait_for_last_submitted_command_buffer() and the synchronous device-to-host
+drain in submit_memcpy(). The latch is sticky, so once a wait times out every
+later wait keeps reporting the failure.
+
+Verified by forcing ACPP_METAL_COMMAND_TIMEOUT_MS=1 on a WarpX 2D Langmuir run:
+the timeout propagates through AMReX as an async SYCL exception and aborts the
+run (exit 1, 0 steps) instead of proceeding.
+
+Note on what is deliberately NOT changed here: releasing our reference to a
+still-pending command buffer on the timeout path is safe. Command buffers are
+created with MTL::CommandQueue::commandBuffer(), which retains referenced
+resources until completion, so the memcpy staging buffer cannot be freed while
+a blit is still able to touch it.
+
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index d2153546..9845bb2a 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -787,6 +787,13 @@ result metal_inorder_queue::wait_for_last_submitted_command_buffer(
+ 
+   auto completion = wait_for_metal_command_buffer(command_buffer, operation);
+   command_buffer->release();
++  if (!completion.is_success()) {
++    // The command buffer has already been forgotten above, so a subsequent
++    // wait() would find nothing outstanding and report success even though this
++    // one never reached a terminal state. Latch the failure so every later wait
++    // keeps failing instead of declaring a wedged queue healthy.
++    record_metal_async_failure(_async_error_state, completion);
++  }
+   return completion;
+ }
+ 
+@@ -1043,6 +1050,9 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+     auto completion =
+         wait_for_metal_command_buffer(command_buffer, "device-to-host memcpy");
+     if (!completion.is_success()) {
++      // Fail closed: the staging bytes were never published, so the queue must
++      // not look healthy to a later wait.
++      record_metal_async_failure(_async_error_state, completion);
+       return completion;
+     }
+ 

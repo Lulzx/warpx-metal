@@ -176,3 +176,124 @@ The MSL dump confirmed the bug: the DenseBins kernel emitted plain `load + add +
 ### Verification
 
 After fix: `inputs_test_2d_langmuir_multi` (128×128 grid, 65,536 particles/species) with `warpx.sort_intervals=1` runs 10 steps with particle counts stable at 65,536 positrons and 65,536 electrons at every step.
+
+---
+
+## Metal Queue Error Propagation: Fail-Open Paths
+
+Two related defects in the Metal backend's error handling, both of which let a
+failed or wedged queue report success. Found while investigating the
+intermittent completion-loss hang reported in PR #1.
+
+### Bug 1: `_async_error_state` had no writer
+
+`metal_inorder_queue::_async_error_state` exists so that an asynchronous
+command-buffer failure becomes visible to a later `wait()`. Patch 0018 added it
+and wrote to it from the device-to-host completion path. Patch 0019 replaced
+that path with a synchronous drain and **removed the only writer while leaving
+the reader in `wait()`**.
+
+Net effect at the pinned base (`3733a56` + 0008/0018/0019): the state was never
+written, so `wait()` returned success unconditionally. Failures from kernel
+command buffers, pointer-translation misses, host-to-device memcpy and memset
+reached only `register_error()` and could not fail a queue wait.
+
+Verified by applying the patch stack to a pristine worktree and confirming zero
+writers of `_async_error_state`.
+
+**Fix:** `patches/adaptivecpp/0020-metal-async-error-failclosed.patch`. Moves
+the state to namespace scope as `metal_async_error_state`, adds
+`record_metal_async_failure()` (latches the first failure, still forwards to
+`register_error()`), and threads it into `launch_kernel_from_library()`,
+`memset_device()` and the `submit_memcpy()` completion handler. Held by
+`shared_ptr` and captured by value, since completion handlers may outlive the
+queue.
+
+### Bug 2: a timed-out wait left the queue looking healthy
+
+`wait_for_last_submitted_command_buffer()` clears
+`_last_submitted_command_buffer` *before* waiting on it. When the wait ends in a
+timeout rather than a terminal state, the member is already null, so the next
+`wait()` finds nothing outstanding and returns success. A queue whose work never
+completed reports healthy and the run continues on unsynchronized data. Bug 1's
+fix does not cover this, because a timeout is not a completion-handler event.
+
+**Fix:** `patches/adaptivecpp/0022-metal-timeout-failclosed.patch`. Latches the
+timeout into the same async error state from both wait sites. Sticky, so every
+later wait keeps reporting it.
+
+**Verification:** with `ACPP_METAL_COMMAND_TIMEOUT_MS=1`, a WarpX 2D Langmuir
+run now propagates the timeout through AMReX as an async SYCL exception and
+aborts (exit 1, 0 steps) instead of proceeding. Normal runs are unaffected:
+500/500 steps, exit 0, no spurious aborts.
+
+**Not a bug:** releasing our reference to a still-pending command buffer on the
+timeout path is safe. Command buffers come from
+`MTL::CommandQueue::commandBuffer()`, which retains referenced resources until
+completion, so the memcpy staging buffer cannot be freed while a blit could
+still touch it.
+
+### Diagnostic: is the CPU-listener → GPU-wait cycle reachable?
+
+The backend has one structural way to produce a command buffer that stays
+`scheduled` forever with `error == nil`: a GPU wait whose value is signalled
+only from a CPU listener block. Two such sites exist (host-to-host memcpy, and
+staged host-to-device); both are reachable only when `_pending_cpu_event` is
+non-zero, and the host-to-host branch is its sole writer.
+
+`patches/adaptivecpp/0021-metal-sync-trace.patch` adds counters for this, inert
+unless `ACPP_METAL_TRACE_SYNC=1`.
+
+Measured on WarpX 2D Langmuir (128², ppc=4, 500 steps, M4 Pro, macOS 26):
+
+```
+h2h_total=0  h2h_listener=0  gpu_wait_armed=0  h2d_listener=0
+```
+
+All zero — the cycle is **not reachable** in that configuration, so it cannot
+explain a completion-loss hang there. Reachability is a property of the deck and
+build (whether AMReX issues host-to-host copies through the SYCL queue), not of
+the GPU, so this should carry to other hardware running comparable decks.
+
+---
+
+## Startup Memory Guard: Raw Used-Fraction Abort Still Present
+
+`2bccb53` dropped the raw used-fraction abort from the *evolve* guard, but the
+*pre-init startup* guard in
+`patches/warpx/0003-correct-macos-memory-guard-available-memory.patch` retains
+it (the patch comment says so explicitly). Its condition is:
+
+```
+if (!over_fraction && !abnormal_pressure) return;   // else abort
+```
+
+`abnormal_pressure` is correctly gated on Darwin CRITICAL (`>= 4`) per
+`6fa4110`, but `over_fraction` is an ungated machine-wide check against
+`WARPX_MAX_MEM_FRACTION` (default `0.70`).
+
+**Observed false trip (M4 Pro, 24 GiB):** a 128^2 / ppc=4 deck needing well
+under 1 GiB was refused at startup with
+
+```
+used 17.5 GiB / 24.0 GiB, available 6.5 GiB, pressure level 1
+```
+
+Pressure level 1 is *normal*. The memory was held by unrelated desktop
+processes, and 6.5 GiB was available -- ample for this deck. The guard measures
+machine-wide usage rather than the run's requirement, so on a developer
+workstation with a browser open it aborts trivial runs.
+
+This is the same false-abort class the original report set out to fix; it
+survives at startup only because the fix was applied to the evolve path.
+
+**Options, in increasing order of effort:** gate `over_fraction` on
+`pressure_level >= 2` as well; downgrade it to a warning when pressure is
+normal; or compare against the deck's estimated footprint instead of a fixed
+fraction of physical RAM.
+
+**Workaround:** `WARPX_MAX_MEM_FRACTION=0.95`.
+
+Note for the supervisor: this failure is correctly classified non-recoverable
+and does **not** trigger CPU demotion, since a too-large deck would fail
+identically on the CPU binary.

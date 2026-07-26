@@ -1,0 +1,120 @@
+Metal: optional sync-path tracer (ACPP_METAL_TRACE_SYNC=1)
+
+Diagnostic only, inert unless ACPP_METAL_TRACE_SYNC=1.
+
+The Metal backend contains one structural way to produce a command buffer that
+stays "scheduled" forever with error == nil: a GPU wait whose value is signalled
+only from a CPU listener block. Two such sites exist, in the host-to-host
+memcpy path and the staged host-to-device path, and both are reachable only
+when _pending_cpu_event is non-zero. The host-to-host branch is the sole writer
+of that field, so it alone bootstraps the cycle.
+
+These counters report whether the cycle is reachable in a given workload:
+
+  h2h_total      host-to-host memcpy seen
+  h2h_listener   ... took the listener branch (bootstrap)
+  gpu_wait_armed a command buffer encoded a wait on a CPU-signalled value
+  h2d_listener   staged host-to-device took the listener branch
+
+First occurrence of each is reported immediately; totals are printed at exit.
+
+Measured on WarpX 2D Langmuir (128^2, ppc=4, 500 steps, M4 Pro, macOS 26):
+all four counters are 0, i.e. the cycle is not reachable in that configuration
+and cannot explain a completion-loss hang there.
+
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index 9ecb7529..d2153546 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -22,9 +22,11 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstdint>
+ #include <iostream>
++#include <string>
+ #include <memory>
+ #include <mutex>
+ #include <sstream>
+@@ -684,6 +686,47 @@ result memset_device(
+   return make_success();
+ }
+ 
++// TEMPORARY DIAGNOSTIC (ACPP_METAL_TRACE_SYNC=1).
++// Determines whether the CPU-listener -> GPU-wait cycle is reachable at all in
++// a real WarpX run. The cycle is bootstrapped exclusively by the host-to-host
++// memcpy branch, which is the only writer of _pending_cpu_event/_pending_gpu_event.
++// If h2h_listener stays 0, the cycle is unreachable and the remaining
++// notifyListener sites cannot explain a "scheduled forever, error == nil" hang.
++struct metal_sync_trace {
++  std::atomic<unsigned long long> h2h_total{0};      // host->host memcpy seen
++  std::atomic<unsigned long long> h2h_listener{0};   // ... took the listener branch (BOOTSTRAP)
++  std::atomic<unsigned long long> gpu_wait_armed{0}; // command buffer encoded a wait on _shared_event
++  std::atomic<unsigned long long> h2d_listener{0};   // H2D staging took the listener branch
++
++  static bool enabled() {
++    static const bool on = [] {
++      const char* e = std::getenv("ACPP_METAL_TRACE_SYNC");
++      return e && std::string{e} == "1";
++    }();
++    return on;
++  }
++
++  void bump(std::atomic<unsigned long long>& c, const char* what) {
++    if (!enabled()) return;
++    if (c.fetch_add(1) == 0) {
++      std::fprintf(stderr, "[acpp-metal-trace] FIRST %s\n", what);
++      std::fflush(stderr);
++    }
++  }
++
++  ~metal_sync_trace() {
++    if (!enabled()) return;
++    std::fprintf(stderr,
++                 "[acpp-metal-trace] h2h_total=%llu h2h_listener=%llu "
++                 "gpu_wait_armed=%llu h2d_listener=%llu\n",
++                 h2h_total.load(), h2h_listener.load(),
++                 gpu_wait_armed.load(), h2d_listener.load());
++    std::fflush(stderr);
++  }
++};
++
++metal_sync_trace g_metal_sync_trace;
++
+ } // anonymous namespace
+ 
+ metal_inorder_queue::metal_inorder_queue(MTL::Device* device, metal_allocator* allocator, const device_id& id, hardware_context* hw_ctx)
+@@ -702,6 +745,8 @@ metal_inorder_queue::metal_inorder_queue(MTL::Device* device, metal_allocator* a
+ MTL::CommandBuffer* metal_inorder_queue::new_command_buffer() {
+   auto* cmd_buf = _command_queue->commandBuffer();
+   if (auto prev = std::exchange(_pending_gpu_event, 0)) {
++    g_metal_sync_trace.bump(g_metal_sync_trace.gpu_wait_armed,
++                            "gpu_wait_armed (command buffer waits on CPU-signaled value)");
+     cmd_buf->encodeWait(_shared_event, prev);
+   }
+   if (_profiling_setup) {
+@@ -839,10 +884,13 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+       }
+     };
+ 
++    g_metal_sync_trace.bump(g_metal_sync_trace.h2h_total, "h2h_total (host->host memcpy)");
+     auto prev_cpu_event = std::exchange(_pending_cpu_event, uint64_t{0});
+     if (prev_cpu_event == 0) {
+       do_h2h_copy();
+     } else {
++      g_metal_sync_trace.bump(g_metal_sync_trace.h2h_listener,
++                              "h2h_listener (BOOTSTRAP of CPU-listener -> GPU-wait cycle)");
+       // wait for the prior CPU async work (e.g. device->host copy) to complete
+       // before reading from src_ptr
+       auto val_done = ++_event_counter;
+@@ -922,6 +970,8 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+     if (prev_cpu_event == 0) {
+       do_h2d_copy();
+     } else {
++      g_metal_sync_trace.bump(g_metal_sync_trace.h2d_listener,
++                              "h2d_listener (staged H2D waits on CPU-signaled value)");
+       auto base = _event_counter.fetch_add(2);
+       auto val_stage_ready = base + 1;
+       auto val_done = base + 2;
