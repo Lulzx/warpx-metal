@@ -15,10 +15,13 @@ standard PIC workloads on Apple Silicon GPUs.
 
 - WarpX PIC workloads execute on Apple GPUs through AMReX SYCL and AdaptiveCpp
   SSCP-generated Metal.
-- Validation has been run across three Apple Silicon generations: M3 Ultra,
-  M4 Max, and M5 Max.
+- Validation has been run across four Apple Silicon parts: M3 Ultra, M4 Pro,
+  M4 Max, and M5 Max (see [`VALIDATION.md`](VALIDATION.md)).
 - The current source patch set is synchronized to the field-validated source
   tree, with debug-only instrumentation removed.
+- Upstream sources are pinned: AdaptiveCpp `develop@3733a56`, AMReX and WarpX
+  at their `26.06` revisions. The patches are generated against those pins and
+  the build scripts check them out explicitly.
 - Device-side `double` is correct: the Metal emitter lowers FP64 to
   [VF64-metal](https://github.com/Lulzx/VF64-metal) correctly rounded software
   binary64 instead of silently demoting it to `float`, so host-written
@@ -62,6 +65,10 @@ The backend includes reliability controls for heavy runs:
   `scripts/10-run-warpx-resilient.py`. Each generation creates fresh Metal
   device/queue state, and a completion timeout automatically retries from the
   last checkpoint that was verified after a clean child-process exit.
+- If the GPU binary keeps wedging, the supervisor can demote the run to a
+  CPU build (`--cpu-fallback-executable`). AMReX checkpoints are backend
+  independent, so the CPU binary resumes the GPU-written checkpoint directly;
+  demotion is permanent for the rest of the run.
 
 The supervisor is the production-safe client workaround for the macOS driver
 defect: it never replays uncertain GPU state inside the affected process.
@@ -74,6 +81,7 @@ Example for a 10,000-step 2D run, using 100-step process generations:
   --max-step 10000 \
   --chunk-steps 100 \
   --work-dir /path/to/run \
+  --cpu-fallback-executable extern/warpx/build-cpu/bin/warpx.2d.NOMPI.OMP.SP.PSP.EB \
   extern/warpx/build-acpp/bin/warpx.2d.NOMPI.SYCL.SP.PSP.EB \
   /path/to/inputs
 ```
@@ -114,6 +122,16 @@ and remaining limitations for the keeper fixes:
 - [macOS system-memory crashguard accounting](reports/macos-memory-crashguard.md)
 - [FP64 on Metal through VF64 software binary64](reports/metal-vf64-double.md)
 
+## Performance
+
+`scripts/08-benchmark.sh` runs the Langmuir cases on the Metal build and the
+OpenMP CPU build back to back and writes
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md). On an M4 Pro (12 CPU
+cores, 16 GPU cores) the GPU is behind the 12-thread CPU on small 2D grids
+and ahead only at 128^3 in 3D; per-step launch overhead dominates the small
+cases. `scripts/09-profile-metal.sh` records a Metal System Trace for
+Instruments.
+
 ## Requirements
 
 - Apple Silicon Mac
@@ -153,8 +171,33 @@ From the repository root:
 ./scripts/06-validate-warpx.sh
 ```
 
-Build products and cloned upstream sources live under `opt/` and `extern/`.
-AdaptiveCpp JIT artifacts are cached by the runtime.
+Optional, for the CPU baseline, benchmarks, and profiling:
+
+```bash
+./scripts/07-build-warpx-cpu.sh   # Apple Clang + OpenMP build of the same patched tree
+./scripts/08-benchmark.sh         # GPU vs CPU, writes benchmarks/RESULTS.md
+./scripts/09-profile-metal.sh     # xctrace Metal System Trace
+```
+
+`scripts/env.sh` holds every shared path and toolchain probe; the numbered
+scripts source it, and so should any ad-hoc shell that runs `acpp`. Build
+products and cloned upstream sources live under `opt/` and `extern/`.
+AdaptiveCpp JIT artifacts are cached by the runtime, so the first kernel
+launch after a rebuild is slow.
+
+## Documentation
+
+- [`VALIDATION.md`](VALIDATION.md) - validated hardware and dated
+  revalidation runs.
+- [`docs/known-issues.md`](docs/known-issues.md) - build workarounds, Metal
+  constraints, patch inventory, and open defects.
+- [`readme-apple-silicon-port-upstream.md`](readme-apple-silicon-port-upstream.md)
+  - portability contract for the AMReX and WarpX changes (every shared code
+  path is behind an Apple/Metal gate).
+- [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) - GPU vs CPU numbers.
+- [`ci/README.md`](ci/README.md) - local CI scope.
+- [`docs/spec.md`](docs/spec.md) - the original planning document, kept for
+  history.
 
 ## Repository Layout
 
@@ -163,10 +206,25 @@ AdaptiveCpp JIT artifacts are cached by the runtime.
 - `patches/amrex/` - AMReX whole-file replacements.
 - `patches/amrex-post/` - AMReX source patch applied after the replacements
   and in-place edits.
-- `patches/warpx/` - WarpX source patches.
+- `patches/warpx/` - WarpX source patches (source identity, host-side parser
+  momentum, macOS memory guard).
 - `reports/` - technical bugfix reports and validation boundaries.
-- `scripts/` - dependency, build, and validation helpers; `scripts/lib/` holds
-  the shared AMReX patcher and toolchain shims.
+- `scripts/` - dependency, build, validation, benchmark, and profiling
+  helpers plus the checkpointed supervisor; `scripts/lib/` holds the shared
+  AMReX patcher and toolchain shims.
 - `tests/sycl/` - AdaptiveCpp/Metal smoke tests, including FP64 and a
   FP64-vs-FP32 throughput benchmark.
-- `tests/` and `benchmarks/` - small validation inputs and benchmark fixtures.
+- `tests/amrex/` - standalone HeatEquation test used by `04-validate-amrex.sh`.
+- `tests/warpx/` - small WarpX input decks (Langmuir, field-only, two-species).
+- `tests/metal_direct/` - plain Metal/Swift reproducer for the thread-to-device
+  pointer defect, independent of AdaptiveCpp.
+- `tests/supervisor/` - unit tests for the process-isolated supervisor, run by
+  local CI.
+- `benchmarks/` - benchmark input decks, results, and captured profiles.
+- `ci/` - pinned CPU portability build.
+- `docs/` - known issues and the historical spec.
+
+## License
+
+BSD 3-Clause, see [`LICENSE`](LICENSE). The embedded VF64-metal shader source
+in patch 0023 is the author's own work and is covered by the same terms.
