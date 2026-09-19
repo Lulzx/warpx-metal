@@ -19,6 +19,11 @@ standard PIC workloads on Apple Silicon GPUs.
   M4 Max, and M5 Max.
 - The current source patch set is synchronized to the field-validated source
   tree, with debug-only instrumentation removed.
+- Device-side `double` is correct: the Metal emitter lowers FP64 to
+  [VF64-metal](https://github.com/Lulzx/VF64-metal) correctly rounded software
+  binary64 instead of silently demoting it to `float`, so host-written
+  doubles keep their layout and `WarpX_PRECISION=DOUBLE` builds become
+  possible at about 13x the FP32 cost.
 
 ## Validation
 
@@ -88,6 +93,14 @@ for recovery semantics and tuning.
   tolerance).
 - On the single-precision path, parser execution uses host-side momentum
   evaluation for particle injection so GPU and CPU setup match exactly.
+- FP64 device code runs through software binary64 (see
+  `docs/known-issues.md`, "FP64 on Metal via VF64"). Keep production builds
+  in `SINGLE` precision; use `double` for setup-time code only.
+- **Open:** parser expressions evaluated on the device (`parse_density_function`,
+  parsed external fields) silently inject zero particles because of the
+  nested-pointer translation gap; only the momentum parser is worked around.
+  See `docs/known-issues.md`, "Device-side parser evaluation injects zero
+  particles".
 
 ## Bugfix Reports
 
@@ -99,11 +112,13 @@ and remaining limitations for the keeper fixes:
 - [AdaptiveCpp Metal in-order readback and bounded completion](reports/adaptivecpp-metal-inorder-readback.md)
 - [Metal process-isolated checkpoint recovery](reports/metal-process-isolated-recovery.md)
 - [macOS system-memory crashguard accounting](reports/macos-memory-crashguard.md)
+- [FP64 on Metal through VF64 software binary64](reports/metal-vf64-double.md)
 
 ## Requirements
 
 - Apple Silicon Mac
-- macOS 14 or newer
+- macOS 15 or newer (validated on macOS 26.4 and 27.0; see
+  `docs/known-issues.md` for the macOS 27 SDK / LLVM 20 libc++ workaround)
 - Xcode 16 or newer with command-line tools
 - Homebrew
 - Internet access to clone upstream sources and fetch `metal-cpp`
@@ -143,10 +158,15 @@ AdaptiveCpp JIT artifacts are cached by the runtime.
 
 ## Repository Layout
 
-- `patches/adaptivecpp/` - AdaptiveCpp SSCP/Metal source patch.
-- `patches/amrex/` - AMReX source patch and replacement files used by the build
-  scripts.
-- `patches/warpx/` - WarpX source patch.
+- `patches/adaptivecpp/` - AdaptiveCpp SSCP/Metal source patches (applied in
+  order); `tools/` holds the VF64 header generator.
+- `patches/amrex/` - AMReX whole-file replacements.
+- `patches/amrex-post/` - AMReX source patch applied after the replacements
+  and in-place edits.
+- `patches/warpx/` - WarpX source patches.
 - `reports/` - technical bugfix reports and validation boundaries.
-- `scripts/` - dependency, build, and validation helpers.
+- `scripts/` - dependency, build, and validation helpers; `scripts/lib/` holds
+  the shared AMReX patcher and toolchain shims.
+- `tests/sycl/` - AdaptiveCpp/Metal smoke tests, including FP64 and a
+  FP64-vs-FP32 throughput benchmark.
 - `tests/` and `benchmarks/` - small validation inputs and benchmark fixtures.

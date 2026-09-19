@@ -45,159 +45,8 @@ fi
 
 echo ""
 echo "=== Step 2: Apply patches ==="
-
-PATCH_DIR="${PATCHES_DIR}/amrex"
-
-# Apply .patch files via git apply
-PATCH_COUNT=$(find "${PATCH_DIR}" -name '*.patch' 2>/dev/null | wc -l | tr -d ' ')
-if [ "${PATCH_COUNT}" -gt 0 ]; then
-    cd "${AMREX_SOURCE_DIR}"
-    for patch in "${PATCH_DIR}"/*.patch; do
-        PATCH_NAME="$(basename "${patch}")"
-        if git apply --check "${patch}" 2>/dev/null; then
-            echo "  [..] Applying ${PATCH_NAME}..."
-            git apply "${patch}"
-            echo "  [OK] Applied ${PATCH_NAME}"
-        elif git apply --reverse --check "${patch}" 2>/dev/null; then
-            echo "  [OK] ${PATCH_NAME} already applied"
-        else
-            echo "  [FAIL] ${PATCH_NAME} does not apply cleanly" >&2
-            exit 1
-        fi
-    done
-fi
-
-# Replace files with AdaptiveCpp-compatible versions
-replace_file() {
-    local src="${PATCH_DIR}/$1"
-    local dst="${AMREX_SOURCE_DIR}/$2"
-    if [ -f "${src}" ]; then
-        echo "  [..] Patching $2..."
-        cp "${src}" "${dst}"
-        echo "  [OK] $2 patched"
-    else
-        echo "  [WARN] ${src} not found"
-    fi
-}
-
-replace_file "AMReXSYCL.cmake"      "Tools/CMake/AMReXSYCL.cmake"
-replace_file "AMReX_RandomEngine.H"  "Src/Base/AMReX_RandomEngine.H"
-replace_file "AMReX_Random.cpp"      "Src/Base/AMReX_Random.cpp"
-
-# Surgical source-level fixes via Python
-python3 -c "
-import re, sys
-
-# Fix 1: AMReX_INT.H — Disable __int128 when AMREX_NO_INT128 is defined.
-#   The Metal emitter cannot translate i128 (maps to uint4 in MSL, casts unsupported).
-#   AMREX_NO_INT128 is set via AMReXSYCL.cmake for AdaptiveCpp builds.
-#   All i128 codepaths (umulhi, FastDivmodU64) have safe non-128 fallbacks.
-f = '${AMREX_SOURCE_DIR}/Src/Base/AMReX_INT.H'
-with open(f) as fh: s = fh.read()
-old_guard = '#if (defined(__x86_64) || defined (__aarch64__)) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__)) && !defined(__NVCOMPILER)'
-new_guard = '#if (defined(__x86_64) || defined (__aarch64__)) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__)) && !defined(__NVCOMPILER) && !defined(AMREX_NO_INT128)'
-s = s.replace(old_guard, new_guard)
-with open(f,'w') as fh: fh.write(s)
-print('  [OK] AMReX_INT.H patched (disable __int128 when AMREX_NO_INT128)')
-
-# Fix 2: AMReX_GpuAsyncArray.H — host_task not in AdaptiveCpp
-f = '${AMREX_SOURCE_DIR}/Src/Base/AMReX_GpuAsyncArray.H'
-with open(f) as fh: s = fh.read()
-old = '''                    q.submit([&] (sycl::handler& h) {
-                        h.host_task([=] () {
-                            The_Arena()->free(pd);
-                            The_Pinned_Arena()->free(ph);
-                        });
-                    });
-                } catch (sycl::exception const& ex) {
-                    amrex::Abort(std::string(\"host_task: \")+ex.what()+\"!!!!!\");'''
-new = '''                    q.wait();
-                    The_Arena()->free(pd);
-                    The_Pinned_Arena()->free(ph);
-                } catch (sycl::exception const& ex) {
-                    amrex::Abort(std::string(\"async cleanup: \")+ex.what()+\"!!!!!\");'''
-s = s.replace(old, new)
-with open(f,'w') as fh: fh.write(s)
-print('  [OK] AMReX_GpuAsyncArray.H patched (host_task replacement)')
-
-# Fix 3: AMReX_GpuElixir.cpp — host_task not in AdaptiveCpp
-f = '${AMREX_SOURCE_DIR}/Src/Base/AMReX_GpuElixir.cpp'
-with open(f) as fh: s = fh.read()
-old = '''        auto& q = *(Gpu::gpuStream().queue);
-        try {
-            q.submit([&] (sycl::handler& h) {
-                h.host_task([=] () {
-                    for (auto const& pa : lpa) {
-                        pa.second->free(pa.first);
-                    }
-                });
-            });
-        } catch (sycl::exception const& ex) {
-            amrex::Abort(std::string(\"host_task: \")+ex.what()+\"!!!!!\");'''
-new = '''        auto& q = *(Gpu::gpuStream().queue);
-        try {
-            q.wait();
-            for (auto const& pa : lpa) {
-                pa.second->free(pa.first);
-            }
-        } catch (sycl::exception const& ex) {
-            amrex::Abort(std::string(\"async cleanup: \")+ex.what()+\"!!!!!\");'''
-s = s.replace(old, new)
-with open(f,'w') as fh: fh.write(s)
-print('  [OK] AMReX_GpuElixir.cpp patched (host_task replacement)')
-
-# Fix 4: Strip [[sycl::reqd_sub_group_size(...)]] and [[sycl::reqd_work_group_size(...)]]
-# These Intel-specific attributes cause:
-#   - compile warnings: 'unknown attribute reqd_sub_group_size/reqd_work_group_size ignored'
-#   - runtime crash: 'LLVMToMetal: Unsupported cast involving uint4 type'
-# Apple GPUs have a fixed 32-thread sub-group size so these are redundant.
-for fname in [
-    '${AMREX_SOURCE_DIR}/Src/Base/AMReX_GpuLaunchFunctsG.H',
-    '${AMREX_SOURCE_DIR}/Src/Base/AMReX_GpuLaunchMacrosG.nolint.H',
-    '${AMREX_SOURCE_DIR}/Src/Base/AMReX_TagParallelFor.H',
-    '${AMREX_SOURCE_DIR}/Src/Base/AMReX_FBI.H',
-]:
-    with open(fname) as fh: s = fh.read()
-    orig = s
-    s = re.sub(r'^\s*\[\[sycl::reqd_sub_group_size\([^)]*\)\]\].*\n', '', s, flags=re.MULTILINE)
-    s = re.sub(r'^\s*\[\[sycl::reqd_work_group_size\([^)]*\)\]\].*\n', '', s, flags=re.MULTILINE)
-    if s != orig:
-        with open(fname, 'w') as fh: fh.write(s)
-        n = fname.split('/')[-1]
-        print(f'  [OK] {n} patched (removed reqd_sub_group_size/reqd_work_group_size)')
-    else:
-        n = fname.split('/')[-1]
-        print(f'  [SKIP] {n} (no matching attributes)')
-"
-
-
-echo ""
-echo "=== Apply AMReX post-replacement patches ==="
-
-AMREX_POST_PATCH_DIR="${PATCHES_DIR}/amrex-post"
-if [ -d "${AMREX_POST_PATCH_DIR}" ]; then
-    POST_PATCH_COUNT=$(find "${AMREX_POST_PATCH_DIR}" -name '*.patch' 2>/dev/null | wc -l | tr -d ' ')
-    if [ "${POST_PATCH_COUNT}" -gt 0 ]; then
-        cd "${AMREX_SOURCE_DIR}"
-        for patch in "${AMREX_POST_PATCH_DIR}"/*.patch; do
-            PATCH_NAME="$(basename "${patch}")"
-            if git apply --check "${patch}" 2>/dev/null; then
-                echo "  [..] Applying ${PATCH_NAME}..."
-                git apply "${patch}"
-                echo "  [OK] Applied ${PATCH_NAME}"
-            elif git apply --reverse --check "${patch}" 2>/dev/null; then
-                echo "  [OK] ${PATCH_NAME} already applied"
-            else
-                echo "  [FAIL] ${PATCH_NAME} does not apply cleanly" >&2
-                exit 1
-            fi
-        done
-    else
-        echo "  [OK] No AMReX post-replacement patches to apply"
-    fi
-else
-    echo "  [OK] No AMReX post-replacement patch directory"
-fi
+# Single source of truth for the AMReX source state; shared with 05 and 07.
+"${SCRIPT_DIR}/lib/patch-amrex.sh"
 
 echo ""
 echo "=== Step 3: Configure AMReX with CMake ==="
@@ -209,6 +58,10 @@ cd "${BUILD_DIR}"
 
 # macOS SDK sysroot (needed for Homebrew LLVM)
 MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+ACPP_EXTRA_CXX_FLAGS="$(acpp_libcxx_workaround_flags)"
+if [ -n "${ACPP_EXTRA_CXX_FLAGS}" ]; then
+    echo "  [INFO] libc++/SDK workaround flags: ${ACPP_EXTRA_CXX_FLAGS}"
+fi
 
 cmake .. \
     -G Ninja \
@@ -216,6 +69,7 @@ cmake .. \
     -DCMAKE_CXX_COMPILER="${ACPP}" \
     -DCMAKE_OSX_SYSROOT="${MACOS_SDK}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_FLAGS="${ACPP_EXTRA_CXX_FLAGS}" \
     -DAMReX_GPU_BACKEND=SYCL \
     -DAMReX_PRECISION=SINGLE \
     -DAMReX_PARTICLES_PRECISION=SINGLE \

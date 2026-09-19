@@ -95,6 +95,7 @@ compile_and_run "vector_add"      "Basic parallel_for with device USM"
 compile_and_run "usm_test"        "sycl::malloc_shared — critical for AMReX"
 compile_and_run "reduction_test"  "Atomic float add — critical for deposition"
 compile_and_run "d2h_stress_test" "Repeated private-device to host copies"
+compile_and_run "double_test"     "FP64 device code via VF64 software binary64"
 
 echo ""
 echo "========================================"

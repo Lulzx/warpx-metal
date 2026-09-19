@@ -1,5 +1,10 @@
 # WarpX on Apple Silicon GPU: Technical Specification
 
+> **Historical planning document.** This is the pre-implementation specification
+> and is kept for context. Several statements are out of date (LLVM version,
+> FP64 handling, repository layout, effort estimate). For the current state see
+> `README.md`, `VALIDATION.md` and `docs/known-issues.md`.
+
 **Project:** GPU-accelerated WarpX for Apple Silicon via AdaptiveCpp Metal backend
 **Target Stack:** WarpX → AMReX (SYCL) → AdaptiveCpp (Metal backend) → Apple GPU
 **License:** Open source (BSD-3-Clause, matching WarpX/AMReX upstream)

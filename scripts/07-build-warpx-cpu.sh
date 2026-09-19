@@ -53,45 +53,9 @@ fi
 
 echo ""
 echo "=== Step 1: Re-apply AMReX patches ==="
-echo "  (CPU build uses same patched AMReX source tree)"
-
-cd "${AMREX_SOURCE_DIR}"
-git checkout -- .
-git clean -fd
-
-AMREX_PATCH_DIR="${PATCHES_DIR}/amrex"
-
-replace_file() {
-    local src="${AMREX_PATCH_DIR}/$1"
-    local dst="${AMREX_SOURCE_DIR}/$2"
-    if [ -f "${src}" ]; then
-        echo "  [..] Patching $2..."
-        cp "${src}" "${dst}"
-        echo "  [OK] $2 patched"
-    else
-        echo "  [WARN] ${src} not found — skipping"
-    fi
-}
-
-# These patches are SYCL-specific — they guard on AMREX_USE_SYCL so they are
-# harmless (no-op) in the CPU build but we apply them so both builds share the
-# exact same AMReX source state.
-replace_file "AMReXSYCL.cmake"      "Tools/CMake/AMReXSYCL.cmake"
-replace_file "AMReX_RandomEngine.H"  "Src/Base/AMReX_RandomEngine.H"
-replace_file "AMReX_Random.cpp"      "Src/Base/AMReX_Random.cpp"
-
-python3 -c "
-import re
-
-# Fix AMReX_INT.H: disable __int128 when AMREX_NO_INT128 is defined
-f = '${AMREX_SOURCE_DIR}/Src/Base/AMReX_INT.H'
-with open(f) as fh: s = fh.read()
-old_guard = '#if (defined(__x86_64) || defined (__aarch64__)) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__)) && !defined(__NVCOMPILER)'
-new_guard = '#if (defined(__x86_64) || defined (__aarch64__)) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__)) && !defined(__NVCOMPILER) && !defined(AMREX_NO_INT128)'
-s = s.replace(old_guard, new_guard)
-with open(f,'w') as fh: fh.write(s)
-print('  [OK] AMReX_INT.H patched')
-"
+# Identical source state to the GPU build: the SYCL-only edits are macro-guarded
+# and inert under OpenMP, so the CPU baseline differs only in compiler/backend.
+"${SCRIPT_DIR}/lib/patch-amrex.sh"
 
 echo ""
 echo "=== Step 2: Configure WarpX CPU build ==="

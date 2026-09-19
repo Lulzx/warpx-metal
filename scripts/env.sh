@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # env.sh — Shared paths and configuration for WarpX-on-Metal builds
 # Source this file before running other scripts:  source scripts/env.sh
-
-set -euo pipefail
+#
+# Deliberately no `set -e` here: this file is sourced, and every script sets
+# its own shell options. Arming -e in an interactive shell that sources this
+# file would make the next failing command close the terminal.
 
 # Project root (resolve relative to this script's location)
 export WARPX_METAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,6 +46,26 @@ fi
 
 # Build parallelism
 export NPROC="$(sysctl -n hw.ncpu)"
+
+# Homebrew LLVM 20's libc++ fails to compile <random> under -std=c++20 with
+# the macOS 27 SDK: math.h defers INFINITY/NAN to <float.h> through the
+# __need_infinity_nan protocol when __has_feature(modules) is true (which
+# C++20 implies), and clang 20's float.h does not implement that protocol.
+# Apple's clang does. AMReX and WarpX compile as C++20, so probe once and
+# supply the builtin definitions only when the toolchain needs them.
+acpp_libcxx_workaround_flags() {
+    local acpp="${ACPP_INSTALL_PREFIX}/bin/acpp"
+    [ -x "${acpp}" ] || return 0
+    local tmp
+    tmp="$(mktemp -d)"
+    printf '#include <random>\nint main() { return 0; }\n' > "${tmp}/probe.cpp"
+    if ! "${acpp}" -std=c++20 -c "${tmp}/probe.cpp" -o "${tmp}/probe.o" >/dev/null 2>&1; then
+        # A force-included header rather than -D: parentheses/quotes in a
+        # -D value do not survive CMake -> ninja -> /bin/sh.
+        echo "-include ${WARPX_METAL_ROOT}/scripts/lib/libcxx-infinity-shim.h"
+    fi
+    rm -rf "${tmp}"
+}
 
 echo "=== WarpX-on-Metal Environment ==="
 echo "  Project root:    ${WARPX_METAL_ROOT}"

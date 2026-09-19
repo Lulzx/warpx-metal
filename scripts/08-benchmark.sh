@@ -106,8 +106,10 @@ run_warpx() {
         > "${log}" 2>&1 || exit_code=$?
 
     if [ ${exit_code} -ne 0 ]; then
-        echo "    [FAIL] ${label} — exit ${exit_code}"
-        tail -10 "${log}" | sed 's/^/    /'
+        # stdout is captured by the caller as the timing value, so all
+        # diagnostics must go to stderr or they corrupt the results table.
+        echo "    [FAIL] ${label} — exit ${exit_code}" >&2
+        tail -10 "${log}" | sed 's/^/    /' >&2
         echo "0.0"
         return 0
     fi

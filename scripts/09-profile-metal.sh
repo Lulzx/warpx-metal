@@ -78,7 +78,7 @@ for w in 0 1; do
     echo "  [..] Warm-up ${w}..."
     cd "${WORK_DIR}/warmup"
     "${WARPX_EXE}" "${INPUT}" \
-        NX="${NX}" PPC="${PPC}" NSTEP="${NSTEP}" my_constants.NSTEP="${NSTEP}" \
+        my_constants.NX="${NX}" my_constants.PPC="${PPC}" my_constants.NSTEP="${NSTEP}" \
         diag1.intervals=99999 \
         warpx.verbose=0 \
         > "${WORK_DIR}/warmup_${w}.log" 2>&1
@@ -97,18 +97,14 @@ cd "${WORK_DIR}/trace_run"
 # Remove old trace file if it exists
 rm -rf "${TRACE_FILE}"
 
-# Build the WarpX command as a string for xctrace
-WARPX_CMD="${WARPX_EXE} ${INPUT} NX=${NX} PPC=${PPC} NSTEP=${NSTEP} my_constants.NSTEP=${NSTEP} diag1.intervals=99999 warpx.verbose=0"
-
 xctrace record \
     --output "${TRACE_FILE}" \
     --template "Metal System Trace" \
     --launch -- \
     "${WARPX_EXE}" \
     "${INPUT}" \
-    "NX=${NX}" \
-    "PPC=${PPC}" \
-    "NSTEP=${NSTEP}" \
+    "my_constants.NX=${NX}" \
+    "my_constants.PPC=${PPC}" \
     "my_constants.NSTEP=${NSTEP}" \
     "diag1.intervals=99999" \
     "warpx.verbose=0"

@@ -1,12 +1,12 @@
 # langmuir_2d_bench.txt — Parameterized 2D Langmuir benchmark input
 #
 # Override these from the command line:
-#   NX=128  (grid cells per dimension, e.g. 128 or 512)
-#   PPC=2   (particles per cell per dimension, total = PPC*PPC per species)
-#   NSTEP=40
+#   my_constants.NX=128  (grid cells per dimension, e.g. 128 or 512)
+#   my_constants.PPC=2   (particles per cell per dimension, total = PPC*PPC per species)
+#   my_constants.NSTEP=40
 #
 # Example:
-#   warpx.2d... langmuir_2d_bench.txt NX=128 PPC=2 NSTEP=40 diag1.intervals=99999
+#   warpx.2d... langmuir_2d_bench.txt my_constants.NX=128 my_constants.PPC=2 my_constants.NSTEP=40 diag1.intervals=99999
 
 # --- Grid size (override NX on command line) ---
 my_constants.NX = 128

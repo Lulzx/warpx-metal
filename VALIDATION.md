@@ -69,6 +69,24 @@ revalidation:
    sorting. The Metal path now uses the multipass scan, and the lookback
    kernel (single-block only) uses the fence-based two-word `BlockStatus`.
 
+## Revalidation (Apple M4 Pro, macOS 27.0, 2026-09-19)
+
+Rebuilt from a wiped `extern/` after adding FP64 support to the Metal emitter
+(`patches/adaptivecpp/0023-metal-vf64-double.patch`), unifying the AMReX
+source edits in `scripts/lib/patch-amrex.sh`, and adding the macOS 27 SDK
+libc++ workaround:
+
+- SYCL smoke tests (`02-validate-metal.sh`): device query, vector add, USM,
+  reduction, D2H stress pass; new `double_test` passes with 0 bitwise
+  mismatches against the CPU across 4,096 × 7 operations.
+- AMReX HeatEquation on Metal GPU (`04-validate-amrex.sh`): PASS.
+- WarpX Langmuir 2D: 40/40 steps; Langmuir 3D: 20/20 steps.
+- Langmuir 2D with `profile = constant`: 131,072 particles at step 40,
+  particle energy 8.835e-3 J, field energy 2.926e-4 J.
+- **Known failure recorded:** the same deck with
+  `profile = parse_density_function` injects 0 particles (silent). Documented
+  in `docs/known-issues.md`; not a regression from this change.
+
 ## Nondeterminism Note
 
 GPU charge/current deposition uses atomic adds. That means bitwise-identical

@@ -234,6 +234,19 @@ def terminate_process(process: subprocess.Popen[bytes], grace_seconds: int = 10)
         process.wait()
 
 
+def signal_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
+    """Signal the child's session; tolerate the child exiting first.
+
+    ``poll()`` and the signal are not atomic, so the group can vanish between
+    the stall check and ``killpg``. That is a normal race, not a supervisor
+    failure, and must not abort the retry loop.
+    """
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 def run_attempt(
     command: list[str],
     log_path: Path,
@@ -269,14 +282,14 @@ def run_attempt(
                     and time.monotonic() - last_progress >= stall_timeout_seconds
                 ):
                     watchdog_fired = True
-                    os.killpg(process.pid, signal.SIGTERM)
+                    signal_process_group(process, signal.SIGTERM)
                     try:
                         process.wait(timeout=10)
                     except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        signal_process_group(process, signal.SIGKILL)
                         process.wait()
         except KeyboardInterrupt:
-            os.killpg(process.pid, signal.SIGTERM)
+            signal_process_group(process, signal.SIGTERM)
             terminate_process(process)
             raise
 

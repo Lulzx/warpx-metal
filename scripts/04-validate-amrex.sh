@@ -16,6 +16,7 @@ AMREX_INSTALL_PREFIX="${WARPX_METAL_ROOT}/opt/amrex"
 TEST_SRC_DIR="${WARPX_METAL_ROOT}/tests/amrex/heat_equation"
 BUILD_DIR="${TEST_SRC_DIR}/build"
 MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+ACPP_EXTRA_CXX_FLAGS="$(acpp_libcxx_workaround_flags)"
 
 # Verify prerequisites
 if [ ! -x "${ACPP}" ]; then
@@ -57,6 +58,7 @@ cmake "${TEST_SRC_DIR}" \
     -G Ninja \
     -DCMAKE_CXX_COMPILER="${ACPP}" \
     -DCMAKE_OSX_SYSROOT="${MACOS_SDK}" \
+    -DCMAKE_CXX_FLAGS="${ACPP_EXTRA_CXX_FLAGS}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="${AMREX_INSTALL_PREFIX}" \
     -DAMREX_SRC_DIR="${AMREX_SOURCE_DIR}"

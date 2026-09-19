@@ -30,9 +30,11 @@
 
 4. **CMAKE_OSX_SYSROOT:** Must be set to `$(xcrun --sdk macosx --show-sdk-path)`. Homebrew LLVM does not auto-detect the macOS SDK, causing SSCP libkernel bitcode compilation to fail with a broken `-isysroot` flag.
 
-5. **MSL 3.2 fallback patch:** metal-cpp headers from macOS 15 do not define `MTL::LanguageVersion4_0`. Patch `metal_code_object.cpp` to fall back to `LanguageVersion3_2`. See `patches/adaptivecpp/0001-metal-fallback-msl-3.2-for-older-metal-cpp-headers.patch`.
+5. **MSL 3.2 fallback:** metal-cpp headers from macOS 15 do not define `MTL::LanguageVersion4_0`. `metal_code_object.cpp` falls back to `LanguageVersion3_2`; the change is carried in `patches/adaptivecpp/0008-metal-source-identity.patch`.
 
 6. **libomp:** Required by AdaptiveCpp runtime. Must pass explicit OpenMP flags to CMake since `libomp` is keg-only on Homebrew.
+
+7. **macOS 27 SDK + Homebrew LLVM 20 libc++ (`INFINITY` undeclared):** with the macOS 27.0 SDK, `<random>` from LLVM 20's libc++ fails under `-std=c++20` with `use of undeclared identifier 'INFINITY'`. The SDK's `math.h` defers `INFINITY`/`NAN` to `<float.h>` through the `__need_infinity_nan` protocol whenever `__has_feature(modules)` is true (C++20 implies it), and clang 20's `float.h` does not implement that protocol; Apple's clang does. AMReX and WarpX compile as C++20, so `03`/`05` probe the toolchain via `acpp_libcxx_workaround_flags` in `scripts/env.sh` and force-include `scripts/lib/libcxx-infinity-shim.h` only when the probe fails. C++17 is unaffected.
 
 ### Linker Warnings (Non-blocking)
 
@@ -68,6 +70,8 @@ AMReX is built with the AdaptiveCpp `acpp` compiler as the SYCL provider, replac
 
 ### Patches Applied
 
+All AMReX source changes are applied by one script, `scripts/lib/patch-amrex.sh`, which `03-build-amrex.sh`, `05-build-warpx.sh` and `07-build-warpx-cpu.sh` all call, so the AMReX library, the WarpX GPU build and the WarpX CPU baseline compile the identical tree. Items 1–2 are whole-file replacements from `patches/amrex/`; items 3, 5 and 6 are verified in-place edits (an edit that does not match exactly one site aborts the build); the atomic/RNG/parser/scan fixes are `patches/amrex-post/0004-metal-pic-rng-reduction-fixes.patch`, applied last.
+
 **1. AMReXSYCL.cmake** (file replacement)
 Replaces `Tools/CMake/AMReXSYCL.cmake` to support AdaptiveCpp alongside Intel oneAPI. The original unconditionally adds Intel-specific flags (`-fsycl`, `-qmkl`, `-fsycl-device-lib`, `-mlong-double-64`) that break under `acpp`. The patched version:
 - Detects AdaptiveCpp by checking if the CXX compiler basename is `acpp` or `syclcc`
@@ -77,23 +81,27 @@ Replaces `Tools/CMake/AMReXSYCL.cmake` to support AdaptiveCpp alongside Intel on
 **2. AMReX_RandomEngine.H / AMReX_Random.cpp** (file replacements)
 Guards `oneapi::mkl::rng` includes and usage with `!defined(SYCL_IMPLEMENTATION_ACPP)`. Provides stub RNG types for AdaptiveCpp (GPU RNG not yet supported; falls through to CPU RNG).
 
-**3. AMReX_INT.H** (surgical patch)
+**3. AMReX_INT.H** (in-place edit)
 Disables `__int128` / `AMREX_INT128_SUPPORTED` when `AMREX_NO_INT128` is defined. The Metal emitter cannot translate `i128` (maps to `uint4` in MSL with unsupported casts). All i128 codepaths (`umulhi`, `FastDivmodU64`) have safe fallbacks.
 
 **4. AMReX_Math.H** (no longer needed — handled by `AMREX_NO_INT128`)
 Previously patched `sycl::mul_hi` → UInt128_t fallback, but disabling INT128 entirely removes the function.
 
-**5. AMReX_GpuAsyncArray.H / AMReX_GpuElixir.cpp** (surgical patches)
-Replaces `host_task` (SYCL 2020 optional, not in AdaptiveCpp) with synchronous `q.wait()` + direct cleanup.
+**5. AMReX_GpuAsyncArray.H / AMReX_GpuElixir.cpp** (in-place edits)
+Replaces `host_task` (SYCL 2020 optional, not in AdaptiveCpp) with stream-ordered `Gpu::Device::freeAsync` calls. An earlier variant used a blocking `q.wait()`; `freeAsync` avoids the per-elixir synchronization (about 27% faster at 512² in Phase 4 measurements).
 
-**6. AMReX_GpuLaunchFunctsG.H / AMReX_GpuLaunchMacrosG.nolint.H / AMReX_TagParallelFor.H / AMReX_FBI.H** (surgical patches)
+**6. AMReX_GpuLaunchFunctsG.H / AMReX_GpuLaunchMacrosG.nolint.H / AMReX_TagParallelFor.H / AMReX_FBI.H** (in-place edits)
 Removes `[[sycl::reqd_sub_group_size(...)]]` and `[[sycl::reqd_work_group_size(...)]]` attributes. These caused: (a) compile warnings "unknown attribute", (b) runtime `uint4` type cast errors in the Metal emitter. Apple GPUs have fixed 32-thread sub-groups, so these are redundant.
 
 ### AdaptiveCpp Metal Emitter Bug Fixes
 
-All AdaptiveCpp Metal-related fixes are consolidated into a single patch: `patches/adaptivecpp/0008-metal-all-warpx-fixes.patch`.
+The AdaptiveCpp changes live in `patches/adaptivecpp/`, applied in order against the pinned `develop@3733a56`:
 
-Key fixes included:
+- `0008-metal-source-identity.patch` — emitter fixes below, pointer-translation passes, MSL 3.2 fallback, JIT guard, 64-bit atomic emulation.
+- `0018`–`0022` — Metal queue completion, timeout and fail-closed error propagation (see "Metal Queue Error Propagation").
+- `0023-metal-vf64-double.patch` — FP64 device code via VF64 software binary64 (see "FP64 on Metal via VF64").
+
+Key emitter fixes in `0008`:
 
 **1. Array-element struct type emission**
 Struct types used as array elements were not having their MSL definitions emitted. The `addDeps` lambda only checked direct `StructType` members but did not recurse into `ArrayType`. Fixed by adding array-element recursion in the `emitTypes()` dependency walker.
@@ -114,16 +122,16 @@ Fix involves:
 
 ### Metal GPU Constraints
 
-1. **No `double`:** Metal GPUs have zero double-precision support. All builds use `SINGLE` precision. Device code must avoid double literals (`2.` → `Real(2.0)` or `2.0f`).
+1. **`double` is software-emulated:** Metal GPUs have no FP64 hardware. Since `0023-metal-vf64-double.patch`, device-side `double` is lowered to VF64 correctly rounded software binary64 (about 13x slower than `float` on a compute-bound chain). Builds still default to `SINGLE` precision for speed; `double` in device code is now correct rather than silently demoted to `float` (see "FP64 on Metal via VF64").
 2. **No `__int128`:** The Metal emitter maps `i128` to `uint4` in MSL but only supports limited cast patterns. Disabled via `AMREX_NO_INT128`.
-3. **No `host_task`:** SYCL 2020 `host_task` is not supported by AdaptiveCpp. Replaced with synchronous `q.wait()`.
+3. **No `host_task`:** SYCL 2020 `host_task` is not supported by AdaptiveCpp. Replaced with `Gpu::Device::freeAsync`.
 4. **JIT compilation:** First kernel run triggers LLVM IR → MSL JIT compilation (AdaptiveCpp warns about this). Cached after first run.
 
 ---
 
 ### Known Limitations (Hardware)
 
-1. **No FP64:** Apple GPUs have zero double-precision support. All builds must use `SINGLE` precision.
+1. **No FP64 hardware:** Apple GPUs have zero double-precision support. `double` runs through VF64 software binary64 at roughly 13x the cost of `float`, so production builds use `SINGLE` precision and reserve `double` for setup-time code such as parser evaluation.
 2. **32-bit atomics only:** M1/M2 Apple GPUs support only 32-bit atomic operations on buffer pointers. FP32 mode makes this sufficient for WarpX.
 3. **No FFT on GPU:** No Metal-native FFT library exists. FDTD solver only (no PSATD spectral solver on GPU).
 
@@ -163,13 +171,15 @@ The non-atomic `Add` in `DenseBins::buildGPU` caused race conditions in bin-coun
 
 The MSL dump confirmed the bug: the DenseBins kernel emitted plain `load + add + store` instead of `atomic_fetch_add_explicit`.
 
-### Fix (patch: `patches/amrex/0002-amrex-sscp-atomic-fix.patch`)
+### Fix (patch: `patches/amrex-post/0004-metal-pic-rng-reduction-fixes.patch`, `AMReX_GpuAtomic.H` hunks)
 
-**Detection macro:** `__ACPP_ENABLE_LLVM_SSCP_TARGET__` — injected by the `acpp` compiler script before any headers are processed. This is the correct compile-time indicator for SSCP mode.
+**Detection:** the shipped patch keys on the AdaptiveCpp implementation macros, `SYCL_IMPLEMENTATION_ACPP || SYCL_IMPLEMENTATION_HIPSYCL || __HIPSYCL__ || __ACPP__`, which are defined for every AdaptiveCpp compilation. (An earlier draft used `__ACPP_ENABLE_LLVM_SSCP_TARGET__`; the implementation macros are what the patch actually uses.)
 
 **Changes to `AMReX_GpuAtomic.H`:**
-1. All `_device` functions (`Add_device`, `Min_device`, `Max_device`) and direct atomic functions (`atomic_op`, `atomic_op_if`, `AddNoRet`, `LogicalOr`, `LogicalAnd`, `Exch`, `CAS`): Changed `#if defined(__SYCL_DEVICE_ONLY__)` → `#if defined(__SYCL_DEVICE_ONLY__) || defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)`. This ensures SYCL `atomic_ref` is used in SSCP mode.
-2. Wrapper functions (`Add`, `If`, `Min`, `Max`, `Multiply`, `Divide`, `HostDevice::Atomic::Add`): Added a new `#if defined(AMREX_USE_SYCL) && defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__)` fast-path that directly calls the `_device` variant, bypassing the broken `AMREX_IF_ON_DEVICE` dispatch.
+1. All `_device` functions (`Add_device`, `Min_device`, `Max_device`) and direct atomic functions (`atomic_op`, `atomic_op_if`, `AddNoRet`, `LogicalOr`, `LogicalAnd`, `Exch`, `CAS`): `#if defined(__SYCL_DEVICE_ONLY__)` became `#if defined(__SYCL_DEVICE_ONLY__) || <AdaptiveCpp macros>`, so SYCL `atomic_ref` is used in SSCP mode.
+2. Wrapper functions (`Add`, `If`, `Min`, `Max`, `Multiply`, `Divide`, `HostDevice::Atomic::Add`): a `<AdaptiveCpp macros>` fast path calls the `_device` variant directly, bypassing the broken `AMREX_IF_ON_DEVICE` dispatch.
+
+Note that the sort corruption described in the README (decoupled-lookback scan needing true 64-bit atomics) is a second, independent cause of the same symptom, found during the post-merge revalidation; both fixes are required.
 
 **Why not patch `AMReX_GpuQualifiers.H`:** Making `AMREX_IF_ON_DEVICE` expand in SSCP mode globally causes `AMReX_GpuRange.H` to compile CUDA-specific identifiers (`blockDim`, `blockIdx`, `threadIdx`, `gridDim`) → build failure. The targeted atomic-only fix avoids this.
 
@@ -297,3 +307,85 @@ fraction of physical RAM.
 Note for the supervisor: this failure is correctly classified non-recoverable
 and does **not** trigger CPU demotion, since a too-large deck would fail
 identically on the CPU binary.
+
+---
+
+## FP64 on Metal via VF64 software binary64
+
+### Defect: `double` was silently demoted to `float`
+
+Before `0023-metal-vf64-double.patch`, `MetalEmitter::mapType` mapped the LLVM `double` type to MSL `float` ("demote parser-side doubles"). That is only sound for register-resident temporaries. Anywhere a `double` lives in memory the host also writes, the device read the wrong bytes:
+
+- `amrex::ParserExeNumber` is `struct alignas(8) { int type; double v; }` in a byte stream the host serializes with `sizeof == 16` and `v` at offset 8. The emitted MSL struct was `{ uint field0; float field1; }`, so `field1` sat at offset 4 and read the padding. Every numeric literal in a device-evaluated parser expression was garbage.
+- Kernel-argument structs, arrays and globals containing `double` had the wrong stride and alignment.
+- `bitcast i64 <-> double` produced invalid MSL (`as_type<float>(ulong)`).
+
+In this repository's single-precision build the parser was already shielded: `patches/amrex-post/0004` makes `ParserExeReal` a `float` under `AMREX_USE_SYCL && AMREX_USE_FLOAT` with AdaptiveCpp, so host and device agreed on a 4-byte literal. The demotion therefore affected `DOUBLE` builds, any other host-written `double` reaching a kernel, and all device math that genuinely needed binary64. See "Device-side parser evaluation injects zero particles" below for the separate, still-open parser problem.
+
+### Fix: carry `double` as IEEE bits and lower every operation to VF64
+
+`0023-metal-vf64-double.patch` integrates the integer soft-float runtime from [VF64-metal](https://github.com/Lulzx/VF64-metal) (`Sources/VF64Metal/Shaders/IEEE/Arithmetic.metal`, commit `7290217`):
+
+- `double` maps to MSL `ulong` holding the binary64 bit pattern. Layout, alignment and stride now match the host.
+- `fadd/fsub/fmul/fdiv/frem/fneg`, all 16 `fcmp` predicates, `fpext/fptrunc/sitofp/uitofp/fptosi/fptoui`, `bitcast`, and `double` constants are emitted as `__vf64_*` calls.
+- The f64 math builtins with an exact soft-float implementation (`sqrt`, `fma`, `fabs`, `copysign`, `fmin`, `fmax`, `floor`, `ceil`, `trunc`, `rint`, `round`, `fmod`) have their float-rounding libkernel bodies stripped in `LLVMToMetal` so the calls reach the emitter and use the exact versions. The remaining transcendental f64 builtins (`sin`, `exp`, `log`, `pow`, ...) still round through `float`.
+- The soft-float source (about 1,100 lines of MSL) is inlined into the generated shader only when the module references `double`, so kernels without FP64 are unchanged.
+- `patches/adaptivecpp/tools/gen-vf64-support.py` regenerates `VF64Support.hpp` from a VF64-metal checkout.
+
+Not supported (emitter reports an explicit error instead of miscompiling): vector-of-double arithmetic, `double` atomics.
+
+### Evidence (Apple M4 Pro, macOS 27.0, 2026-09-19)
+
+`tests/sycl/double_test.cpp` (run by `02-validate-metal.sh`): 4,096 elements × {add, sub, mul, div, fma, sqrt, struct-member load, comparisons, int/float conversions} are bit-identical to the CPU; a 8-term Horner polynomial in `double` agrees with the CPU to 7.8e-16 relative (CPU uses contracted FMA; the GPU does not).
+
+`tests/sycl/double_bench.cpp`, 4M elements × 32 dependent multiply-adds:
+
+| Type | ns/element | Slowdown |
+|------|-----------:|---------:|
+| float | 0.354 | 1x |
+| double (VF64) | 4.824 | 13.6x |
+
+VF64's own M4 Pro numbers put the integer path at roughly 13 GFLOP/s, consistent with the above. The reduced-precision `fast48`/`wide48` pair modes (about 4–15x faster) are not wired in; they are not binary64 and would need the pair-residency compiler work VF64 documents.
+
+### Consequences
+
+- Single-precision WarpX builds are unaffected in the PIC loop (no `double` there). Revalidated 2026-09-19 with the rebuilt translator: SYCL smoke 5/5 + FP64 test, AMReX HeatEquation PASS, Langmuir 2D 40/40 and 3D 20/20 steps.
+- `-DWarpX_PRECISION=DOUBLE` builds are possible on Metal but will run the field solve and particle push at soft-float speed; that is a correctness tool, not a performance configuration.
+
+---
+
+## Device-side parser evaluation injects zero particles (open)
+
+**Repro (Apple M4 Pro, 2026-09-19, current patch set):** take
+`Examples/Tests/langmuir/inputs_test_2d_langmuir_multi`, set for both species
+`profile = parse_density_function` and `density_function(x,y,z) = "n0"`, run
+one step on the SP GPU binary with a `ParticleNumber` reduced diagnostic.
+
+| Density | Particles after step 1 |
+|---------|-----------------------:|
+| `profile = constant`, `density = n0` | 131,072 |
+| `parse_density_function`, `"n0"` | 0 |
+| `parse_density_function`, `"4.e24"` | 0 |
+| `parse_density_function`, `"n0*(1.0+0.0*x)"` | 0 |
+
+The run exits 0 and WarpX records no warning, so this is a silent failure.
+Field and particle energies are identically zero for the parsed case.
+
+**Mechanism:** the same nested-pointer boundary described in
+`reports/addplasma-parser-momentum-oob.md`. The injector object captured by
+the `AddPlasma` kernel holds a `char*` to the compiled parser byte stream; the
+Metal pointer-translation pass does not translate pointers reached through a
+captured struct, so the device walks the wrong address and the density
+threshold test drops every particle. `patches/warpx/0002` works around this
+for the momentum parser only (host-side backfill). Density, external-field
+(`E_ext_grid_init_style = parse_E_ext_grid_function`, etc.) and boundary
+expressions evaluated on the device are affected in the same way.
+
+**Not caused by FP64:** with `patches/amrex-post/0004` the SP parser literal
+stream is `float`; and the VF64 lowering makes `double` correct. The pointer
+translation, not the arithmetic, is what is left.
+
+**Until fixed:** use `profile = constant` or `predefined` profiles, and keep
+field initializations that need expressions on the CPU build. Any validation
+that claims parser support must use the repro above, since the failure mode
+is silent.

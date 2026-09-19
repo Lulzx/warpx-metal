@@ -1,0 +1,1539 @@
+diff --git a/src/compiler/llvm-to-backend/metal/Emitter.cpp b/src/compiler/llvm-to-backend/metal/Emitter.cpp
+index 4ccc547f..e368351d 100644
+--- a/src/compiler/llvm-to-backend/metal/Emitter.cpp
++++ b/src/compiler/llvm-to-backend/metal/Emitter.cpp
+@@ -46,6 +46,9 @@
+ #include "llvm/Transforms/Scalar/ADCE.h"
+ 
+ #include "Emitter.hpp"
++#include "VF64Support.hpp"
++#include <unordered_map>
++#include <unordered_set>
+ #include "HLTree.hpp"
+ #include "HLExtractionPass.hpp"
+ 
+@@ -112,6 +115,47 @@ struct EmitContext {
+   std::string name;
+ };
+ 
++
++namespace {
++// True if T is, or transitively contains, the LLVM `double` type. The Metal
++// emitter lowers `double` to VF64 software binary64 (see VF64Support.hpp) and
++// only inlines that support code when a module actually needs it.
++bool containsDoubleType(const llvm::Type* T, std::unordered_set<const llvm::Type*>& visited) {
++  if (!T || !visited.insert(T).second) return false;
++  if (T->isDoubleTy()) return true;
++  if (auto* AT = llvm::dyn_cast<llvm::ArrayType>(T)) return containsDoubleType(AT->getElementType(), visited);
++  if (auto* VT = llvm::dyn_cast<llvm::VectorType>(T)) return containsDoubleType(VT->getElementType(), visited);
++  if (auto* ST = llvm::dyn_cast<llvm::StructType>(T)) {
++    for (auto* E : ST->elements()) if (containsDoubleType(E, visited)) return true;
++  }
++  if (auto* FT = llvm::dyn_cast<llvm::FunctionType>(T)) {
++    if (containsDoubleType(FT->getReturnType(), visited)) return true;
++    for (auto* P : FT->params()) if (containsDoubleType(P, visited)) return true;
++  }
++  return false;
++}
++
++bool moduleUsesDouble(const llvm::Module& M) {
++  std::unordered_set<const llvm::Type*> visited;
++  for (const llvm::StructType* ST : const_cast<llvm::Module&>(M).getIdentifiedStructTypes())
++    if (containsDoubleType(ST, visited)) return true;
++  for (const llvm::GlobalVariable& GV : M.globals())
++    if (containsDoubleType(GV.getValueType(), visited)) return true;
++  for (const llvm::Function& F : M) {
++    if (containsDoubleType(F.getFunctionType(), visited)) return true;
++    for (const llvm::BasicBlock& BB : F)
++      for (const llvm::Instruction& I : BB) {
++        if (containsDoubleType(I.getType(), visited)) return true;
++        if (auto* AI = llvm::dyn_cast<llvm::AllocaInst>(&I))
++          if (containsDoubleType(AI->getAllocatedType(), visited)) return true;
++        for (const llvm::Value* Op : I.operands())
++          if (containsDoubleType(Op->getType(), visited)) return true;
++      }
++  }
++  return false;
++}
++} // namespace
++
+ std::optional<EmitContext> initEmitContext(const llvm::CallInst* CI, std::string& errorStr) {
+   errorStr.clear();
+   const llvm::Function* F = CI ? CI->getCalledFunction() : nullptr;
+@@ -331,6 +375,10 @@ inline void _ZN5amrex11Assert_hostEPKcS1_iS1_m(A, B, uint, C, ulong) {}
+ 
+ )__";
+ 
++  if (moduleUsesDouble(M)) {
++    os << vf64_support_msl << "\n";
++  }
++
+   emitTypes();
+   emitIntrinsicHelpers();
+   emitGlobalConstants();
+@@ -995,7 +1043,11 @@ void MetalEmitter::emitUnaryOperator(const UnaryOperator* UO, const std::string&
+   switch (UO->getOpcode()) {
+     case Instruction::FNeg: {
+       std::string operand = emitExpr(UO->getOperand(0));
+-      os << indent(level) << name << " = -" << operand << "; " << "// " << instToString(*UO) << "\n";
++      if (UO->getType()->isDoubleTy()) {
++        os << indent(level) << name << " = __vf64_neg(" << operand << "); " << "// " << instToString(*UO) << "\n";
++      } else {
++        os << indent(level) << name << " = -" << operand << "; " << "// " << instToString(*UO) << "\n";
++      }
+       break;
+     }
+ 
+@@ -1046,6 +1098,45 @@ bool MetalEmitter::emitCastInstruction(const CastInst* CI, const std::string& na
+     return false;
+   };
+ 
++  // double is a ulong bit pattern; route every conversion through VF64.
++  {
++    Type* srcTy = CI->getSrcTy();
++    Type* dstTy = CI->getDestTy();
++    bool srcD = srcTy->isDoubleTy();
++    bool dstD = dstTy->isDoubleTy();
++    if (srcD || dstD) {
++      std::string expr;
++      switch (CI->getOpcode()) {
++        case Instruction::BitCast:
++          expr = src; // i64 <-> double: same bits, same MSL type
++          break;
++        case Instruction::FPExt:
++          expr = "__vf64_from_f32((float)" + src + ")"; // float or half -> double
++          break;
++        case Instruction::FPTrunc:
++          expr = "(" + destType + ")__vf64_to_f32(" + src + ")"; // double -> float or half
++          break;
++        case Instruction::SIToFP:
++          expr = "__vf64_from_i64((ulong)(long)__as_signed(" + src + "))";
++          break;
++        case Instruction::UIToFP:
++          expr = "__vf64_from_u64((ulong)" + src + ")";
++          break;
++        case Instruction::FPToSI:
++          expr = "(" + destType + ")__vf64_to_i64(" + src + ")";
++          break;
++        case Instruction::FPToUI:
++          expr = "(" + destType + ")__vf64_to_u64(" + src + ")";
++          break;
++        default:
++          errorMsg = "Error: Unsupported cast involving double: " + instToString(*CI);
++          return false;
++      }
++      os << indent(level) << name << " = " << expr << "; // " << instToString(*CI) << "\n";
++      return true;
++    }
++  }
++
+   // Special-case addrspacecast: preserve AS3/AS5 when casting to generic.
+   if (auto* ASC = dyn_cast<AddrSpaceCastInst>(CI)) {
+     unsigned srcAS = ASC->getSrcAddressSpace();
+@@ -1079,6 +1170,26 @@ void MetalEmitter::emitBinaryOperator(const BinaryOperator* BO, const std::strin
+ 
+   std::string resultType = mapType(BO->getType());
+ 
++  if (BO->getType()->isDoubleTy()) {
++    const char* fn = nullptr;
++    switch (BO->getOpcode()) {
++      case Instruction::FAdd: fn = "__vf64_add"; break;
++      case Instruction::FSub: fn = "__vf64_sub"; break;
++      case Instruction::FMul: fn = "__vf64_mul"; break;
++      case Instruction::FDiv: fn = "__vf64_div"; break;
++      case Instruction::FRem: fn = "__vf64_fmod"; break;
++      default:
++        errorMsg = "ERROR: Unsupported double binary operator: " + std::string(BO->getOpcodeName());
++        return;
++    }
++    os << indent(level) << name << " = " << fn << "(" << lhs << ", " << rhs << "); // " << instToString(*BO) << "\n";
++    return;
++  }
++  if (BO->getType()->isVectorTy() && cast<VectorType>(BO->getType())->getElementType()->isDoubleTy()) {
++    errorMsg = "ERROR: Unsupported double vector operator: " + std::string(BO->getOpcodeName());
++    return;
++  }
++
+   switch (BO->getOpcode()) {
+     case Instruction::FAdd:
+     case Instruction::Add:
+@@ -1229,6 +1340,38 @@ void MetalEmitter::emitFCmpInstruction(const FCmpInst* FC, const std::string& na
+   std::string lhs = emitExpr(FC->getOperand(0));
+   std::string rhs = emitExpr(FC->getOperand(1));
+ 
++  if (FC->getOperand(0)->getType()->isDoubleTy()) {
++    // Quiet VF64 comparisons: false on NaN, no exception state.
++    std::string uno = "(__vf64_isnan(" + lhs + ") || __vf64_isnan(" + rhs + "))";
++    std::string expr;
++    switch (FC->getPredicate()) {
++      case FCmpInst::FCMP_FALSE: expr = "false"; break;
++      case FCmpInst::FCMP_TRUE:  expr = "true"; break;
++      case FCmpInst::FCMP_OEQ: expr = "__vf64_eq(" + lhs + ", " + rhs + ")"; break;
++      case FCmpInst::FCMP_ONE: expr = "(!" + uno + " && !__vf64_eq(" + lhs + ", " + rhs + "))"; break;
++      case FCmpInst::FCMP_OGT: expr = "__vf64_lt(" + rhs + ", " + lhs + ")"; break;
++      case FCmpInst::FCMP_OGE: expr = "__vf64_le(" + rhs + ", " + lhs + ")"; break;
++      case FCmpInst::FCMP_OLT: expr = "__vf64_lt(" + lhs + ", " + rhs + ")"; break;
++      case FCmpInst::FCMP_OLE: expr = "__vf64_le(" + lhs + ", " + rhs + ")"; break;
++      case FCmpInst::FCMP_ORD: expr = "(!" + uno + ")"; break;
++      case FCmpInst::FCMP_UNO: expr = uno; break;
++      case FCmpInst::FCMP_UEQ: expr = "(" + uno + " || __vf64_eq(" + lhs + ", " + rhs + "))"; break;
++      case FCmpInst::FCMP_UGT: expr = "(" + uno + " || __vf64_lt(" + rhs + ", " + lhs + "))"; break;
++      case FCmpInst::FCMP_UGE: expr = "(" + uno + " || __vf64_le(" + rhs + ", " + lhs + "))"; break;
++      case FCmpInst::FCMP_ULT: expr = "(" + uno + " || __vf64_lt(" + lhs + ", " + rhs + "))"; break;
++      case FCmpInst::FCMP_ULE: expr = "(" + uno + " || __vf64_le(" + lhs + ", " + rhs + "))"; break;
++      case FCmpInst::FCMP_UNE: expr = "(!__vf64_eq(" + lhs + ", " + rhs + "))"; break;
++      default: {
++        std::ostringstream ss;
++        ss << "ERROR: Unknown double FCmp predicate: " << FC->getPredicate() << std::endl;
++        errorMsg = ss.str();
++        return;
++      }
++    }
++    os << indent(level) << name << " = " << expr << "; // " << instToString(*FC) << "\n";
++    return;
++  }
++
+   switch (FC->getPredicate()) {
+     case FCmpInst::FCMP_OEQ:
+       os << indent(level) << name << " = (" << lhs << " == " << rhs << ");\n";
+@@ -1377,6 +1520,23 @@ bool MetalEmitter::emitCallInstruction(const CallInst* CI, const std::string& na
+     return emitMetalInlineCall(CI, name, level);
+   }
+ 
++  // Exact VF64 versions of the f64 math builtins. The libkernel bodies for
++  // these round through float; the software runtime gives correctly rounded
++  // binary64 results, so prefer it where an exact operation exists.
++  {
++    const auto& exactF64 = vf64ExactBuiltins();
++    auto it = exactF64.find(calleeName);
++    if (it != exactF64.end() && CI->getType()->isDoubleTy()) {
++      std::string callExpr = it->second + "(";
++      for (unsigned i = 0; i < CI->arg_size(); ++i) {
++        if (i > 0) callExpr += ", ";
++        callExpr += emitExpr(CI->getArgOperand(i));
++      }
++      os << indent(level) << name << " = " << callExpr << "); // " << instToString(*CI) << "\n";
++      return true;
++    }
++  }
++
+   int argsSize = CI->arg_size();
+   if (callee->isDeclaration()) {
+     auto returnType = callee->getReturnType();
+@@ -1417,6 +1577,12 @@ std::string MetalEmitter::emitExpr(const Value* V) {
+   }
+ 
+   if (auto *CF = dyn_cast<ConstantFP>(V)) {
++    if (CF->getType()->isDoubleTy()) {
++      uint64_t bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
++      std::ostringstream hex;
++      hex << "0x" << std::hex << bits << "ul";
++      return hex.str();
++    }
+     float floatVal = CF->getValue().convertToFloat();
+     uint32_t val; memcpy(&val, &floatVal, sizeof(float));
+     std::ostringstream hex;
+@@ -1599,8 +1765,10 @@ std::string MetalEmitter::mapType(const Type* T) {
+   } else if (T->isFloatTy()) {
+     return typeCache[T] = "float";
+   } else if (T->isDoubleTy()) {
+-    // Metal GPUs do not have native FP64 support; demote parser-side doubles.
+-    return typeCache[T] = "float";
++    // Metal GPUs have no native FP64. `double` is carried as a ulong holding
++    // the IEEE-754 binary64 bit pattern (layout-compatible with the host) and
++    // all operations are lowered to the VF64 software runtime.
++    return typeCache[T] = "ulong";
+   } else if (T->isHalfTy()) {
+     return typeCache[T] = "half";
+   } else {
+diff --git a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
+index 65a9f21b..5ce9f547 100644
+--- a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
++++ b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
+@@ -64,6 +64,7 @@
+ #include <unistd.h>
+ 
+ #include "Emitter.hpp"
++#include "VF64Support.hpp"
+ 
+ namespace hipsycl {
+ namespace compiler {
+@@ -473,6 +474,22 @@ AddressSpaceMap LLVMToMetalTranslator::getAddressSpaceMap() const
+   return ASMap;
+ }
+ 
++
++namespace {
++// Drop the libkernel bodies of f64 builtins that VF64 implements exactly. The
++// libkernel versions round through float; keeping them as declarations stops
++// the inliner from expanding them so the emitter can lower the call itself.
++void stripExactF64Builtins(llvm::Module& M) {
++  for (llvm::Function& F : M) {
++    if (F.isDeclaration()) continue;
++    if (!vf64ExactBuiltins().count(F.getName().str())) continue;
++    F.deleteBody();
++    F.removeFnAttr(llvm::Attribute::AlwaysInline);
++    F.setLinkage(llvm::GlobalValue::ExternalLinkage);
++  }
++}
++} // namespace
++
+ bool LLVMToMetalTranslator::isKernelAfterFlavoring(llvm::Function& F) {
+   return ActualKernelNames.count(F.getName().str()) > 0;
+ }
+@@ -500,6 +517,7 @@ bool LLVMToMetalTranslator::toBackendFlavor(llvm::Module &M, PassHandler& PH) {
+       common::filesystem::join_path(getBitcodePath(), "libkernel-sscp-metal-full.bc");
+   if (!this->linkBitcodeFile(M, BuiltinBitcodeFile))
+     return false;
++  stripExactF64Builtins(M);
+ 
+   AddressSpaceInferencePass ASIPass{ASMap};
+   ASIPass.run(M, *PH.ModuleAnalysisManager);
+@@ -528,6 +546,7 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
+ 
+     if (!linkBitcodeFile(FlavoredModule, BuiltinBitcodeFile))
+       return false;
++    stripExactF64Builtins(FlavoredModule);
+ 
+     llvm::AlwaysInlinerPass{}.run(FlavoredModule, MAM);
+ 
+diff --git a/src/compiler/llvm-to-backend/metal/VF64Support.hpp b/src/compiler/llvm-to-backend/metal/VF64Support.hpp
+new file mode 100644
+index 00000000..0226a0ea
+--- /dev/null
++++ b/src/compiler/llvm-to-backend/metal/VF64Support.hpp
+@@ -0,0 +1,1234 @@
++// Generated from VF64-metal Sources/VF64Metal/Shaders/IEEE/Arithmetic.metal
++// (https://github.com/Lulzx/VF64-metal, commit 7290217). Do not edit by hand;
++// regenerate with patches/adaptivecpp/tools/gen-vf64-support.py.
++//
++// Correctly rounded software IEEE-754 binary64 for Apple GPUs, which have no
++// native FP64. The Metal emitter inlines this text into the generated MSL
++// whenever a kernel module references the LLVM `double` type.
++#ifndef HIPSYCL_METAL_VF64_SUPPORT_HPP
++#define HIPSYCL_METAL_VF64_SUPPORT_HPP
++
++#include <string>
++#include <unordered_map>
++
++namespace hipsycl {
++namespace compiler {
++
++// f64 math builtins that have an exact VF64 implementation. LLVMToMetal strips
++// the libkernel (float-rounding) bodies of these so the calls reach the
++// emitter, which lowers them to the mapped __vf64_* function.
++inline const std::unordered_map<std::string, std::string>& vf64ExactBuiltins() {
++  static const std::unordered_map<std::string, std::string> table = {
++    {"__acpp_sscp_sqrt_f64", "__vf64_sqrt"},
++    {"__acpp_sscp_fma_f64", "__vf64_fma"},
++    {"__acpp_sscp_fabs_f64", "__vf64_fabs"},
++    {"__acpp_sscp_copysign_f64", "__vf64_copysign"},
++    {"__acpp_sscp_fmin_f64", "__vf64_fmin"},
++    {"__acpp_sscp_fmax_f64", "__vf64_fmax"},
++    {"__acpp_sscp_floor_f64", "__vf64_floor"},
++    {"__acpp_sscp_ceil_f64", "__vf64_ceil"},
++    {"__acpp_sscp_trunc_f64", "__vf64_trunc"},
++    {"__acpp_sscp_rint_f64", "__vf64_rint"},
++    {"__acpp_sscp_round_f64", "__vf64_round"},
++    {"__acpp_sscp_fmod_f64", "__vf64_fmod"},
++  };
++  return table;
++}
++
++static const char* const vf64_support_msl = R"vf64(
++// ===================== VF64-metal IEEE/Arithmetic.metal =====================
++inline bool soft_is_nan(ulong a) {
++    return (a & 0x7ff0000000000000ul) == 0x7ff0000000000000ul &&
++           (a & 0x000ffffffffffffful) != 0;
++}
++
++inline bool soft_is_inf(ulong a) {
++    return (a & 0x7ffffffffffffffful) == 0x7ff0000000000000ul;
++}
++
++inline bool soft_is_signaling_nan(ulong a) {
++    return soft_is_nan(a) && (a & 0x0008000000000000ul) == 0;
++}
++
++inline ulong soft_propagate_nan(ulong a, ulong b) {
++    bool signalingA = soft_is_signaling_nan(a);
++    bool signalingB = soft_is_signaling_nan(b);
++    ulong source;
++    if (signalingA || signalingB) {
++        source = signalingA ? a : b;
++    } else {
++        source = soft_is_nan(a) ? a : b;
++    }
++    return source | 0x0008000000000000ul;
++}
++
++inline ulong shift_right_jam(ulong value, uint distance) {
++    if (distance == 0) return value;
++    if (distance < 64) {
++        ulong discarded = value & ((1ul << distance) - 1ul);
++        return (value >> distance) | ulong(discarded != 0);
++    }
++    return ulong(value != 0);
++}
++
++constant uint soft_round_near_even = 0;
++constant uint soft_round_min_mag = 1;
++constant uint soft_round_min = 2;
++constant uint soft_round_max = 3;
++constant uint soft_round_near_max_mag = 4;
++constant uint soft_flag_inexact = 1;
++constant uint soft_flag_underflow = 2;
++constant uint soft_flag_overflow = 4;
++constant uint soft_flag_infinite = 8;
++constant uint soft_flag_invalid = 16;
++
++inline bool soft_should_increment(
++    bool sign, ulong roundBits, ulong significand, uint roundingMode
++) {
++    if (roundBits == 0) return false;
++    if (roundingMode == soft_round_near_even) {
++        return roundBits > 4ul ||
++               (roundBits == 4ul && (significand & 1ul) != 0);
++    }
++    if (roundingMode == soft_round_near_max_mag) return roundBits >= 4ul;
++    if (roundingMode == soft_round_min) return sign;
++    if (roundingMode == soft_round_max) return !sign;
++    return false;
++}
++
++inline ulong soft_overflow_result(bool sign, uint roundingMode) {
++    bool toInfinity =
++        roundingMode == soft_round_near_even ||
++        roundingMode == soft_round_near_max_mag ||
++        (roundingMode == soft_round_min && sign) ||
++        (roundingMode == soft_round_max && !sign);
++    ulong signBit = ulong(sign) << 63;
++    return toInfinity
++        ? signBit | 0x7ff0000000000000ul
++        : signBit | 0x7feffffffffffffful;
++}
++
++inline ulong soft_round_pack_status(
++    bool sign, int exponent, ulong significandWithRound, uint roundingMode,
++    thread uint &flags
++) {
++    bool wasSubnormal = exponent <= 0;
++    if (exponent <= 0) {
++        uint distance = uint(1 - exponent);
++        significandWithRound = shift_right_jam(significandWithRound, distance);
++        exponent = 0;
++    }
++
++    ulong roundBits = significandWithRound & 7ul;
++    ulong significand = significandWithRound >> 3;
++    if (soft_should_increment(sign, roundBits, significand, roundingMode)) {
++        significand += 1ul;
++    }
++
++    if (exponent == 0) {
++        if (significand >= (1ul << 52)) exponent = 1;
++    } else if (exponent == 1 && significand < (1ul << 52)) {
++        // Subnormal operands use effective exponent 1 during alignment.
++        exponent = 0;
++    } else if (significand >= (1ul << 53)) {
++        significand >>= 1;
++        exponent += 1;
++    }
++    if (exponent >= 0x7ff) {
++        flags |= soft_flag_overflow | soft_flag_inexact;
++        return soft_overflow_result(sign, roundingMode);
++    }
++    if (roundBits != 0) {
++        flags |= soft_flag_inexact;
++        bool tiny = exponent == 0 ||
++            (wasSubnormal && exponent == 1 && roundBits <= 4ul);
++        if (tiny) flags |= soft_flag_underflow;
++    }
++    if (significand == 0) return ulong(sign) << 63;
++    return (ulong(sign) << 63) | (ulong(exponent) << 52) |
++           (significand & 0x000ffffffffffffful);
++}
++
++inline ulong soft_round_pack(
++    bool sign, int exponent, ulong significandWithRound, uint roundingMode
++) {
++    uint ignoredFlags = 0;
++    return soft_round_pack_status(
++        sign, exponent, significandWithRound, roundingMode, ignoredFlags
++    );
++}
++
++inline ulong soft_add64_status(
++    ulong a, ulong b, uint roundingMode, thread uint &flags
++) {
++    uint expAField = uint((a >> 52) & 0x7fful);
++    uint expBField = uint((b >> 52) & 0x7fful);
++    ulong fracA = a & 0x000ffffffffffffful;
++    ulong fracB = b & 0x000ffffffffffffful;
++    bool signA = (a >> 63) != 0;
++    bool signB = (b >> 63) != 0;
++
++    if (expAField == 0x7ffu || expBField == 0x7ffu) {
++        if (soft_is_nan(a) || soft_is_nan(b)) {
++            if (soft_is_signaling_nan(a) || soft_is_signaling_nan(b)) {
++                flags |= soft_flag_invalid;
++            }
++            return soft_propagate_nan(a, b);
++        }
++        if (soft_is_inf(a) && soft_is_inf(b) && signA != signB) {
++            flags |= soft_flag_invalid;
++            return 0x7ff8000000000000ul;
++        }
++        return soft_is_inf(a) ? a : b;
++    }
++
++    int expA = expAField == 0 ? 1 : int(expAField);
++    int expB = expBField == 0 ? 1 : int(expBField);
++    ulong sigA = fracA | (expAField == 0 ? 0ul : (1ul << 52));
++    ulong sigB = fracB | (expBField == 0 ? 0ul : (1ul << 52));
++
++    // Order by magnitude so opposite-sign subtraction is nonnegative.
++    if (expA < expB || (expA == expB && sigA < sigB)) {
++        int te = expA; expA = expB; expB = te;
++        ulong ts = sigA; sigA = sigB; sigB = ts;
++        bool tb = signA; signA = signB; signB = tb;
++    }
++
++    sigA <<= 3;
++    sigB <<= 3;
++    sigB = shift_right_jam(sigB, uint(expA - expB));
++
++    if (signA == signB) {
++        ulong sum = sigA + sigB;
++        if ((sum & (1ul << 56)) != 0) {
++            sum = shift_right_jam(sum, 1);
++            expA += 1;
++        }
++        return soft_round_pack_status(signA, expA, sum, roundingMode, flags);
++    }
++
++    ulong difference = sigA - sigB;
++    if (difference == 0) {
++        // Exact cancellation is -0 only when rounding toward -infinity.
++        return roundingMode == soft_round_min ? 0x8000000000000000ul : 0ul;
++    }
++    int leading = 63 - int(clz(difference));
++    int left = 55 - leading;
++    if (left > 0) {
++        difference <<= uint(left);
++        expA -= left;
++    }
++    return soft_round_pack_status(
++        signA, expA, difference, roundingMode, flags
++    );
++}
++
++inline ulong soft_add64_mode(ulong a, ulong b, uint roundingMode) {
++    uint ignoredFlags = 0;
++    return soft_add64_status(a, b, roundingMode, ignoredFlags);
++}
++
++inline ulong soft_add64(ulong a, ulong b) {
++    return soft_add64_mode(a, b, soft_round_near_even);
++}
++
++inline ulong soft_sub64_status(
++    ulong a, ulong b, uint roundingMode, thread uint &flags
++) {
++    if (soft_is_nan(a) || soft_is_nan(b)) {
++        if (soft_is_signaling_nan(a) || soft_is_signaling_nan(b)) {
++            flags |= soft_flag_invalid;
++        }
++        return soft_propagate_nan(a, b);
++    }
++    return soft_add64_status(
++        a, b ^ 0x8000000000000000ul, roundingMode, flags
++    );
++}
++
++inline ulong soft_sub64_mode(ulong a, ulong b, uint roundingMode) {
++    uint ignoredFlags = 0;
++    return soft_sub64_status(a, b, roundingMode, ignoredFlags);
++}
++
++inline ulong soft_sub64(ulong a, ulong b) {
++    return soft_sub64_mode(a, b, soft_round_near_even);
++}
++
++struct soft_normalized {
++    ulong significand;
++    int exponent;
++};
++
++inline soft_normalized soft_normalize_operand(uint exponentField, ulong fraction) {
++    if (exponentField != 0) {
++        return soft_normalized{fraction | (1ul << 52), int(exponentField)};
++    }
++    int leading = 63 - int(clz(fraction));
++    int left = 52 - leading;
++    return soft_normalized{fraction << uint(left), 1 - left};
++}
++
++inline ulong round_shift_u128_status(
++    ulong hi, ulong lo, int distance, bool sign, uint roundingMode,
++    thread bool &wasInexact, thread bool &wasAboveHalf
++) {
++    if (distance <= 0) return lo;
++    ulong quotient;
++    bool greaterHalf = false;
++    bool exactlyHalf = false;
++    if (distance < 64) {
++        uint d = uint(distance);
++        quotient = (hi << (64u - d)) | (lo >> d);
++        ulong remainder = lo & ((1ul << d) - 1ul);
++        ulong halfwayBit = 1ul << (d - 1u);
++        greaterHalf = remainder > halfwayBit;
++        exactlyHalf = remainder == halfwayBit;
++    } else if (distance == 64) {
++        quotient = hi;
++        ulong halfwayBit = 1ul << 63;
++        greaterHalf = lo > halfwayBit;
++        exactlyHalf = lo == halfwayBit;
++    } else if (distance < 128) {
++        uint d = uint(distance - 64);
++        quotient = hi >> d;
++        ulong highRemainder = hi & ((1ul << d) - 1ul);
++        ulong halfwayBit = 1ul << (d - 1u);
++        greaterHalf = highRemainder > halfwayBit || (highRemainder == halfwayBit && lo != 0);
++        exactlyHalf = highRemainder == halfwayBit && lo == 0;
++    } else {
++        quotient = 0ul;
++        greaterHalf = false;
++        exactlyHalf = false;
++        wasInexact = hi != 0 || lo != 0;
++        wasAboveHalf = false;
++        ulong syntheticRoundBits = wasInexact ? 1ul : 0ul;
++        if (soft_should_increment(sign, syntheticRoundBits, quotient, roundingMode)) {
++            quotient += 1ul;
++        }
++        return quotient;
++    }
++    ulong roundBits = greaterHalf ? 5ul : (exactlyHalf ? 4ul : 0ul);
++    wasInexact = greaterHalf || exactlyHalf;
++    wasAboveHalf = greaterHalf;
++    if (!wasInexact) {
++        if (distance < 64) {
++            wasInexact = (lo & ((1ul << uint(distance)) - 1ul)) != 0;
++        } else if (distance == 64) {
++            wasInexact = lo != 0;
++        } else {
++            uint d = uint(distance - 64);
++            wasInexact = (hi & ((1ul << d) - 1ul)) != 0 || lo != 0;
++        }
++        if (wasInexact) roundBits = 1ul;
++    }
++    if (soft_should_increment(sign, roundBits, quotient, roundingMode)) quotient += 1ul;
++    return quotient;
++}
++
++inline ulong round_shift_u128(
++    ulong hi, ulong lo, int distance, bool sign, uint roundingMode
++) {
++    bool ignoredInexact = false;
++    bool ignoredAboveHalf = false;
++    return round_shift_u128_status(
++        hi, lo, distance, sign, roundingMode, ignoredInexact,
++        ignoredAboveHalf
++    );
++}
++
++inline ulong soft_mul64_status(
++    ulong a, ulong b, uint roundingMode, thread uint &flags
++) {
++    bool sign = ((a ^ b) >> 63) != 0;
++    uint expAField = uint((a >> 52) & 0x7fful);
++    uint expBField = uint((b >> 52) & 0x7fful);
++    ulong fracA = a & 0x000ffffffffffffful;
++    ulong fracB = b & 0x000ffffffffffffful;
++
++    if (expAField == 0x7ffu || expBField == 0x7ffu) {
++        if (soft_is_nan(a) || soft_is_nan(b)) {
++            if (soft_is_signaling_nan(a) || soft_is_signaling_nan(b)) {
++                flags |= soft_flag_invalid;
++            }
++            return soft_propagate_nan(a, b);
++        }
++        bool zeroA = (a & 0x7ffffffffffffffful) == 0;
++        bool zeroB = (b & 0x7ffffffffffffffful) == 0;
++        if (zeroA || zeroB) {
++            flags |= soft_flag_invalid;
++            return 0x7ff8000000000000ul;
++        }
++        return (ulong(sign) << 63) | 0x7ff0000000000000ul;
++    }
++    if ((expAField == 0 && fracA == 0) || (expBField == 0 && fracB == 0)) {
++        return ulong(sign) << 63;
++    }
++
++    soft_normalized na = soft_normalize_operand(expAField, fracA);
++    soft_normalized nb = soft_normalize_operand(expBField, fracB);
++    ulong lo = na.significand * nb.significand;
++    ulong hi = mulhi(na.significand, nb.significand);
++    int top = 127 - int(clz(hi));
++    int exponent = na.exponent + nb.exponent - 1023 + (top - 104);
++    int shift = top - 52;
++    bool subnormal = exponent <= 0;
++    if (subnormal) shift += 1 - exponent;
++    bool inexact = false;
++    bool aboveHalf = false;
++    ulong significand = round_shift_u128_status(
++        hi, lo, shift, sign, roundingMode, inexact, aboveHalf
++    );
++
++    if (subnormal) {
++        if (significand >= (1ul << 52)) exponent = 1;
++        else exponent = 0;
++    } else if (significand >= (1ul << 53)) {
++        significand >>= 1;
++        exponent += 1;
++    }
++    if (exponent >= 0x7ff) {
++        flags |= soft_flag_overflow | soft_flag_inexact;
++        return soft_overflow_result(sign, roundingMode);
++    }
++    if (inexact) {
++        flags |= soft_flag_inexact;
++        bool tiny = exponent == 0 ||
++            (subnormal && exponent == 1 && !aboveHalf);
++        if (tiny) flags |= soft_flag_underflow;
++    }
++    if (significand == 0) return ulong(sign) << 63;
++    return (ulong(sign) << 63) | (ulong(exponent) << 52) |
++           (significand & 0x000ffffffffffffful);
++}
++
++inline ulong soft_mul64_mode(ulong a, ulong b, uint roundingMode) {
++    uint ignoredFlags = 0;
++    return soft_mul64_status(a, b, roundingMode, ignoredFlags);
++}
++
++inline ulong soft_mul64(ulong a, ulong b) {
++    return soft_mul64_mode(a, b, soft_round_near_even);
++}
++
++inline ulong soft_div64_status(
++    ulong a, ulong b, uint roundingMode, thread uint &flags
++) {
++    bool sign = ((a ^ b) >> 63) != 0;
++    uint expAField = uint((a >> 52) & 0x7fful);
++    uint expBField = uint((b >> 52) & 0x7fful);
++    ulong fracA = a & 0x000ffffffffffffful;
++    ulong fracB = b & 0x000ffffffffffffful;
++    bool zeroA = expAField == 0 && fracA == 0;
++    bool zeroB = expBField == 0 && fracB == 0;
++
++    if (soft_is_nan(a) || soft_is_nan(b)) {
++        if (soft_is_signaling_nan(a) || soft_is_signaling_nan(b)) {
++            flags |= soft_flag_invalid;
++        }
++        return soft_propagate_nan(a, b);
++    }
++    if (soft_is_inf(a)) {
++        if (soft_is_inf(b)) {
++            flags |= soft_flag_invalid;
++            return 0x7ff8000000000000ul;
++        }
++        return (ulong(sign) << 63) | 0x7ff0000000000000ul;
++    }
++    if (soft_is_inf(b)) return ulong(sign) << 63;
++    if (zeroB) {
++        if (zeroA) {
++            flags |= soft_flag_invalid;
++            return 0x7ff8000000000000ul;
++        }
++        flags |= soft_flag_infinite;
++        return (ulong(sign) << 63) | 0x7ff0000000000000ul;
++    }
++    if (zeroA) return ulong(sign) << 63;
++
++    soft_normalized na = soft_normalize_operand(expAField, fracA);
++    soft_normalized nb = soft_normalize_operand(expBField, fracB);
++    int exponent = na.exponent - nb.exponent + 1023;
++    ulong remainder = na.significand;
++    if (remainder < nb.significand) {
++        remainder <<= 1;
++        exponent -= 1;
++    }
++
++    // Generate the hidden bit, 52 stored significand bits, and three rounding
++    // bits. The residual is then jammed into the low bit as sticky state.
++    ulong quotientWithRound = 0;
++    for (uint bit = 0; bit < 56; ++bit) {
++        quotientWithRound <<= 1;
++        if (remainder >= nb.significand) {
++            quotientWithRound |= 1ul;
++            remainder -= nb.significand;
++        }
++        remainder <<= 1;
++    }
++    if (remainder != 0) quotientWithRound |= 1ul;
++    return soft_round_pack_status(
++        sign, exponent, quotientWithRound, roundingMode, flags
++    );
++}
++
++inline ulong soft_div64_mode(ulong a, ulong b, uint roundingMode) {
++    uint ignoredFlags = 0;
++    return soft_div64_status(a, b, roundingMode, ignoredFlags);
++}
++
++inline ulong soft_div64(ulong a, ulong b) {
++    return soft_div64_mode(a, b, soft_round_near_even);
++}
++
++inline ulong soft_sqrt64_status(
++    ulong a, uint roundingMode, thread uint &flags
++) {
++    uint exponentField = uint((a >> 52) & 0x7fful);
++    ulong fraction = a & 0x000ffffffffffffful;
++    bool sign = (a >> 63) != 0;
++
++    if (soft_is_nan(a)) {
++        if (soft_is_signaling_nan(a)) flags |= soft_flag_invalid;
++        return a | 0x0008000000000000ul;
++    }
++    if (soft_is_inf(a)) {
++        if (sign) flags |= soft_flag_invalid;
++        return sign ? 0x7ff8000000000000ul : a;
++    }
++    if (exponentField == 0 && fraction == 0) return a;
++    if (sign) {
++        flags |= soft_flag_invalid;
++        return 0x7ff8000000000000ul;
++    }
++
++    soft_normalized operand = soft_normalize_operand(exponentField, fraction);
++    int unbiasedExponent = operand.exponent - 1023;
++    ulong adjustedSignificand = operand.significand;
++    if ((unbiasedExponent & 1) != 0) {
++        adjustedSignificand <<= 1;
++        unbiasedExponent -= 1;
++    }
++
++    // Compute floor(sqrt(adjustedSignificand << 58)). This is the normalized
++    // 53-bit result plus three rounding bits. Feeding two radicand bits per
++    // iteration keeps the partial remainder below 2^59, so ulong is enough.
++    ulong rootWithRound = 0;
++    ulong remainder = 0;
++    for (uint pairIndex = 0; pairIndex < 56; ++pairIndex) {
++        int radicandBit = 110 - int(pairIndex * 2);
++        ulong pair = 0;
++        if (radicandBit >= 58) {
++            pair = (adjustedSignificand >> uint(radicandBit - 58)) & 3ul;
++        }
++        remainder = (remainder << 2) | pair;
++        rootWithRound <<= 1;
++        ulong trial = (rootWithRound << 1) | 1ul;
++        if (remainder >= trial) {
++            remainder -= trial;
++            rootWithRound |= 1ul;
++        }
++    }
++    if (remainder != 0) rootWithRound |= 1ul;
++    int resultExponent = unbiasedExponent / 2 + 1023;
++    return soft_round_pack_status(
++        false, resultExponent, rootWithRound, roundingMode, flags
++    );
++}
++
++inline ulong soft_sqrt64_mode(ulong a, uint roundingMode) {
++    uint ignoredFlags = 0;
++    return soft_sqrt64_status(a, roundingMode, ignoredFlags);
++}
++
++inline ulong soft_sqrt64(ulong a) {
++    return soft_sqrt64_mode(a, soft_round_near_even);
++}
++
++struct soft_u128 {
++    ulong hi;
++    ulong lo;
++};
++
++inline soft_u128 soft_add128(soft_u128 a, soft_u128 b) {
++    ulong lo = a.lo + b.lo;
++    return soft_u128{a.hi + b.hi + ulong(lo < a.lo), lo};
++}
++
++inline soft_u128 soft_sub128(soft_u128 a, soft_u128 b) {
++    ulong lo = a.lo - b.lo;
++    return soft_u128{a.hi - b.hi - ulong(a.lo < b.lo), lo};
++}
++
++inline soft_u128 soft_shift_right_jam128(soft_u128 a, uint distance) {
++    if (distance == 0) return a;
++    if (distance < 64) {
++        ulong discarded = a.lo & ((1ul << distance) - 1ul);
++        return soft_u128{
++            a.hi >> distance,
++            (a.hi << (64u - distance)) | (a.lo >> distance) |
++                ulong(discarded != 0)
++        };
++    }
++    if (distance == 64) {
++        return soft_u128{0, a.hi | ulong(a.lo != 0)};
++    }
++    if (distance < 128) {
++        uint shift = distance - 64;
++        ulong discarded = a.hi & ((1ul << shift) - 1ul);
++        return soft_u128{
++            0,
++            (a.hi >> shift) | ulong(discarded != 0 || a.lo != 0)
++        };
++    }
++    return soft_u128{0, ulong(a.hi != 0 || a.lo != 0)};
++}
++
++inline soft_u128 soft_shift_left128(soft_u128 a, uint distance) {
++    if (distance == 0) return a;
++    return soft_u128{
++        (a.hi << distance) | (a.lo >> (64u - distance)),
++        a.lo << distance
++    };
++}
++
++inline ulong soft_finish_fma_status(
++    bool sign, int exponent, ulong significand, uint roundingMode,
++    thread uint &flags
++) {
++    ulong roundIncrement = 0x200ul;
++    if (roundingMode != soft_round_near_even &&
++        roundingMode != soft_round_near_max_mag) {
++        bool towardSign = roundingMode ==
++            (sign ? soft_round_min : soft_round_max);
++        roundIncrement = towardSign ? 0x3fful : 0ul;
++    }
++
++    ulong roundedInput = significand;
++    bool tiny = false;
++    if (exponent < 0) {
++        tiny = exponent < -1 ||
++            significand + roundIncrement < 0x8000000000000000ul;
++        roundedInput = shift_right_jam(significand, uint(-exponent));
++    }
++    ulong roundBits = roundedInput & 0x3fful;
++    bool overflow = exponent > 0x7fd ||
++        (exponent == 0x7fd &&
++         significand + roundIncrement >= 0x8000000000000000ul);
++    if (overflow) {
++        flags |= soft_flag_overflow | soft_flag_inexact;
++    } else if (roundBits != 0) {
++        flags |= soft_flag_inexact;
++        if (tiny) flags |= soft_flag_underflow;
++    }
++
++    return soft_round_pack(
++        sign, exponent + 1, shift_right_jam(significand, 7), roundingMode
++    );
++}
++
++inline ulong soft_fma64_status(
++    ulong a, ulong b, ulong c, uint roundingMode, thread uint &flags
++) {
++    bool signProduct = ((a ^ b) >> 63) != 0;
++    bool signC = (c >> 63) != 0;
++    uint expAField = uint((a >> 52) & 0x7fful);
++    uint expBField = uint((b >> 52) & 0x7fful);
++    uint expCField = uint((c >> 52) & 0x7fful);
++    ulong fracA = a & 0x000ffffffffffffful;
++    ulong fracB = b & 0x000ffffffffffffful;
++    ulong fracC = c & 0x000ffffffffffffful;
++    bool zeroA = expAField == 0 && fracA == 0;
++    bool zeroB = expBField == 0 && fracB == 0;
++
++    if (soft_is_nan(a) || soft_is_nan(b)) {
++        if (soft_is_signaling_nan(a) || soft_is_signaling_nan(b) ||
++            soft_is_signaling_nan(c)) {
++            flags |= soft_flag_invalid;
++        }
++        ulong ab = soft_propagate_nan(a, b);
++        return soft_is_nan(c) ? soft_propagate_nan(ab, c) : ab;
++    }
++    if (soft_is_inf(a) || soft_is_inf(b)) {
++        if (zeroA || zeroB) {
++            flags |= soft_flag_invalid;
++            ulong invalidProduct = 0x7ff8000000000000ul;
++            return soft_is_nan(c)
++                ? soft_propagate_nan(invalidProduct, c)
++                : invalidProduct;
++        }
++        if (soft_is_nan(c)) {
++            if (soft_is_signaling_nan(c)) flags |= soft_flag_invalid;
++            return c | 0x0008000000000000ul;
++        }
++        ulong productInfinity =
++            (ulong(signProduct) << 63) | 0x7ff0000000000000ul;
++        if (soft_is_inf(c) && signProduct != signC) {
++            flags |= soft_flag_invalid;
++            return 0x7ff8000000000000ul;
++        }
++        return productInfinity;
++    }
++    if (soft_is_nan(c)) {
++        if (soft_is_signaling_nan(c)) flags |= soft_flag_invalid;
++        return c | 0x0008000000000000ul;
++    }
++    if (soft_is_inf(c)) return c;
++    if (zeroA || zeroB) {
++        bool zeroC = expCField == 0 && fracC == 0;
++        if (zeroC && signProduct != signC) {
++            return roundingMode == soft_round_min
++                ? 0x8000000000000000ul : 0ul;
++        }
++        return c;
++    }
++
++    soft_normalized na = soft_normalize_operand(expAField, fracA);
++    soft_normalized nb = soft_normalize_operand(expBField, fracB);
++    int exponent = na.exponent + nb.exponent - 0x3fe;
++    ulong sigA = na.significand << 10;
++    ulong sigB = nb.significand << 10;
++    soft_u128 product = soft_u128{mulhi(sigA, sigB), sigA * sigB};
++    if (product.hi < 0x2000000000000000ul) {
++        exponent -= 1;
++        product = soft_add128(product, product);
++    }
++
++    bool zeroC = expCField == 0 && fracC == 0;
++    if (zeroC) {
++        exponent -= 1;
++        ulong significand = (product.hi << 1) | ulong(product.lo != 0);
++        return soft_finish_fma_status(
++            signProduct, exponent, significand, roundingMode, flags
++        );
++    }
++
++    soft_normalized nc = soft_normalize_operand(expCField, fracC);
++    ulong sigC = nc.significand << 9;
++    int exponentDifference = exponent - nc.exponent;
++    soft_u128 alignedC = soft_u128{0, 0};
++    if (exponentDifference < 0) {
++        exponent = nc.exponent;
++        if (signProduct == signC || exponentDifference < -1) {
++            product.hi = shift_right_jam(
++                product.hi, uint(-exponentDifference)
++            );
++        } else {
++            product = soft_shift_right_jam128(product, 1);
++        }
++    } else if (exponentDifference > 0) {
++        alignedC = soft_shift_right_jam128(
++            soft_u128{sigC, 0}, uint(exponentDifference)
++        );
++    }
++
++    ulong significand;
++    bool signResult = signProduct;
++    if (signProduct == signC) {
++        if (exponentDifference <= 0) {
++            significand = (sigC + product.hi) | ulong(product.lo != 0);
++        } else {
++            product = soft_add128(product, alignedC);
++            significand = product.hi | ulong(product.lo != 0);
++        }
++        if (significand < 0x4000000000000000ul) {
++            exponent -= 1;
++            significand <<= 1;
++        }
++    } else {
++        if (exponentDifference < 0) {
++            signResult = signC;
++            product = soft_sub128(soft_u128{sigC, 0}, product);
++        } else if (exponentDifference == 0) {
++            product.hi -= sigC;
++            if ((product.hi | product.lo) == 0) {
++                return roundingMode == soft_round_min
++                    ? 0x8000000000000000ul : 0ul;
++            }
++            if ((product.hi >> 63) != 0) {
++                signResult = !signResult;
++                product = soft_sub128(soft_u128{0, 0}, product);
++            }
++        } else {
++            product = soft_sub128(product, alignedC);
++        }
++
++        if (product.hi == 0) {
++            exponent -= 64;
++            product.hi = product.lo;
++            product.lo = 0;
++        }
++        int shiftDistance = int(clz(product.hi)) - 1;
++        if (shiftDistance < 0) {
++            significand = shift_right_jam(product.hi, 1);
++            exponent += 1;
++        } else {
++            exponent -= shiftDistance;
++            product = soft_shift_left128(product, uint(shiftDistance));
++            significand = product.hi;
++        }
++        significand |= ulong(product.lo != 0);
++    }
++    return soft_finish_fma_status(
++        signResult, exponent, significand, roundingMode, flags
++    );
++}
++
++inline ulong soft_fma64_mode(ulong a, ulong b, ulong c, uint roundingMode) {
++    uint ignoredFlags = 0;
++    return soft_fma64_status(a, b, c, roundingMode, ignoredFlags);
++}
++
++inline ulong soft_fma64(ulong a, ulong b, ulong c) {
++    return soft_fma64_mode(a, b, c, soft_round_near_even);
++}
++
++inline bool soft_equal64_status(
++    ulong a, ulong b, bool signaling, thread uint &flags
++) {
++    bool nanA = soft_is_nan(a);
++    bool nanB = soft_is_nan(b);
++    if (nanA || nanB) {
++        if (signaling || soft_is_signaling_nan(a) ||
++            soft_is_signaling_nan(b)) {
++            flags |= soft_flag_invalid;
++        }
++        return false;
++    }
++    ulong magnitudeA = a & 0x7ffffffffffffffful;
++    ulong magnitudeB = b & 0x7ffffffffffffffful;
++    return a == b || ((magnitudeA | magnitudeB) == 0);
++}
++
++inline bool soft_less64_status(
++    ulong a, ulong b, bool orEqual, bool quiet, thread uint &flags
++) {
++    bool nanA = soft_is_nan(a);
++    bool nanB = soft_is_nan(b);
++    if (nanA || nanB) {
++        if (!quiet || soft_is_signaling_nan(a) ||
++            soft_is_signaling_nan(b)) {
++            flags |= soft_flag_invalid;
++        }
++        return false;
++    }
++
++    ulong magnitudeA = a & 0x7ffffffffffffffful;
++    ulong magnitudeB = b & 0x7ffffffffffffffful;
++    bool equal = a == b || ((magnitudeA | magnitudeB) == 0);
++    if (equal) return orEqual;
++
++    bool signA = (a >> 63) != 0;
++    bool signB = (b >> 63) != 0;
++    if (signA != signB) return signA;
++    return signA ? a > b : a < b;
++}
++
++inline ulong soft_round_to_int64_status(
++    ulong a, uint roundingMode, bool exact, thread uint &flags
++) {
++    uint exponentField = uint((a >> 52) & 0x7fful);
++    ulong fraction = a & 0x000ffffffffffffful;
++    bool sign = (a >> 63) != 0;
++
++    if (exponentField == 0x7ffu) {
++        if (fraction != 0) {
++            if (soft_is_signaling_nan(a)) flags |= soft_flag_invalid;
++            return a | 0x0008000000000000ul;
++        }
++        return a;
++    }
++    ulong magnitude = a & 0x7ffffffffffffffful;
++    if (magnitude == 0 || exponentField >= 1075u) return a;
++
++    if (exponentField < 1023u) {
++        if (exact) flags |= soft_flag_inexact;
++        bool toOne = false;
++        ulong halfValue = 0x3fe0000000000000ul;
++        if (roundingMode == soft_round_near_even) {
++            toOne = magnitude > halfValue;
++        } else if (roundingMode == soft_round_near_max_mag) {
++            toOne = magnitude >= halfValue;
++        } else if (roundingMode == soft_round_min) {
++            toOne = sign;
++        } else if (roundingMode == soft_round_max) {
++            toOne = !sign;
++        }
++        return toOne
++            ? (ulong(sign) << 63) | 0x3ff0000000000000ul
++            : ulong(sign) << 63;
++    }
++
++    uint fractionalBits = 1075u - exponentField;
++    ulong mask = (1ul << fractionalBits) - 1ul;
++    ulong discarded = magnitude & mask;
++    if (discarded == 0) return a;
++    if (exact) flags |= soft_flag_inexact;
++
++    ulong truncated = magnitude & ~mask;
++    ulong halfValue = 1ul << (fractionalBits - 1u);
++    bool increment = false;
++    if (roundingMode == soft_round_near_even) {
++        increment = discarded > halfValue ||
++            (discarded == halfValue &&
++             ((truncated >> fractionalBits) & 1ul) != 0);
++    } else if (roundingMode == soft_round_near_max_mag) {
++        increment = discarded >= halfValue;
++    } else if (roundingMode == soft_round_min) {
++        increment = sign;
++    } else if (roundingMode == soft_round_max) {
++        increment = !sign;
++    }
++    if (increment) truncated += 1ul << fractionalBits;
++    return (ulong(sign) << 63) | truncated;
++}
++
++inline ulong soft_pack_exact64(bool sign, int exponent, ulong magnitude) {
++    if (magnitude == 0) return ulong(sign) << 63;
++    int leading = 63 - int(clz(magnitude));
++    int left = 52 - leading;
++    ulong significand = magnitude << uint(left);
++    return soft_round_pack(
++        sign, exponent - left, significand << 3, soft_round_near_even
++    );
++}
++
++inline ulong soft_remainder64_status(
++    ulong a, ulong b, thread uint &flags
++) {
++    uint expAField = uint((a >> 52) & 0x7fful);
++    uint expBField = uint((b >> 52) & 0x7fful);
++    ulong fracA = a & 0x000ffffffffffffful;
++    ulong fracB = b & 0x000ffffffffffffful;
++    bool signA = (a >> 63) != 0;
++
++    if (soft_is_nan(a) || soft_is_nan(b)) {
++        if (soft_is_signaling_nan(a) || soft_is_signaling_nan(b)) {
++            flags |= soft_flag_invalid;
++        }
++        return soft_propagate_nan(a, b);
++    }
++    if (soft_is_inf(a) || (expBField == 0 && fracB == 0)) {
++        flags |= soft_flag_invalid;
++        return 0x7ff8000000000000ul;
++    }
++    if (soft_is_inf(b) || (expAField == 0 && fracA == 0)) return a;
++
++    soft_normalized na = soft_normalize_operand(expAField, fracA);
++    soft_normalized nb = soft_normalize_operand(expBField, fracB);
++    int exponentDifference = na.exponent - nb.exponent;
++    if (exponentDifference < -1) return a;
++
++    if (exponentDifference == -1) {
++        // |a / b| is below one. A tie chooses quotient zero (even).
++        if (na.significand <= nb.significand) return a;
++        ulong magnitude = (nb.significand << 1) - na.significand;
++        return soft_pack_exact64(!signA, nb.exponent - 1, magnitude);
++    }
++
++    ulong remainder = na.significand;
++    bool quotientOdd = false;
++    for (int bit = 0; bit <= exponentDifference; ++bit) {
++        bool quotientBit = remainder >= nb.significand;
++        if (quotientBit) remainder -= nb.significand;
++        if (bit == exponentDifference) {
++            quotientOdd = quotientBit;
++        } else {
++            remainder <<= 1;
++        }
++    }
++
++    ulong twiceRemainder = remainder << 1;
++    bool chooseUpper = twiceRemainder > nb.significand ||
++        (twiceRemainder == nb.significand && quotientOdd);
++    bool signResult = signA;
++    if (chooseUpper) {
++        remainder = nb.significand - remainder;
++        signResult = !signResult;
++    }
++    return soft_pack_exact64(signResult, nb.exponent, remainder);
++}
++
++inline ulong soft_uint_to_f64_status(
++    ulong magnitude, bool sign, uint roundingMode, thread uint &flags
++) {
++    if (magnitude == 0) return ulong(sign) << 63;
++    int leading = 63 - int(clz(magnitude));
++    int exponent = 1023 + leading;
++    ulong significand;
++    if (leading <= 52) {
++        significand = magnitude << uint(52 - leading);
++    } else {
++        uint shift = uint(leading - 52);
++        ulong mask = (1ul << shift) - 1ul;
++        ulong discarded = magnitude & mask;
++        significand = magnitude >> shift;
++        if (discarded != 0) {
++            flags |= soft_flag_inexact;
++            ulong halfValue = 1ul << (shift - 1u);
++            bool increment = false;
++            if (roundingMode == soft_round_near_even) {
++                increment = discarded > halfValue ||
++                    (discarded == halfValue && (significand & 1ul) != 0);
++            } else if (roundingMode == soft_round_near_max_mag) {
++                increment = discarded >= halfValue;
++            } else if (roundingMode == soft_round_min) {
++                increment = sign;
++            } else if (roundingMode == soft_round_max) {
++                increment = !sign;
++            }
++            if (increment) significand += 1ul;
++            if (significand >= (1ul << 53)) {
++                significand >>= 1;
++                exponent += 1;
++            }
++        }
++    }
++    return (ulong(sign) << 63) | (ulong(exponent) << 52) |
++        (significand & 0x000ffffffffffffful);
++}
++
++inline ulong soft_f64_to_int_status(
++    ulong a, uint roundingMode, bool exact, bool signedTarget,
++    uint targetBits, thread uint &flags
++) {
++    bool sign = (a >> 63) != 0;
++    uint exponentField = uint((a >> 52) & 0x7fful);
++    ulong fraction = a & 0x000ffffffffffffful;
++    ulong positiveOverflow = targetBits == 32
++        ? (signedTarget ? 0x000000007ffffffful : 0x00000000fffffffful)
++        : (signedTarget ? 0x7ffffffffffffffful : 0xfffffffffffffffful);
++    ulong negativeOverflow = signedTarget
++        ? (targetBits == 32 ? 0x0000000080000000ul : 0x8000000000000000ul)
++        : 0ul;
++
++    if (exponentField == 0x7ffu) {
++        flags |= soft_flag_invalid;
++        if (fraction != 0) return 0;
++        return sign ? negativeOverflow : positiveOverflow;
++    }
++
++    uint roundingFlags = 0;
++    ulong rounded = soft_round_to_int64_status(
++        a, roundingMode, exact, roundingFlags
++    );
++    bool roundedSign = (rounded >> 63) != 0;
++    uint roundedExponent = uint((rounded >> 52) & 0x7fful);
++    ulong roundedFraction = rounded & 0x000ffffffffffffful;
++    ulong magnitude = 0;
++    if (roundedExponent >= 1023u) {
++        int unbiased = int(roundedExponent) - 1023;
++        if (unbiased > 63) {
++            flags |= soft_flag_invalid;
++            return roundedSign ? negativeOverflow : positiveOverflow;
++        }
++        ulong significand = roundedFraction | (1ul << 52);
++        magnitude = unbiased >= 52
++            ? significand << uint(unbiased - 52)
++            : significand >> uint(52 - unbiased);
++    }
++
++    bool invalid = false;
++    if (!signedTarget) {
++        invalid = roundedSign && magnitude != 0;
++        if (targetBits == 32 && magnitude > 0xfffffffful) invalid = true;
++    } else {
++        ulong negativeLimit = targetBits == 32
++            ? 0x0000000080000000ul : 0x8000000000000000ul;
++        ulong positiveLimit = negativeLimit - 1ul;
++        invalid = roundedSign ? magnitude > negativeLimit
++                              : magnitude > positiveLimit;
++    }
++    if (invalid) {
++        flags |= soft_flag_invalid;
++        return roundedSign ? negativeOverflow : positiveOverflow;
++    }
++
++    flags |= roundingFlags;
++    ulong result = roundedSign && magnitude != 0
++        ? (~magnitude) + 1ul : magnitude;
++    return targetBits == 32 ? result & 0xfffffffful : result;
++}
++
++inline ulong soft_round_pack_format_status(
++    bool sign, int exponent, ulong significandWithRound, uint roundingMode,
++    uint exponentBits, uint fractionBits, thread uint &flags
++) {
++    bool wasSubnormal = exponent <= 0;
++    if (exponent <= 0) {
++        significandWithRound = shift_right_jam(
++            significandWithRound, uint(1 - exponent)
++        );
++        exponent = 0;
++    }
++
++    ulong roundBits = significandWithRound & 7ul;
++    ulong significand = significandWithRound >> 3;
++    if (soft_should_increment(sign, roundBits, significand, roundingMode)) {
++        significand += 1ul;
++    }
++    ulong hidden = 1ul << fractionBits;
++    if (exponent == 0 && significand >= hidden) {
++        exponent = 1;
++    } else if (significand >= (hidden << 1)) {
++        significand >>= 1;
++        exponent += 1;
++    }
++
++    uint exponentMax = (1u << exponentBits) - 1u;
++    ulong signBit = ulong(sign) << (exponentBits + fractionBits);
++    if (exponent >= int(exponentMax)) {
++        flags |= soft_flag_overflow | soft_flag_inexact;
++        bool toInfinity =
++            roundingMode == soft_round_near_even ||
++            roundingMode == soft_round_near_max_mag ||
++            (roundingMode == soft_round_min && sign) ||
++            (roundingMode == soft_round_max && !sign);
++        return toInfinity
++            ? signBit | (ulong(exponentMax) << fractionBits)
++            : signBit | (ulong(exponentMax - 1u) << fractionBits) |
++                (hidden - 1ul);
++    }
++    if (roundBits != 0) {
++        flags |= soft_flag_inexact;
++        bool tiny = exponent == 0 ||
++            (wasSubnormal && exponent == 1 && roundBits <= 4ul);
++        if (tiny) flags |= soft_flag_underflow;
++    }
++    if (significand == 0) return signBit;
++    return signBit | (ulong(exponent) << fractionBits) |
++        (significand & (hidden - 1ul));
++}
++
++inline ulong soft_f64_to_format_status(
++    ulong a, uint roundingMode, uint exponentBits, uint fractionBits,
++    int targetBias, thread uint &flags
++) {
++    bool sign = (a >> 63) != 0;
++    uint exponentField = uint((a >> 52) & 0x7fful);
++    ulong fraction = a & 0x000ffffffffffffful;
++    uint exponentMax = (1u << exponentBits) - 1u;
++    ulong signBit = ulong(sign) << (exponentBits + fractionBits);
++    if (exponentField == 0x7ffu) {
++        if (fraction == 0) {
++            return signBit | (ulong(exponentMax) << fractionBits);
++        }
++        if (soft_is_signaling_nan(a)) flags |= soft_flag_invalid;
++        uint payloadShift = 52u - fractionBits;
++        ulong payload = fraction >> payloadShift;
++        return signBit | (ulong(exponentMax) << fractionBits) |
++            (1ul << (fractionBits - 1u)) | payload;
++    }
++    if (exponentField == 0 && fraction == 0) return signBit;
++
++    soft_normalized operand = soft_normalize_operand(exponentField, fraction);
++    int targetExponent = operand.exponent - 1023 + targetBias;
++    uint shift = 52u - fractionBits - 3u;
++    ulong significandWithRound = shift_right_jam(
++        operand.significand, shift
++    );
++    return soft_round_pack_format_status(
++        sign, targetExponent, significandWithRound, roundingMode,
++        exponentBits, fractionBits, flags
++    );
++}
++
++inline ulong soft_format_to_f64_status(
++    ulong raw, uint exponentBits, uint fractionBits, int sourceBias,
++    thread uint &flags
++) {
++    uint signPosition = exponentBits + fractionBits;
++    bool sign = ((raw >> signPosition) & 1ul) != 0;
++    uint exponentMax = (1u << exponentBits) - 1u;
++    uint exponentField = uint((raw >> fractionBits) & ulong(exponentMax));
++    ulong fractionMask = (1ul << fractionBits) - 1ul;
++    ulong fraction = raw & fractionMask;
++    if (exponentField == exponentMax) {
++        if (fraction == 0) {
++            return (ulong(sign) << 63) | 0x7ff0000000000000ul;
++        }
++        ulong quietBit = 1ul << (fractionBits - 1u);
++        if ((fraction & quietBit) == 0) flags |= soft_flag_invalid;
++        return (ulong(sign) << 63) | 0x7ff8000000000000ul |
++            (fraction << (52u - fractionBits));
++    }
++    if (exponentField == 0 && fraction == 0) return ulong(sign) << 63;
++
++    ulong significand;
++    int adjustedExponent;
++    if (exponentField == 0) {
++        int leading = 63 - int(clz(fraction));
++        int left = int(fractionBits) - leading;
++        significand = fraction << uint(left);
++        adjustedExponent = 1 - left;
++    } else {
++        significand = fraction | (1ul << fractionBits);
++        adjustedExponent = int(exponentField);
++    }
++    int exponent64 = adjustedExponent - sourceBias + 1023;
++    ulong fraction64 = (significand & fractionMask) << (52u - fractionBits);
++    return (ulong(sign) << 63) | (ulong(exponent64) << 52) | fraction64;
++}
++
++// ---------------------------------------------------------------------------
++// Thin wrappers used by the AdaptiveCpp Metal emitter. `double` values are
++// carried as `ulong` IEEE-754 binary64 bit patterns; all arithmetic is
++// correctly rounded (nearest-even) software binary64 from VF64-metal.
++// ---------------------------------------------------------------------------
++inline ulong __vf64_add(ulong a, ulong b) { uint f = 0; return soft_add64_status(a, b, soft_round_near_even, f); }
++inline ulong __vf64_sub(ulong a, ulong b) { uint f = 0; return soft_sub64_status(a, b, soft_round_near_even, f); }
++inline ulong __vf64_mul(ulong a, ulong b) { uint f = 0; return soft_mul64_status(a, b, soft_round_near_even, f); }
++inline ulong __vf64_div(ulong a, ulong b) { uint f = 0; return soft_div64_status(a, b, soft_round_near_even, f); }
++inline ulong __vf64_sqrt(ulong a) { uint f = 0; return soft_sqrt64_status(a, soft_round_near_even, f); }
++inline ulong __vf64_fma(ulong a, ulong b, ulong c) { uint f = 0; return soft_fma64_status(a, b, c, soft_round_near_even, f); }
++inline ulong __vf64_neg(ulong a) { return a ^ 0x8000000000000000ul; }
++inline ulong __vf64_fabs(ulong a) { return a & 0x7ffffffffffffffful; }
++inline ulong __vf64_copysign(ulong a, ulong b) { return (a & 0x7ffffffffffffffful) | (b & 0x8000000000000000ul); }
++inline bool __vf64_isnan(ulong a) { return soft_is_nan(a); }
++inline bool __vf64_eq(ulong a, ulong b) { uint f = 0; return soft_equal64_status(a, b, false, f); }
++inline bool __vf64_lt(ulong a, ulong b) { uint f = 0; return soft_less64_status(a, b, false, true, f); }
++inline bool __vf64_le(ulong a, ulong b) { uint f = 0; return soft_less64_status(a, b, true, true, f); }
++inline ulong __vf64_fmin(ulong a, ulong b) {
++    if (soft_is_nan(a)) return b;
++    if (soft_is_nan(b)) return a;
++    return __vf64_lt(b, a) ? b : a;
++}
++inline ulong __vf64_fmax(ulong a, ulong b) {
++    if (soft_is_nan(a)) return b;
++    if (soft_is_nan(b)) return a;
++    return __vf64_lt(a, b) ? b : a;
++}
++inline ulong __vf64_floor(ulong a) { uint f = 0; return soft_round_to_int64_status(a, soft_round_min, false, f); }
++inline ulong __vf64_ceil(ulong a) { uint f = 0; return soft_round_to_int64_status(a, soft_round_max, false, f); }
++inline ulong __vf64_trunc(ulong a) { uint f = 0; return soft_round_to_int64_status(a, soft_round_min_mag, false, f); }
++inline ulong __vf64_rint(ulong a) { uint f = 0; return soft_round_to_int64_status(a, soft_round_near_even, false, f); }
++inline ulong __vf64_round(ulong a) { uint f = 0; return soft_round_to_int64_status(a, soft_round_near_max_mag, false, f); }
++// C fmod (truncated quotient) derived from the exact IEEE remainder: both are
++// exactly representable, and the correction term keeps the result exact.
++inline ulong __vf64_fmod(ulong a, ulong b) {
++    uint f = 0;
++    ulong r = soft_remainder64_status(a, b, f);
++    if (soft_is_nan(r)) return r;
++    if ((r & 0x7ffffffffffffffful) == 0) return a & 0x8000000000000000ul;
++    if (((r ^ a) >> 63) != 0) r = __vf64_add(r, __vf64_copysign(b, a));
++    return r;
++}
++inline ulong __vf64_from_f32(float x) { uint f = 0; return soft_format_to_f64_status(ulong(as_type<uint>(x)), 8u, 23u, 127, f); }
++inline float __vf64_to_f32(ulong x) { uint f = 0; return as_type<float>(uint(soft_f64_to_format_status(x, soft_round_near_even, 8u, 23u, 127, f))); }
++inline ulong __vf64_from_u64(ulong v) { uint f = 0; return soft_uint_to_f64_status(v, false, soft_round_near_even, f); }
++inline ulong __vf64_from_i64(ulong v) {
++    bool sign = (v >> 63) != 0;
++    ulong magnitude = sign ? (~v + 1ul) : v;
++    uint f = 0;
++    return soft_uint_to_f64_status(magnitude, sign, soft_round_near_even, f);
++}
++// LLVM fptoui/fptosi truncate toward zero; out-of-range inputs are poison in
++// LLVM, so the SoftFloat saturation result is an acceptable definition.
++inline ulong __vf64_to_u64(ulong x) { uint f = 0; return soft_f64_to_int_status(x, soft_round_min_mag, false, false, 64u, f); }
++inline ulong __vf64_to_i64(ulong x) { uint f = 0; return soft_f64_to_int_status(x, soft_round_min_mag, false, true, 64u, f); }
++)vf64";
++
++}
++}
++
++#endif

@@ -6,7 +6,7 @@
 #   NSTEP=20
 #
 # Example:
-#   warpx.3d... langmuir_3d_bench.txt NX=64 PPC=1 NSTEP=20 diag1.intervals=99999
+#   warpx.3d... langmuir_3d_bench.txt my_constants.NX=64 my_constants.PPC=1 my_constants.NSTEP=20 diag1.intervals=99999
 
 # --- Grid size (override NX on command line) ---
 my_constants.NX = 64
